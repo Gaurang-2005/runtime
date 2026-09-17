@@ -53,9 +53,13 @@ class LeverRecord:
     wins: int
     losses: int
     inconclusive: int
-    mean_delta: float
-    best_delta: float
-    worst_delta: float
+    #: ``None`` when no attempt recorded a usable delta, for the same reason
+    #: :func:`record_for` returns ``None`` for a lever never tried: "we have no
+    #: number" and "the number was zero" point opposite ways, and 0.0 for both
+    #: would read as a measured no-op.
+    mean_delta: float | None
+    best_delta: float | None
+    worst_delta: float | None
     last_run_id: str | None
 
     @property
@@ -173,9 +177,9 @@ def load_history(runs_dir: str | Path, *, gpu_sku: str | None = None) -> History
             wins=a["win"],
             losses=a["loss"],
             inconclusive=a["inconclusive"],
-            mean_delta=sum(deltas) / len(deltas) if deltas else 0.0,
-            best_delta=max(deltas) if deltas else 0.0,
-            worst_delta=min(deltas) if deltas else 0.0,
+            mean_delta=(sum(deltas) / len(deltas)) if deltas else None,
+            best_delta=max(deltas) if deltas else None,
+            worst_delta=min(deltas) if deltas else None,
             last_run_id=a["last_run_id"],
         )
 
@@ -227,10 +231,11 @@ def render_history(history: History, *, top: int = 20) -> str:
                f"{'lost':>5s} {'incon':>6s} {'mean':>8s}  last")
     for r in rows[:top]:
         flag = "  CONFLICTED" if r.conflicted else ""
+        mean = f"{r.mean_delta:+.1%}" if r.mean_delta is not None else "n/a"
         out.append(
             f"  {r.intervention_name[:32]:32s} {(r.gpu_sku or '-')[:18]:18s} "
             f"{r.runs:5d} {r.attempts:4d} {r.wins:4d} {r.losses:5d} {r.inconclusive:6d} "
-            f"{r.mean_delta:+7.1%}  {(r.last_run_id or '-')[:8]}{flag}"
+            f"{mean:>7s}  {(r.last_run_id or '-')[:8]}{flag}"
         )
     if len(rows) > top:
         out.append(f"  ... {len(rows) - top} more")

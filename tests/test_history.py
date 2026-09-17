@@ -311,3 +311,26 @@ def test_reading_the_same_directory_twice_does_not_accumulate(tmp_path):
 
     assert (first.runs, first.attempts) == (1, 1)
     assert (second.runs, second.attempts) == (1, 1)
+
+
+def test_no_recorded_delta_is_none_not_zero(tmp_path):
+    """Same distinction record_for makes: "we have no number" and "the number was
+    zero" point opposite ways, and 0.0 for both reads as a measured no-op."""
+    _run(tmp_path, "run-a", [{"intervention_name": "mystery_lever",
+                              "kept": True, "significant": True}])
+
+    r = record_for(load_history(tmp_path), "mystery_lever", gpu_sku="NVIDIA H100 80GB")
+
+    assert r.attempts == 1          # the attempt still counts
+    assert r.wins == 1              # and its verdict is still known
+    assert r.mean_delta is None     # only the magnitude is missing
+    assert r.best_delta is None and r.worst_delta is None
+
+
+def test_a_measured_zero_is_not_the_same_as_no_measurement(tmp_path):
+    _run(tmp_path, "run-a", [{"intervention_name": "flat_lever", "kept": True,
+                              "significant": True, "delta": 0.0, "speedup": 1.0}])
+
+    r = record_for(load_history(tmp_path), "flat_lever", gpu_sku="NVIDIA H100 80GB")
+
+    assert r.mean_delta == 0.0      # not None — this one was measured
