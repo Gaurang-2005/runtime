@@ -59,7 +59,7 @@ def test_two_wins_for_the_same_lever_accumulate(tmp_path):
     r = record_for(h, "kv_cache_dtype_fp8", gpu_sku="NVIDIA H100 80GB")
 
     assert h.runs_read == 2
-    assert (r.runs, r.wins, r.losses) == (2, 2, 0)
+    assert (r.runs, r.attempts, r.wins, r.losses) == (2, 2, 2, 0)
     assert r.mean_delta == 0.05
     assert (r.best_delta, r.worst_delta) == (0.06, 0.04)
     assert not r.conflicted
@@ -273,3 +273,41 @@ def test_no_warning_when_every_run_named_its_gpu(tmp_path):
     _run(tmp_path, "run-a", [_result("kv_cache_dtype_fp8")], gpu_sku="NVIDIA H100 80GB")
 
     assert "WARNING" not in render_history(load_history(tmp_path))
+
+
+def test_two_ab_runs_in_one_folder_count_as_one_run_but_two_attempts(tmp_path):
+    """Five A/Bs inside one run is far weaker evidence than five across five
+    runs. A single counter cannot tell those apart, so the record carries both."""
+    _run(tmp_path, "run-a", [_result("kv_cache_dtype_fp8", delta=0.04),
+                             _result("kv_cache_dtype_fp8", delta=0.06)])
+
+    r = record_for(load_history(tmp_path), "kv_cache_dtype_fp8",
+                   gpu_sku="NVIDIA H100 80GB")
+
+    assert r.runs == 1
+    assert r.attempts == 2
+    assert r.wins + r.losses + r.inconclusive == r.attempts
+
+
+def test_the_same_lever_across_two_folders_counts_two_runs(tmp_path):
+    _run(tmp_path, "run-a", [_result("kv_cache_dtype_fp8", delta=0.04)])
+    _run(tmp_path, "run-b", [_result("kv_cache_dtype_fp8", delta=0.06)])
+
+    r = record_for(load_history(tmp_path), "kv_cache_dtype_fp8",
+                   gpu_sku="NVIDIA H100 80GB")
+
+    assert (r.runs, r.attempts) == (2, 2)
+
+
+def test_reading_the_same_directory_twice_does_not_accumulate(tmp_path):
+    """load_history is read-only and builds a fresh tally each call; nothing is
+    carried between calls."""
+    _run(tmp_path, "run-a", [_result("kv_cache_dtype_fp8")])
+
+    first = record_for(load_history(tmp_path), "kv_cache_dtype_fp8",
+                       gpu_sku="NVIDIA H100 80GB")
+    second = record_for(load_history(tmp_path), "kv_cache_dtype_fp8",
+                        gpu_sku="NVIDIA H100 80GB")
+
+    assert (first.runs, first.attempts) == (1, 1)
+    assert (second.runs, second.attempts) == (1, 1)

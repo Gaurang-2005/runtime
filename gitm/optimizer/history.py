@@ -43,7 +43,13 @@ class LeverRecord:
 
     intervention_name: str
     gpu_sku: str | None
+    #: Distinct run folders this lever appears in. Kept apart from ``attempts``
+    #: because five A/Bs inside one run is far weaker evidence than five across
+    #: five runs, and a single count cannot tell those apart.
     runs: int
+    #: Individual A/Bs. ``wins + losses + inconclusive`` sums to this, not to
+    #: ``runs`` — one run can measure the same lever more than once.
+    attempts: int
     wins: int
     losses: int
     inconclusive: int
@@ -143,10 +149,11 @@ def load_history(runs_dir: str | Path, *, gpu_sku: str | None = None) -> History
             key = (name, sku)
             a = acc.setdefault(
                 key,
-                {"runs": 0, "win": 0, "loss": 0, "inconclusive": 0,
-                 "deltas": [], "last_run_id": None},
+                {"runs": set(), "attempts": 0, "win": 0, "loss": 0,
+                 "inconclusive": 0, "deltas": [], "last_run_id": None},
             )
-            a["runs"] += 1
+            a["runs"].add(run_id)
+            a["attempts"] += 1
             a[_verdict(r)] += 1
             delta = r.get("delta")
             if delta is None and r.get("speedup") is not None:
@@ -161,7 +168,8 @@ def load_history(runs_dir: str | Path, *, gpu_sku: str | None = None) -> History
         records[(name, sku)] = LeverRecord(
             intervention_name=name,
             gpu_sku=sku,
-            runs=a["runs"],
+            runs=len(a["runs"]),
+            attempts=a["attempts"],
             wins=a["win"],
             losses=a["loss"],
             inconclusive=a["inconclusive"],
@@ -215,13 +223,13 @@ def render_history(history: History, *, top: int = 20) -> str:
             "part) so these separate correctly."
         )
     out.append("")
-    out.append(f"  {'lever':32s} {'gpu':18s} {'runs':>5s} {'won':>4s} {'lost':>5s} "
-               f"{'incon':>6s} {'mean':>8s}  last")
+    out.append(f"  {'lever':32s} {'gpu':18s} {'runs':>5s} {'a/b':>4s} {'won':>4s} "
+               f"{'lost':>5s} {'incon':>6s} {'mean':>8s}  last")
     for r in rows[:top]:
         flag = "  CONFLICTED" if r.conflicted else ""
         out.append(
             f"  {r.intervention_name[:32]:32s} {(r.gpu_sku or '-')[:18]:18s} "
-            f"{r.runs:5d} {r.wins:4d} {r.losses:5d} {r.inconclusive:6d} "
+            f"{r.runs:5d} {r.attempts:4d} {r.wins:4d} {r.losses:5d} {r.inconclusive:6d} "
             f"{r.mean_delta:+7.1%}  {(r.last_run_id or '-')[:8]}{flag}"
         )
     if len(rows) > top:
