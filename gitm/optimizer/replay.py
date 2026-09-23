@@ -48,12 +48,21 @@ def predict_delta(
 def _applies(spec: InterventionSpec, kernel_name: str) -> bool:
     """Does ``kernel_name`` fall within ``spec``'s declared scope?
 
-    Prefers op-identity via :func:`gitm.optimizer.deviation.classify_op` (same
-    vocabulary ``residuals()`` uses), falling back to substring matching for
-    tags it doesn't cover (other workloads' own vocabularies, e.g. HFT's
-    ``cudf_groupby_scan``). An empty ``applies_to_kernels`` means 0 coverage,
-    not 100% — a blank scope no longer wins ranking by default.
+    A ``whole_step`` lever covers every kernel in the step, including those the
+    predicted graph does not model. Batch shape, admission order and graph
+    capture do not care which ops a checkpoint happens to have, and enumerating
+    one architecture's op names is what made those levers score zero coverage on
+    every other architecture.
+
+    Otherwise, prefers op-identity via
+    :func:`gitm.optimizer.deviation.classify_op` (same vocabulary ``residuals()``
+    uses), falling back to substring matching for tags it doesn't cover (other
+    workloads' own vocabularies, e.g. HFT's ``cudf_groupby_scan``). An empty
+    ``applies_to_kernels`` still means 0 coverage, not 100% — a blank scope does
+    not win ranking by default.
     """
+    if spec.whole_step:
+        return True
     if not spec.applies_to_kernels:
         return False
     op = classify_op(kernel_name)
