@@ -167,6 +167,11 @@ class LoopConfig:
     #: which reads as off: the loop never asks. ``gitm run`` puts the question to
     #: the operator and passes an explicit answer down.
     use_history: bool | None = None
+    #: What to do with what this run learns, between one candidate and the next.
+    #: ``"off"`` keeps the opening order to the end, which is how the loop has
+    #: always behaved. ``"recapture"`` traces the workload again after each
+    #: applied candidate and re-ranks what is left against it.
+    rerank: str = "off"
     # Optional explicit driver for the embedded/engine path. When unset, the
     # loop looks up ``workload`` in the workload registry (gitm.workloads).
     workload_runner: WorkloadRunner | None = None
@@ -407,6 +412,34 @@ def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float
     do not all display a misleading +0.0% gap.
     """
     return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
+
+
+def _recapture(path, *, workload: str, run_id: str, runner) -> Any:
+    """Trace the workload again, as it stands after what has been applied.
+
+    The deviation profile moves as candidates land: a region the last one fixed
+    is no longer where time is going, and ranking the rest against the opening
+    trace asks where it *was* going. Coverage is measured per trace, so a fresh
+    one re-ranks on its own without any new scoring rule.
+
+    Affordable because ``measure()`` already runs this workload several times
+    for the A/B — the extra cost is another run of something already running,
+    not a new phase. It is deliberately taken *after* the gate has decided, so
+    the tracing overhead never lands on the numbers that decide keep or
+    rollback.
+
+    Returns ``None`` if the capture fails. A run that has already paid for its
+    trace and its A/Bs must not be lost to a failed re-measurement; the caller
+    keeps the order it had.
+    """
+    try:
+        with capture(path, workload_id=workload, run_id=run_id) as trace:
+            if runner is not None:
+                runner()
+                sync_device()
+        return trace
+    except Exception:
+        return None
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
@@ -805,7 +838,16 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # Aggregate kernel-time residual for the report (was hardcoded 0.0). Same for
     # every claim in a run — it describes the run's gap vs the predicted graph.
     kt_residual = _agg_kt_residual(res)
-    for c in ranked:
+    # A queue rather than a fixed list. `for c in ranked` walked an order decided
+    # before a single candidate had been measured, so nothing the run learned
+    # could reach the next choice until the following run read the export back.
+    # Popping from the front leaves `queue` as exactly what is still unattempted,
+    # which is what a re-rank has to re-order — and a candidate already popped,
+    # applied or rejected, cannot return.
+    queue = list(ranked)
+    reranks: list[dict[str, Any]] = []
+    while queue:
+        c = queue.pop(0)
         if c.rejected_reason is not None:
             rejected.append(f"{c.spec.name} ({c.rejected_reason})")
             continue
@@ -875,6 +917,34 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         if time.time_ns() - started_ns >= int(budget_s * 1e9):
             break
 
+        if cfg.rerank == "recapture" and queue:
+            # After the gate has decided, so the tracing overhead never lands on
+            # the A/B that decides keep or rollback.
+            step = len(reranks) + 1
+            fresh = _recapture(traces_dir(cfg.scratch) / f"{run_id}-rerank{step}.jsonl",
+                               workload=workload, run_id=run_id, runner=runner)
+            was = [x.spec.name for x in queue]
+            if fresh is not None and fresh.kernels():
+                queue = select_interventions(
+                    fresh, [x.spec for x in queue], policy, top_n=len(queue),
+                    ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
+                    fingerprint=qual.fingerprint)
+            now = [x.spec.name for x in queue]
+            reranks.append({
+                "after": c.spec.name,
+                "measured_delta": result.measured_delta,
+                "recaptured": fresh is not None,
+                "order_before": was,
+                "order_after": now,
+                "changed": was != now,
+            })
+
+    if reranks:
+        # What the run re-decided, and on what. Without it a report says which
+        # candidates were tried but not that the order moved, nor why.
+        (run_dir / "rerank.json").write_text(json.dumps({
+            "mode": cfg.rerank, "steps": reranks,
+        }, indent=2))
 
     # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
     if time.time_ns() - started_ns < int(budget_s * 1e9):
