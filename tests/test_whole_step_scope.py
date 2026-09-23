@@ -23,6 +23,14 @@ DENSE = ["void gemm_kernel", "flash_fwd_kernel"]
 UNMODELED = ["some_kernel_nobody_models", "void reduce_kernel"]
 
 
+def _events(names, *, stream=7, device=0, start=0, each=1000):
+    return [
+        KernelEvent(name=n, start_ns=start + i * each, end_ns=start + i * each + each,
+                    stream_id=stream, device_id=device, correlation_id=i)
+        for i, n in enumerate(names)
+    ]
+
+
 def _trace(names) -> Trace:
     events = [
         KernelEvent(name=n, start_ns=i * 1000, end_ns=i * 1000 + 1000, stream_id=7,
@@ -115,3 +123,58 @@ def test_a_measured_result_can_reach_the_ranking_on_a_sparse_moe_trace():
 
     assert measured > predict_delta(_trace(MOE), lever)   # beats its own prior
     assert abs(measured - 0.21) < 1e-9
+
+
+# --------------------------------------------------------------------------- #
+# coverage is a fraction of device time, not of the wall clock                 #
+# --------------------------------------------------------------------------- #
+def test_two_busy_devices_do_not_double_a_levers_predicted_effect():
+    """Summed kernel durations over the wall window is not a fraction. Two GPUs
+    busy for the same second sum to two seconds of work in one second of wall
+    clock, so coverage came out at 2.0 and a lever worth 10% predicted 20% — on
+    an eight-GPU box, the configuration these runs actually use."""
+    lever = _spec("max_num_seqs", whole_step=True)
+    concurrent = Trace(
+        workload_id="vllm-decode", fingerprint="f", run_id="r", device_count=2,
+        vendor="nvidia", captured_at_ns=0, duration_ns=1000,
+        events=(_events(["void gemm_kernel"], stream=7, device=0)
+                + _events(["void gemm_kernel"], stream=8, device=1)),
+    )
+
+    assert abs(predict_delta(concurrent, lever) - 0.10) < 1e-9
+
+
+def test_an_idle_gap_does_not_shrink_a_levers_predicted_effect():
+    """The same denominator bent the other way: a half-idle window halved the
+    prediction, though the lever reshapes whatever work there is."""
+    lever = _spec("max_num_seqs", whole_step=True)
+    half_idle = Trace(
+        workload_id="vllm-decode", fingerprint="f", run_id="r", device_count=1,
+        vendor="nvidia", captured_at_ns=0, duration_ns=2000,
+        events=_events(["void gemm_kernel"]),
+    )
+
+    assert abs(predict_delta(half_idle, lever) - 0.10) < 1e-9
+
+
+def test_an_op_scoped_lever_reads_its_share_of_device_time():
+    """One op over total device work, which is what share_of_device means in the
+    deviation table — the two now agree on what a share is."""
+    lever = _spec("attn_only", kernels=["attn_score_value"])
+    mixed = Trace(
+        workload_id="vllm-decode", fingerprint="f", run_id="r", device_count=1,
+        vendor="nvidia", captured_at_ns=0, duration_ns=4000,
+        events=_events(["void gemm_kernel", "flash_fwd_kernel",
+                        "void gemm_kernel", "void gemm_kernel"]),
+    )
+
+    assert abs(predict_delta(mixed, lever) - 0.10 * 0.25) < 1e-9
+
+
+def test_a_trace_with_no_kernels_predicts_nothing_rather_than_dividing_by_zero():
+    empty = Trace(
+        workload_id="vllm-decode", fingerprint="f", run_id="r", device_count=1,
+        vendor="nvidia", captured_at_ns=0, duration_ns=1000, events=[],
+    )
+
+    assert predict_delta(empty, _spec("max_num_seqs", whole_step=True)) == 0.0

@@ -35,12 +35,20 @@ def predict_delta(
     substitutes rather than being blended in against some weighting constant
     nobody has calibrated.
     """
-    total_ns = max(trace.duration_ns, 1)
-    applicable_ns = 0
-    for k in trace.kernels():
-        if _applies(spec, k.name):
-            applicable_ns += k.end_ns - k.start_ns
-    coverage = applicable_ns / total_ns
+    # Device time, not wall time. Summed kernel durations over the wall window is
+    # not a fraction: two GPUs busy for the same second sum to two seconds of work
+    # in one second of wall clock, and coverage came out at 2.0 — a lever worth
+    # 10% predicted 20% on an eight-GPU box. Idle gaps bent it the other way. Both
+    # denominators are already distinguished in the deviation table, where
+    # share_of_device divides by observed device time for exactly this reason.
+    kernels = list(trace.kernels())
+    device_ns = sum(max(0, k.end_ns - k.start_ns) for k in kernels)
+    if device_ns <= 0:
+        return 0.0
+    applicable_ns = sum(
+        max(0, k.end_ns - k.start_ns) for k in kernels if _applies(spec, k.name)
+    )
+    coverage = applicable_ns / device_ns
     mean = spec.expected_delta_mean if delta_mean is None else delta_mean
     return coverage * mean
 
