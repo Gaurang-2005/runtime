@@ -107,7 +107,8 @@ def test_each_recapture_is_recorded_with_what_prompted_it(tmp_path, captures):
     assert doc["mode"] == "recapture"
     assert doc["steps"]
     step = doc["steps"][0]
-    assert set(step) >= {"after", "recaptured", "order_before", "order_after", "changed"}
+    assert set(step) >= {"after", "recaptured", "error", "order_before",
+                         "order_after", "changed"}
     assert step["recaptured"] is True
 
 
@@ -227,3 +228,114 @@ def test_a_moved_bottleneck_reorders_what_is_tried_next(tmp_path, monkeypatch):
         "the queue was re-ordered but the next candidate did not change")
     # and the re-ordering is confined to what was still unattempted
     assert set(first["order_after"]) == set(first["order_before"])
+
+
+# --------------------------------------------------------------------------- #
+# the re-capture spends budget, and says what went wrong                       #
+# --------------------------------------------------------------------------- #
+def test_the_budget_bounds_the_recapture_too(tmp_path, monkeypatch):
+    """The re-capture runs the workload, so it spends wall clock. Checking the
+    deadline only *before* it let a candidate cycle start on a budget the trace
+    had already consumed — overrunning by a whole A/B on top of the trace.
+
+    Asserted on what the run *did*, not on how long it took: the clock here is
+    monkeypatched, so timing it would only measure the patch."""
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    @contextmanager
+    def fine(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(["flash_fwd_kernel"] * 4, run_id=run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fine)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+
+    # The first re-capture's workload run exhausts the budget, and nothing after
+    # it should start. Any further candidate would add another rerank step.
+    real_ns = loop.time.time_ns
+    runs = {"n": 0, "spent": False}
+
+    class _Burner(_Runner):
+        def __call__(self):
+            runs["n"] += 1
+            if runs["n"] > 1:        # run 1 is Phase 1's capture, not a re-capture
+                runs["spent"] = True
+            return {"events": 1}
+
+    monkeypatch.setattr(
+        loop.time, "time_ns",
+        lambda: real_ns() + 10 ** 12 if runs["spent"] else real_ns())
+
+    # Counting candidate cycles directly: that is the unit the budget bounds, and
+    # the step count cannot see the difference — an overrunning candidate is
+    # applied and only then breaks, before it would record a step of its own.
+    applies = {"n": 0}
+    real_apply = loop.apply_intervention
+
+    def counting(*a, **kw):
+        applies["n"] += 1
+        return real_apply(*a, **kw)
+
+    monkeypatch.setattr(loop, "apply_intervention", counting)
+
+    run_loop(LoopConfig(budget="30s", scratch=str(tmp_path),
+                        workload_runner=_Burner(), rerank="recapture"))
+
+    assert applies["n"] == 1, (
+        "a candidate was applied after the re-capture had spent the budget")
+
+
+def test_a_workload_failure_is_not_recorded_as_a_missing_trace(tmp_path, monkeypatch):
+    """The workload dying during the extra run and the tracer being unavailable
+    are different events. Recording both as "no trace" hides the first from
+    whoever reads the run afterwards."""
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    @contextmanager
+    def fine(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(["flash_fwd_kernel"] * 4, run_id=run_id or "r")
+
+    calls = {"n": 0}
+
+    class _Flaky(_Runner):
+        def __call__(self):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("engine died mid-run")
+            return {"events": 1}
+
+    monkeypatch.setattr(loop, "capture", fine)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    run_loop(LoopConfig(budget="30s", scratch=str(tmp_path),
+                        workload_runner=_Flaky(), rerank="recapture"))
+    doc = _rerank_doc(tmp_path)
+
+    assert doc is not None and doc["steps"]
+    step = doc["steps"][0]
+    assert step["recaptured"] is False
+    assert step["error"] and "workload run failed" in step["error"]
+
+
+# --------------------------------------------------------------------------- #
+# a mode nobody implements must not read as "off"                              #
+# --------------------------------------------------------------------------- #
+def test_an_unknown_mode_is_refused_rather_than_ignored(tmp_path):
+    """A typo used to run the whole budget without the thing it asked for, and
+    say nothing. The CLI already refuses via choices=; the embedded entry point
+    has to refuse too, or only one kind of caller is protected."""
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    with pytest.raises(ValueError, match="rerank must be one of"):
+        run_loop(LoopConfig(budget="1s", scratch=str(tmp_path),
+                            workload_runner=_Runner(), rerank="recaptre"))
+
+
+def test_the_cli_offers_exactly_the_modes_the_loop_knows(tmp_path):
+    """One list. A mode the CLI accepts and the loop does not would now raise
+    mid-run instead of reading as off — worse than the bug it replaced."""
+    from gitm.cli import _parser
+    from gitm.scheduler.loop import RERANK_MODES
+
+    action = next(a for a in _parser()._subparsers._group_actions[0]
+                  .choices["run"]._actions if a.dest == "rerank")
+
+    assert tuple(action.choices) == RERANK_MODES

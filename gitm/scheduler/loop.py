@@ -414,7 +414,18 @@ def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float
     return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
 
 
-def _recapture(path, *, workload: str, run_id: str, runner) -> Any:
+RERANK_MODES = ("off", "recapture")
+"""What a run may do with what it learns between candidates.
+
+Named here so the CLI's ``choices=`` and the embedded entry point agree. An
+unrecognised value used to read as "off", so a typo in a script silently ran
+without the thing it asked for.
+"""
+
+
+def _recapture(
+    path, *, workload: str, run_id: str, runner
+) -> tuple[Any, str | None]:
     """Trace the workload again, as it stands after what has been applied.
 
     The deviation profile moves as candidates land: a region the last one fixed
@@ -428,23 +439,35 @@ def _recapture(path, *, workload: str, run_id: str, runner) -> Any:
     the tracing overhead never lands on the numbers that decide keep or
     rollback.
 
-    Returns ``None`` if the capture fails. A run that has already paid for its
-    trace and its A/Bs must not be lost to a failed re-measurement; the caller
-    keeps the order it had.
+    Returns ``(trace, None)``, or ``(None, reason)`` when it could not be taken.
+    A run that has already paid for its trace and its A/Bs must not be lost to a
+    failed re-measurement, so the caller keeps the order it had — but the reason
+    is carried out rather than swallowed. The workload failing during the extra
+    run and the tracer being unavailable are different events for whoever reads
+    the run afterwards, and recording both as "no trace" hides the first.
     """
     try:
         with capture(path, workload_id=workload, run_id=run_id) as trace:
             if runner is not None:
-                runner()
+                try:
+                    runner()
+                except Exception as exc:
+                    return None, f"workload run failed: {exc}"
                 sync_device()
-        return trace
-    except Exception:
-        return None
+        return trace, None
+    except Exception as exc:
+        return None, f"capture failed: {exc}"
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     """Execute the 24-hour loop and return ``{summary, report_md, ...}``."""
     workload = cfg.workload or (getattr(cfg.engine, "workload_id", None) or "vllm-decode")
+    if cfg.rerank not in RERANK_MODES:
+        # Silently reading as "off" would let a scripted run spend its whole
+        # budget without the thing it asked for, and say nothing.
+        raise ValueError(
+            f"rerank must be one of {RERANK_MODES}, got {cfg.rerank!r}")
+
     # Never prompts. Deciding that is the CLI's job, because a library entry
     # point that can block on stdin is one an embedded caller cannot use.
     use_history = bool(cfg.use_history)
@@ -921,8 +944,9 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             # After the gate has decided, so the tracing overhead never lands on
             # the A/B that decides keep or rollback.
             step = len(reranks) + 1
-            fresh = _recapture(traces_dir(cfg.scratch) / f"{run_id}-rerank{step}.jsonl",
-                               workload=workload, run_id=run_id, runner=runner)
+            fresh, why = _recapture(
+                traces_dir(cfg.scratch) / f"{run_id}-rerank{step}.jsonl",
+                workload=workload, run_id=run_id, runner=runner)
             was = [x.spec.name for x in queue]
             if fresh is not None and fresh.kernels():
                 queue = select_interventions(
@@ -934,10 +958,17 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 "after": c.spec.name,
                 "measured_delta": result.measured_delta,
                 "recaptured": fresh is not None,
+                "error": why,
                 "order_before": was,
                 "order_after": now,
                 "changed": was != now,
             })
+            # The re-capture runs the workload, so it spends budget. Checked
+            # again here because the check above ran before that spend: a
+            # candidate cycle started on its strength could overrun by a whole
+            # A/B on top of the trace.
+            if time.time_ns() - started_ns >= int(budget_s * 1e9):
+                break
 
     if reranks:
         # What the run re-decided, and on what. Without it a report says which
