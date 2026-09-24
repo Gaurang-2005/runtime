@@ -160,7 +160,14 @@ def build_export(
         },
         "environment": _environment(gpu_sku),
         "protocol": {
-            "metric": "decode throughput (tokens/sec)",
+            # Per record, because a harness-converted comparison measures
+            # requests/sec over a serving window and derives ``kept`` from the
+            # number rather than from a rollback gate. One blanket description
+            # over both would misstate the units for one of them.
+            "metric": "per record: see `via` — 'hot-swap'/'restart' are decode "
+                      "throughput (tokens/sec) under the rollback gate; "
+                      "'harness' is serving goodput (requests/sec), kept "
+                      "derived from the measured delta",
             "reps": "each side benchmarked `reps` times; std is the sample stdev",
             "agreement_band": (
                 "relative band around our numbers within which a re-measurement "

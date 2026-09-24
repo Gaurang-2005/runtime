@@ -15,25 +15,47 @@ import json
 
 import pytest
 
+from gitm.kernels.library import load_library
 from gitm.optimizer.harness_results import (
     CaptureError,
     compare,
+    fingerprint_of,
     knob_difference,
     read_capture,
+    resolve_lever,
     write_comparison,
 )
 from gitm.optimizer.history import load_history, record_for
+from gitm.optimizer.qualification import fingerprint as trace_fingerprint
+from gitm.tracer.capture import write_trace_jsonl
+from gitm.tracer.schema import KernelEvent, Trace
+
+LIB = load_library(workload="vllm-decode")
 
 BASE_ARGV = ["--tensor-parallel-size", "2"]
 LOAD = {"requests": 512, "concurrency": 256, "input_tokens": 1024,
         "output_tokens": 256, "seed": 42}
 
 
+def _trace(vendor="amd", n=12):
+    events = [
+        KernelEvent(name=f"k{i % 3}", start_ns=i * 100, end_ns=i * 100 + 90,
+                    stream_id=7, device_id=0, correlation_id=i,
+                    grid_x=i % 2 + 1, grid_y=1, grid_z=1,
+                    block_x=128, block_y=1, block_z=1)
+        for i in range(n)
+    ]
+    return Trace(workload_id="vllm-serve", fingerprint="", run_id="r", device_count=1,
+                 vendor=vendor, captured_at_ns=0, duration_ns=10 ** 6, events=events)
+
+
 def _arm(root, name, *, argv=None, rps=40.0, model="Kimi-K2.5", tracing="cupti",
-         load=None, summary=None, manifest=None):
+         load=None, summary=None, manifest=None, trace=True):
     """One arm's directory in the shape `gitm capture serve` writes it."""
     d = root / name
     d.mkdir(parents=True, exist_ok=True)
+    if trace:
+        write_trace_jsonl(d / "trace.jsonl", _trace())
     (d / "serving_summary.json").write_text(json.dumps(summary if summary is not None else {
         "mode": "drive", "tracing": tracing, "nvtx": False, "wall_s": 300.0,
         "client": {"latency_source": "client", "n_failed_requests": 0,
@@ -56,7 +78,7 @@ def test_a_cluster_result_reaches_the_record_the_loop_ranks_from(tmp_path):
     base = _arm(tmp_path, "tp2", rps=40.0)
     cand = _arm(tmp_path, "tp2-ep", argv=[*BASE_ARGV, "--enable-expert-parallel"], rps=59.6)
 
-    write_comparison(read_capture(base), read_capture(cand),
+    write_comparison(read_capture(base), read_capture(cand), library=LIB,
                      out_dir=tmp_path / "runs" / "cluster-1",
                      gpu_sku="AMD Instinct MI355X", fingerprint="kimi-k2.5-mi355x")
 
@@ -76,15 +98,15 @@ def test_a_measured_win_is_a_win_and_not_a_loss(tmp_path):
     win = _arm(tmp_path, "w", argv=[*BASE_ARGV, "--enable-expert-parallel"], rps=59.6)
     loss = _arm(tmp_path, "l", argv=[*BASE_ARGV, "--enforce-eager"], rps=36.4)
 
-    assert compare(read_capture(base), read_capture(win)).kept is True
-    assert compare(read_capture(base), read_capture(loss)).kept is False
+    assert compare(read_capture(base), read_capture(win), library=LIB).kept is True
+    assert compare(read_capture(base), read_capture(loss), library=LIB).kept is False
 
 
 def test_a_change_inside_the_band_is_not_significant(tmp_path):
     base = _arm(tmp_path, "b", rps=40.0)
     noise = _arm(tmp_path, "n", argv=[*BASE_ARGV, "--enable-expert-parallel"], rps=40.4)
 
-    rec = compare(read_capture(base), read_capture(noise))
+    rec = compare(read_capture(base), read_capture(noise), library=LIB)
 
     assert rec.significant is False
     assert rec.kept is False
@@ -102,7 +124,7 @@ def test_a_traced_arm_against_an_untraced_one_is_refused(tmp_path):
                 tracing="cupti", rps=40.0)
 
     with pytest.raises(CaptureError, match="not an A/B"):
-        compare(read_capture(base), read_capture(cand))
+        compare(read_capture(base), read_capture(cand), library=LIB)
 
 
 def test_a_different_load_shape_is_refused(tmp_path):
@@ -111,7 +133,7 @@ def test_a_different_load_shape_is_refused(tmp_path):
                 load={**LOAD, "concurrency": 32})
 
     with pytest.raises(CaptureError, match="not an A/B"):
-        compare(read_capture(base), read_capture(cand))
+        compare(read_capture(base), read_capture(cand), library=LIB)
 
 
 def test_a_different_model_is_refused(tmp_path):
@@ -120,7 +142,7 @@ def test_a_different_model_is_refused(tmp_path):
                 model="GLM-5.2", rps=59.6)
 
     with pytest.raises(CaptureError, match="not an A/B"):
-        compare(read_capture(base), read_capture(cand))
+        compare(read_capture(base), read_capture(cand), library=LIB)
 
 
 def test_identical_flags_are_refused_rather_than_recorded_as_a_lever(tmp_path):
@@ -130,7 +152,7 @@ def test_identical_flags_are_refused_rather_than_recorded_as_a_lever(tmp_path):
     same = _arm(tmp_path, "s", rps=41.0)
 
     with pytest.raises(CaptureError, match="no intervention"):
-        compare(read_capture(base), read_capture(same))
+        compare(read_capture(base), read_capture(same), library=LIB)
 
 
 # --------------------------------------------------------------------------- #
@@ -191,22 +213,148 @@ def test_a_bare_switch_reads_as_true(tmp_path):
     assert knob_difference(base, cand) == {"--enforce-eager": True}
 
 
-def test_a_flag_the_baseline_carries_and_the_candidate_drops_is_not_reported(tmp_path):
-    """Removing a knob is a different experiment. Reporting it under the same
-    shape would claim the candidate *set* something it unset."""
+def test_a_dropped_flag_is_reported_rather_than_ignored(tmp_path):
+    """It used to be left out, which was worse than incomplete: the measured
+    delta would be credited entirely to whatever the candidate *added*, while a
+    removal had moved it too."""
     base = read_capture(_arm(tmp_path, "b", argv=[*BASE_ARGV, "--enforce-eager"]))
     cand = read_capture(_arm(tmp_path, "c", argv=BASE_ARGV))
 
-    assert knob_difference(base, cand) == {}
+    assert knob_difference(base, cand) == {"--enforce-eager": None}
 
 
-def test_the_lever_name_is_stable_across_reads(tmp_path):
-    """Read twice, the same experiment must key to one lever — otherwise it
-    accumulates as several that were each tried once."""
+def test_launch_settings_are_not_part_of_the_lever(tmp_path):
+    """Real manifests carry --host and --port. Where a server binds says nothing
+    about what it computes, and folding a port into the knob under test invents a
+    lever no catalog entry can match."""
+    base = read_capture(_arm(tmp_path, "b", argv=[*BASE_ARGV, "--port", "8000"]))
+    cand = read_capture(_arm(tmp_path, "c", argv=[*BASE_ARGV, "--port", "8001",
+                                                  "--enable-expert-parallel"]))
+
+    assert knob_difference(base, cand) == {"--enable-expert-parallel": True}
+
+
+# --------------------------------------------------------------------------- #
+# the record has to be findable, which is the whole point                      #
+# --------------------------------------------------------------------------- #
+def test_the_lever_name_comes_from_the_catalog_not_from_the_flag(tmp_path):
+    """Ranking looks a record up by ``spec.name``, and the names do not follow
+    from the flags: --enforce-eager is the lever ``cuda_graphs_enable``. A name
+    invented from the flag is a record nothing will ever look up."""
     base = read_capture(_arm(tmp_path, "b"))
-    cand = read_capture(_arm(tmp_path, "c",
-                             argv=[*BASE_ARGV, "--enable-expert-parallel", "--max-num-seqs", "512"]))
+    cand = read_capture(_arm(tmp_path, "c", argv=[*BASE_ARGV, "--enforce-eager"]))
 
-    first = compare(base, cand).intervention_name
-    assert first == compare(base, cand).intervention_name
-    assert first == "enable_expert_parallel+max_num_seqs_512"
+    assert compare(base, cand, library=LIB).intervention_name == "cuda_graphs_enable"
+
+
+def test_a_valued_flag_resolves_to_its_catalog_entry(tmp_path):
+    base = read_capture(_arm(tmp_path, "b"))
+    cand = read_capture(_arm(tmp_path, "c", argv=[*BASE_ARGV, "--max-num-seqs", "512"]))
+
+    assert compare(base, cand, library=LIB).intervention_name == "max_num_seqs_dynamic"
+
+
+def test_resolution_is_by_knob_not_by_name():
+    assert resolve_lever("--enforce-eager", True, LIB).name == "cuda_graphs_enable"
+    assert resolve_lever("--enable-expert-parallel", True, LIB).name == "enable_expert_parallel"
+    assert resolve_lever("--not-a-real-knob", 1, LIB) is None
+
+
+def test_a_flag_with_no_catalog_entry_is_refused(tmp_path):
+    """Recording it under an invented name would put a measurement in the record
+    that the ranking can never find — present, and useless."""
+    base = read_capture(_arm(tmp_path, "b"))
+    cand = read_capture(_arm(tmp_path, "c", argv=[*BASE_ARGV, "--some-future-flag", "7"]))
+
+    with pytest.raises(CaptureError, match="no catalog entry"):
+        compare(base, cand, library=LIB)
+
+
+def test_more_than_one_changed_flag_is_refused(tmp_path):
+    base = read_capture(_arm(tmp_path, "b"))
+    cand = read_capture(_arm(tmp_path, "c", argv=[*BASE_ARGV, "--enforce-eager",
+                                                  "--enable-expert-parallel"]))
+
+    with pytest.raises(CaptureError, match="cannot be credited to one lever"):
+        compare(base, cand, library=LIB)
+
+
+# --------------------------------------------------------------------------- #
+# the fingerprint the loop actually filters on                                 #
+# --------------------------------------------------------------------------- #
+def test_the_fingerprint_matches_what_the_loop_computes(tmp_path):
+    """The loop filters history on qualification.fingerprint(trace). A record
+    filed under anything else — a model name, say — is written and then filtered
+    straight back out, which is invisible rather than merely coarse.
+
+    Streamed rather than loaded, because a real capture is millions of kernels;
+    this pins that the two agree."""
+    arm = _arm(tmp_path, "b")
+
+    assert fingerprint_of(read_capture(arm)) == trace_fingerprint(_trace())
+
+
+def test_an_untraced_arm_cannot_be_fingerprinted(tmp_path):
+    """`--no-trace` arms exist — they are the baseline of a tracing-overhead
+    measurement. One cannot be filed against a workload the loop would know."""
+    arm = _arm(tmp_path, "b", trace=False)
+
+    with pytest.raises(CaptureError, match="no trace.jsonl"):
+        fingerprint_of(read_capture(arm))
+
+
+def test_the_written_record_carries_the_trace_fingerprint(tmp_path):
+    base = _arm(tmp_path, "b")
+    cand = _arm(tmp_path, "c", argv=[*BASE_ARGV, "--enable-expert-parallel"], rps=59.6)
+
+    write_comparison(read_capture(base), read_capture(cand), library=LIB,
+                     out_dir=tmp_path / "runs" / "c1", gpu_sku="MI355X")
+
+    h = load_history(tmp_path / "runs")
+    rec = record_for(h, "enable_expert_parallel", gpu_sku="MI355X",
+                     fingerprint=trace_fingerprint(_trace()))
+    assert rec is not None and rec.wins == 1
+
+
+# --------------------------------------------------------------------------- #
+# not clobbering what is already there                                         #
+# --------------------------------------------------------------------------- #
+def test_an_existing_export_is_never_overwritten(tmp_path):
+    """The loop's own exports live under the same tree. A reused run id would
+    replace whatever a directory records with this single comparison."""
+    base = _arm(tmp_path, "b")
+    cand = _arm(tmp_path, "c", argv=[*BASE_ARGV, "--enable-expert-parallel"], rps=59.6)
+    out = tmp_path / "runs" / "c1"
+    write_comparison(read_capture(base), read_capture(cand), library=LIB, out_dir=out)
+
+    with pytest.raises(CaptureError, match="already exists"):
+        write_comparison(read_capture(base), read_capture(cand), library=LIB, out_dir=out)
+
+
+# --------------------------------------------------------------------------- #
+# arms measured on different metrics                                           #
+# --------------------------------------------------------------------------- #
+def test_goodput_against_raw_rate_is_refused(tmp_path):
+    """One arm SLO-qualified and the other not is a comparison of two different
+    numbers, and can record a win that never happened."""
+    base = _arm(tmp_path, "b", rps=40.0)
+    cand = _arm(tmp_path, "c", argv=[*BASE_ARGV, "--enable-expert-parallel"], summary={
+        "mode": "drive", "tracing": "cupti", "wall_s": 300.0,
+        "client": {"n_requests": 512, "goodput_rps": None, "window_s": 300.0}})
+
+    with pytest.raises(CaptureError, match="different metrics"):
+        compare(read_capture(base), read_capture(cand), library=LIB)
+
+
+def test_a_null_goodput_is_not_the_same_as_an_absent_one(tmp_path):
+    """null is a present field carrying no number, which is what a capture writes
+    when its window had no usable duration. It falls back to the raw rate, and
+    the capture records that it did so."""
+    d = _arm(tmp_path, "b", summary={
+        "mode": "drive", "tracing": "cupti", "wall_s": 256.0,
+        "client": {"n_requests": 512, "goodput_rps": None, "window_s": 256.0}})
+
+    cap = read_capture(d)
+
+    assert cap.throughput == 2.0
+    assert cap.goodput is False
