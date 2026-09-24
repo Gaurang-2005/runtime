@@ -147,26 +147,57 @@ def fingerprint_of(capture: Capture) -> str:
     return f"{vendor}:{digest}"
 
 
+def _as_bool(value: Any) -> bool:
+    """A flag value as the boolean a server would act on."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _realises(value: Any, spec_value: Any) -> bool:
+    """Whether an arm setting a knob to ``value`` is the setting ``spec_value``.
+
+    A lever is a knob *and* the value it puts there — :func:`apply_intervention`
+    applies ``{spec.knob: spec.value}``. Matching on the knob alone credits an
+    arm to a lever it did not run, and for a boolean it credits it to the
+    opposite one: ``--enforce-eager`` sets ``enforce_eager`` true, while the
+    only catalog entry on that knob is ``cuda_graphs_enable``, which sets it
+    false. That record would be a win for eager mode read as evidence for
+    disabling it.
+    """
+    if isinstance(spec_value, bool) or isinstance(value, bool):
+        return _as_bool(value) is _as_bool(spec_value)
+    if isinstance(spec_value, int | float):
+        try:
+            return float(value) == float(spec_value)
+        except (TypeError, ValueError):
+            return False
+    return str(value).strip().lower() == str(spec_value).strip().lower()
+
+
 def resolve_lever(knob: str, value: Any, library: Iterable[Any]) -> Any | None:
-    """The catalog entry this flag corresponds to, or ``None``.
+    """The catalog entry this flag change corresponds to, or ``None``.
 
     Ranking looks a record up by ``spec.name``, so a name invented from the flag
     is a record nothing can find. The names do not follow from the flags:
-    ``--enforce-eager`` is the lever ``cuda_graphs_enable``, and
-    ``--max-num-seqs 512`` is ``max_num_seqs_dynamic``. Matching on ``knob``
-    is what bridges them.
+    ``--enforce-eager`` is the knob ``enforce_eager``, and ``--max-num-seqs`` is
+    the lever ``max_num_seqs_dynamic``. Matching on ``knob`` is what bridges
+    them, and matching on the value is what keeps the bridge honest: no catalog
+    entry shares a knob with another, so a knob-only match would resolve *every*
+    setting of that knob to the one entry regardless of what the arm actually
+    ran.
 
-    Where several entries share a knob, an entry declaring a fixed ``value``
-    must match it; an entry with no fixed value (a relative or swept lever)
-    matches any.
+    ``value`` is ``None`` when the candidate *removed* the flag. Removing a
+    boolean flag realises ``false``, which is how ``cuda_graphs_enable`` — a
+    lever that exists only as the absence of ``--enforce-eager`` — is reachable
+    at all. Removing a valued flag restores a server default this module does
+    not know, so there is no lever to name and it resolves to ``None``.
     """
     knob_name = knob.lstrip("-").replace("-", "_")
     matches = [s for s in library if s.knob == knob_name]
-    exact = [s for s in matches if s.value is not None and str(s.value) == str(value)]
-    if exact:
-        return exact[0]
-    open_valued = [s for s in matches if s.value is None]
-    return open_valued[0] if open_valued else (matches[0] if len(matches) == 1 else None)
+    if value is None:
+        return next((s for s in matches if isinstance(s.value, bool) and not s.value), None)
+    return next((s for s in matches if _realises(value, s.value)), None)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -209,6 +240,31 @@ def _throughput(summary: dict[str, Any]) -> tuple[float | None, float | None, bo
     return None, window, False
 
 
+def _find_trace(path: Path, manifest: dict[str, Any]) -> Path | None:
+    """The trace belonging to this capture directory.
+
+    The manifest records the path the trace had *on the machine that produced
+    it*, and cluster captures are read after ``sync_results.sh`` has mirrored
+    them somewhere else. That recorded path is then either missing — and the
+    fingerprint fails, so a good measurement never reaches the loop — or, worse,
+    still present and holding a different run's trace, which files the
+    measurement under a workload it did not run.
+
+    So the directory wins over the manifest: the trace sitting beside the
+    artifacts is this capture's trace. The recorded path is consulted last, for
+    a capture read in place on the machine that wrote it.
+    """
+    trace = manifest.get("trace")
+    declared = trace.get("path") if isinstance(trace, dict) else None
+    here = [path / "trace.jsonl"]
+    if declared:
+        here.insert(0, path / Path(declared).name)
+    for candidate in here:
+        if candidate.exists():
+            return candidate
+    return Path(declared) if declared else None
+
+
 def read_capture(path: str | Path) -> Capture:
     """One arm's directory, read into a :class:`Capture`.
 
@@ -224,12 +280,7 @@ def read_capture(path: str | Path) -> Capture:
     throughput, window, is_goodput = _throughput(summary)
     if throughput is None:
         raise CaptureError(f"{path.name}: no throughput in {SUMMARY_NAME}")
-    trace = manifest.get("trace")
-    trace_path = Path(trace["path"]) if isinstance(trace, dict) and trace.get("path") else None
-    if trace_path is not None and not trace_path.is_absolute():
-        trace_path = path / trace_path.name
-    elif trace_path is None and (path / "trace.jsonl").exists():
-        trace_path = path / "trace.jsonl"
+    trace_path = _find_trace(path, manifest)
 
     argv = manifest.get("serve_argv")
     load = manifest.get("load")
@@ -330,22 +381,22 @@ def compare(
         raise CaptureError(
             f"{baseline.path.name} and {candidate.path.name} ran the same server "
             "flags: there is no intervention between them")
-    dropped = sorted(k for k, v in knobs.items() if v is None)
-    if dropped:
-        raise CaptureError(
-            f"the candidate dropped {', '.join(dropped)} as well as changing "
-            "other flags: the measured delta cannot be credited to one lever")
     if len(knobs) > 1:
+        dropped = sorted(k for k, v in knobs.items() if v is None)
+        detail = f"dropping {', '.join(dropped)}, " if dropped else ""
         raise CaptureError(
-            f"these arms differ in {len(knobs)} flags ({', '.join(sorted(knobs))}): "
-            "the measured delta cannot be credited to one lever")
+            f"these arms differ in {len(knobs)} flags ({detail}"
+            f"{', '.join(sorted(knobs))}): the measured delta cannot be "
+            "credited to one lever")
 
     knob, value = next(iter(knobs.items()))
     spec = resolve_lever(knob, value, library)
     if spec is None:
+        ran = f"removing {knob}" if value is None else f"setting {knob}={value}"
         raise CaptureError(
-            f"{knob} matches no catalog entry. A record filed under an invented "
-            "name is one the ranking will never look up.")
+            f"{ran} matches no catalog entry. The catalog names a knob *and* the "
+            "value it puts there, so a record filed under a lever the arm did "
+            "not run is evidence for the wrong intervention.")
 
     speedup = candidate.throughput / baseline.throughput
     delta = speedup - 1.0
@@ -353,7 +404,7 @@ def compare(
         intervention_name=spec.name,
         summary=spec.summary,
         knob=spec.knob,
-        value=value,
+        value=spec.value,
         source=str(candidate.path),
         baseline_tps=baseline.throughput,
         candidate_tps=candidate.throughput,

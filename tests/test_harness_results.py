@@ -96,7 +96,7 @@ def test_a_measured_win_is_a_win_and_not_a_loss(tmp_path):
     back and the number is the whole question."""
     base = _arm(tmp_path, "b", rps=40.0)
     win = _arm(tmp_path, "w", argv=[*BASE_ARGV, "--enable-expert-parallel"], rps=59.6)
-    loss = _arm(tmp_path, "l", argv=[*BASE_ARGV, "--enforce-eager"], rps=36.4)
+    loss = _arm(tmp_path, "l", argv=[*BASE_ARGV, "--enable-dbo"], rps=36.4)
 
     assert compare(read_capture(base), read_capture(win), library=LIB).kept is True
     assert compare(read_capture(base), read_capture(loss), library=LIB).kept is False
@@ -239,25 +239,69 @@ def test_launch_settings_are_not_part_of_the_lever(tmp_path):
 # --------------------------------------------------------------------------- #
 def test_the_lever_name_comes_from_the_catalog_not_from_the_flag(tmp_path):
     """Ranking looks a record up by ``spec.name``, and the names do not follow
-    from the flags: --enforce-eager is the lever ``cuda_graphs_enable``. A name
-    invented from the flag is a record nothing will ever look up."""
+    from the flags: ``--max-num-seqs`` is the lever ``max_num_seqs_dynamic``. A
+    name invented from the flag is a record nothing will ever look up."""
     base = read_capture(_arm(tmp_path, "b"))
-    cand = read_capture(_arm(tmp_path, "c", argv=[*BASE_ARGV, "--enforce-eager"]))
-
-    assert compare(base, cand, library=LIB).intervention_name == "cuda_graphs_enable"
-
-
-def test_a_valued_flag_resolves_to_its_catalog_entry(tmp_path):
-    base = read_capture(_arm(tmp_path, "b"))
-    cand = read_capture(_arm(tmp_path, "c", argv=[*BASE_ARGV, "--max-num-seqs", "512"]))
+    cand = read_capture(_arm(tmp_path, "c", argv=[*BASE_ARGV, "--max-num-seqs", "256"]))
 
     assert compare(base, cand, library=LIB).intervention_name == "max_num_seqs_dynamic"
 
 
+def test_a_valued_flag_must_carry_the_value_the_lever_names(tmp_path):
+    """No catalog entry shares a knob with another, so matching on the knob
+    alone resolves *every* setting of it to the one entry. ``max_num_seqs_dynamic``
+    is the setting 256; an arm that ran 512 measured something else, and filing
+    it under that name is a number the ranking will trust for a config nobody
+    ran."""
+    base = read_capture(_arm(tmp_path, "b"))
+    cand = read_capture(_arm(tmp_path, "c", argv=[*BASE_ARGV, "--max-num-seqs", "512"]))
+
+    with pytest.raises(CaptureError, match="no catalog entry"):
+        compare(base, cand, library=LIB)
+
+
 def test_resolution_is_by_knob_not_by_name():
-    assert resolve_lever("--enforce-eager", True, LIB).name == "cuda_graphs_enable"
+    assert resolve_lever("--max-num-seqs", "256", LIB).name == "max_num_seqs_dynamic"
     assert resolve_lever("--enable-expert-parallel", True, LIB).name == "enable_expert_parallel"
     assert resolve_lever("--not-a-real-knob", 1, LIB) is None
+
+
+def test_an_arm_is_never_credited_to_the_opposite_lever(tmp_path):
+    """The only catalog entry on the ``enforce_eager`` knob is
+    ``cuda_graphs_enable``, which sets it *false*. An arm that passes
+    ``--enforce-eager`` ran the opposite intervention, so crediting it there
+    would record a win for eager mode as evidence for disabling it — and the
+    loop would rank the reverse of what was measured."""
+    base = read_capture(_arm(tmp_path, "b"))
+    cand = read_capture(_arm(tmp_path, "c", argv=[*BASE_ARGV, "--enforce-eager"], rps=59.6))
+
+    assert resolve_lever("--enforce-eager", True, LIB) is None
+    with pytest.raises(CaptureError, match="no catalog entry"):
+        compare(base, cand, library=LIB)
+
+
+def test_removing_a_boolean_flag_is_the_lever_that_turns_it_off(tmp_path):
+    """``cuda_graphs_enable`` sets ``enforce_eager`` false, which a server
+    expresses as the *absence* of ``--enforce-eager``. Refusing every removal
+    would leave that lever unmeasurable through the harness."""
+    base = read_capture(_arm(tmp_path, "b", argv=[*BASE_ARGV, "--enforce-eager"], rps=40.0))
+    cand = read_capture(_arm(tmp_path, "c", argv=list(BASE_ARGV), rps=59.6))
+
+    rec = compare(base, cand, library=LIB)
+
+    assert rec.intervention_name == "cuda_graphs_enable"
+    assert rec.value is False
+    assert rec.kept is True
+
+
+def test_removing_a_valued_flag_is_refused(tmp_path):
+    """Dropping ``--max-num-seqs`` restores a server default this module does
+    not know, so there is no lever whose value it realises."""
+    base = read_capture(_arm(tmp_path, "b", argv=[*BASE_ARGV, "--max-num-seqs", "256"]))
+    cand = read_capture(_arm(tmp_path, "c", argv=list(BASE_ARGV)))
+
+    with pytest.raises(CaptureError, match="no catalog entry"):
+        compare(base, cand, library=LIB)
 
 
 def test_a_flag_with_no_catalog_entry_is_refused(tmp_path):
@@ -290,6 +334,42 @@ def test_the_fingerprint_matches_what_the_loop_computes(tmp_path):
     Streamed rather than loaded, because a real capture is millions of kernels;
     this pins that the two agree."""
     arm = _arm(tmp_path, "b")
+
+    assert fingerprint_of(read_capture(arm)) == trace_fingerprint(_trace())
+
+
+def test_a_synced_capture_uses_the_trace_beside_it(tmp_path):
+    """Cluster captures are read after ``sync_results.sh`` has mirrored them, so
+    the manifest holds the path the trace had on the machine that produced it.
+    Following that path finds nothing — and the measurement never reaches the
+    loop — or finds a *different* run's trace, which is worse: the result is
+    filed against a workload it did not run."""
+    stale = tmp_path / "elsewhere"
+    stale.mkdir()
+    write_trace_jsonl(stale / "trace.jsonl", _trace(vendor="nvidia"))
+
+    arm = _arm(tmp_path, "b", manifest={
+        "workload_id": "vllm-serve", "capture_mode": "serve",
+        "served_model": "Kimi-K2.5", "serve_argv": BASE_ARGV, "load": LOAD,
+        "trace": {"path": str(stale / "trace.jsonl")},
+    })
+
+    assert read_capture(arm).trace_path == arm / "trace.jsonl"
+    assert fingerprint_of(read_capture(arm)) == trace_fingerprint(_trace())
+
+
+def test_a_capture_read_in_place_still_honours_its_manifest(tmp_path):
+    """The recorded path is not ignored, only outranked: a capture with no
+    trace beside it falls back to what the manifest says."""
+    away = tmp_path / "away"
+    away.mkdir()
+    write_trace_jsonl(away / "capture.jsonl", _trace())
+
+    arm = _arm(tmp_path, "b", trace=False, manifest={
+        "workload_id": "vllm-serve", "capture_mode": "serve",
+        "served_model": "Kimi-K2.5", "serve_argv": BASE_ARGV, "load": LOAD,
+        "trace": {"path": str(away / "capture.jsonl")},
+    })
 
     assert fingerprint_of(read_capture(arm)) == trace_fingerprint(_trace())
 
