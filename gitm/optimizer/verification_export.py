@@ -174,7 +174,16 @@ def build_export(
                 f"agrees; floored at {MIN_NOISE_BAND:.0%} because a single-rep A/B "
                 "reports zero scatter"
             ),
-            "kept": "decided by the rollback gate (min_keep_delta), not by delta >= 0",
+            # Same split as `metric`: the gate is what decides `kept` for a
+            # run this process supervised, and there is no gate behind a
+            # harness arm — it ran standalone on a cluster, so there was
+            # nothing to roll back and the measured delta is the whole
+            # decision. Saying "the gate decided" over both would claim a
+            # provenance half these records do not have.
+            "kept": "per record: see `via` — 'hot-swap'/'restart' are decided by "
+                    "the rollback gate (min_keep_delta), not by delta >= 0; "
+                    "'harness' has no gate behind it and is decided by the "
+                    "measured delta clearing `agreement_band`",
         },
         "results": [r.to_dict() for r in records],
     }

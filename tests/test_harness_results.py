@@ -12,6 +12,7 @@ history reader exists to prevent, one layer out.
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -438,3 +439,25 @@ def test_a_null_goodput_is_not_the_same_as_an_absent_one(tmp_path):
 
     assert cap.throughput == 2.0
     assert cap.goodput is False
+
+
+def test_the_export_does_not_claim_a_gate_that_never_ran(tmp_path):
+    """`kept` and `metric` mean different things depending on `via`, and the
+    protocol block is shared by both paths. A harness arm ran standalone on a
+    cluster: there was no rollback gate behind it and no decode-throughput
+    number in it, so a blanket description would claim a provenance and a unit
+    that half these records do not have."""
+    base = _arm(tmp_path, "b", rps=40.0)
+    cand = _arm(tmp_path, "c", argv=[*BASE_ARGV, "--enable-expert-parallel"], rps=59.6)
+
+    out = write_comparison(read_capture(base), read_capture(cand), library=LIB,
+                           out_dir=tmp_path / "runs" / "cluster-1",
+                           gpu_sku="AMD Instinct MI355X", fingerprint="kimi-k2.5-mi355x")
+    protocol = json.loads(pathlib.Path(out).read_text())["protocol"]
+
+    assert json.loads(pathlib.Path(out).read_text())["results"][0]["via"] == "harness"
+    for field in ("kept", "metric"):
+        assert "harness" in protocol[field], f"{field} does not describe harness records"
+        assert protocol[field].startswith("per record"), f"{field} is stated as a blanket claim"
+    assert "requests/sec" in protocol["metric"]
+    assert "measured delta" in protocol["kept"]
