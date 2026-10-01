@@ -1017,7 +1017,21 @@ def is_glm_moe_dsa_config(cfg: dict[str, Any]) -> bool:
     if str(cfg.get("model_type", "")).lower() == "glm_moe_dsa":
         return True
     archs = cfg.get("architectures") or []
-    return any("glmmoedsa" in str(a).lower() for a in archs)
+    if any("glmmoedsa" in str(a).lower() for a in archs):
+        return True
+    # Structural fallback, for the checkpoints that are this shape without
+    # saying so. This graph models MLA attention over a mixture FFN; the DSA
+    # indexer is an addition it prices when present. A checkpoint with MLA
+    # (``q_lora_rank`` + ``kv_lora_rank``), routed experts, and no indexer that
+    # ever binds is therefore exactly what this models — Kimi K2.5 is the live
+    # case, and the catalogue entry already assigns it ``family: glm_moe_dsa``
+    # by hand. DeepSeek-V4 carries a live indexer and so still falls through to
+    # ``is_sparse_moe_config``, which is the family that prices one.
+    from gitm.planner.moe_graph import has_active_indexer
+
+    mla = cfg.get("q_lora_rank") and cfg.get("kv_lora_rank")
+    routed = cfg.get("n_routed_experts") and cfg.get("num_experts_per_tok")
+    return bool(mla and routed and not has_active_indexer(cfg))
 
 
 #: Which graph op each ``modules_to_not_convert`` entry belongs to. Substring
@@ -1071,6 +1085,32 @@ def _op_dtype_overrides(
         found["moe_router"] = "fp32"
 
     return tuple(sorted(found.items()))
+
+
+def _indexer_schedule(
+    cfg: dict[str, Any], declared: tuple[str, ...], n_layers: int
+) -> tuple[str, ...]:
+    """The per-layer indexer schedule, with an inert indexer written down.
+
+    An explicit ``indexer_types`` is read verbatim. Where the checkpoint gives
+    none, :meth:`GlmMoeDsaModelSpec.indexer_kind` falls back to a frequency
+    rule — ``full`` every ``index_topk_freq`` layers — which is how GLM-5.2 is
+    laid out.
+
+    That fallback manufactures work for a checkpoint whose indexer never binds.
+    Kimi K2.5 sets ``index_topk`` to ``max_position_embeddings`` and ships no
+    indexer tensors at all; priced on the frequency rule it gains a full
+    indexer every fourth layer, so the family is right and the graph still
+    describes a model that does not exist. Getting the family right is not
+    enough on its own — the indexer-off state has to survive into the spec.
+    """
+    if declared:
+        return declared
+    from gitm.planner.moe_graph import has_active_indexer
+
+    if has_active_indexer(cfg):
+        return ()
+    return (SHARED_INDEXER,) * n_layers
 
 
 def spec_from_hf_config(
@@ -1153,7 +1193,7 @@ def spec_from_hf_config(
         index_head_dim=_int("index_head_dim", 128),
         index_topk=_int("index_topk", 2048),
         index_topk_freq=_int("index_topk_freq", 4),
-        indexer_types=_types("indexer_types"),
+        indexer_types=_indexer_schedule(cfg, _types("indexer_types"), n_layers),
         n_routed_experts=_req("n_routed_experts"),
         n_shared_experts=_int("n_shared_experts", 1),
         num_experts_per_tok=_req("num_experts_per_tok"),
