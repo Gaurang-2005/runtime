@@ -29,9 +29,12 @@ Two things are deliberate:
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from gitm.optimizer.degradation import AB_UNITS, ab_unit
 
 if TYPE_CHECKING:
     from gitm.kernels.spec import InterventionSpec
@@ -82,6 +85,13 @@ class VerificationRecord:
 
     baseline_config: dict[str, Any] = field(default_factory=dict)
     candidate_config: dict[str, Any] = field(default_factory=dict)
+    #: The A/B-affecting degradations this comparison was measured under: the
+    #: run's own and those recorded during this candidate's A/B, never another
+    #: candidate's. History judges each record by these, not by the run.
+    degradations: list[dict[str, Any]] = field(default_factory=list)
+    #: What ``baseline_tps`` / ``candidate_tps`` count, from this record's own
+    #: degradations: another record's fallback says nothing about this one.
+    unit: str = "tokens/sec"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -94,6 +104,7 @@ def build_record(
     *,
     baseline_config: dict[str, Any] | None = None,
     candidate_config: dict[str, Any] | None = None,
+    degradations: Iterable[Any] = (),
 ) -> VerificationRecord:
     """Assemble one record from a live A/B and its gate decision.
 
@@ -101,6 +112,7 @@ def build_record(
     kwargs are mutated in place by a hot-swap and replaced entirely by a
     restart, so reading them afterwards yields the candidate on both sides.
     """
+    degradations = [d if isinstance(d, dict) else d.to_dict() for d in degradations]
     return VerificationRecord(
         intervention_name=spec.name,
         summary=spec.summary,
@@ -121,6 +133,8 @@ def build_record(
         via=ab.via,
         baseline_config=dict(baseline_config or {}),
         candidate_config=dict(candidate_config or {}),
+        degradations=degradations,
+        unit=AB_UNITS[ab_unit(degradations)][2],
     )
 
 
@@ -148,7 +162,14 @@ def build_export(
     *,
     gpu_sku: str | None = None,
 ) -> dict[str, Any]:
-    """The full export document: provenance + environment + every comparison."""
+    """The full export document: provenance + environment + every comparison.
+
+    The run's degradations travel in ``provenance`` for the reader. Each record
+    also carries the ones it was measured under, and that is what the history
+    reader judges it by. A probe that timed workload runs rather than tokens
+    changes what ``metric`` says was measured.
+    """
+    degradations = list(getattr(provenance, "degradations", None) or [])
     return {
         "schema": SCHEMA,
         "provenance": {
@@ -157,17 +178,22 @@ def build_export(
             "run_id": provenance.run_id,
             "git_sha": provenance.git_sha,
             "gitm_version": provenance.gitm_version,
+            "degradations": degradations,
         },
         "environment": _environment(gpu_sku),
         "protocol": {
             # Per record, because a harness-converted comparison measures
             # requests/sec over a serving window and derives ``kept`` from the
-            # number rather than from a rollback gate. One blanket description
-            # over both would misstate the units for one of them.
-            "metric": "per record: see `via` — 'hot-swap'/'restart' are decode "
-                      "throughput (tokens/sec) under the rollback gate; "
-                      "'harness' is serving goodput (requests/sec), kept "
-                      "derived from the measured delta",
+            # number rather than from a rollback gate, and because a live probe
+            # that could not count tokens measured something else and says so
+            # in the record's ``unit``. One blanket description over all of them
+            # would misstate the units for some.
+            "metric": "per record: see `via` and `unit` — 'hot-swap'/'restart' are "
+                      "decode throughput (tokens/sec) under the rollback gate, unless "
+                      "`unit` names what the probe counted instead (runs/sec, "
+                      "decode_steps/sec, events/sec); 'harness' is serving "
+                      "throughput in requests/sec (`unit` says whether it is goodput), "
+                      "kept derived from the measured delta",
             "reps": "each side benchmarked `reps` times; std is the sample stdev",
             "agreement_band": (
                 "relative band around our numbers within which a re-measurement "

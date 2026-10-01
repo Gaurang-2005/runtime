@@ -417,6 +417,9 @@ def compare(
         significant=abs(delta) > agreement_band,
         kept=delta > 0 and abs(delta) > agreement_band,
         via="harness",
+        # Requests, not tokens, and goodput only when the capture reported it —
+        # the two arms are refused above unless they agree on which.
+        unit="goodput_requests/sec" if baseline.goodput else "requests/sec",
         baseline_config={"serve_argv": list(baseline.serve_argv)},
         candidate_config={"serve_argv": list(candidate.serve_argv)},
     )

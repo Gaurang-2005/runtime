@@ -455,7 +455,10 @@ def test_the_export_does_not_claim_a_gate_that_never_ran(tmp_path):
                            gpu_sku="AMD Instinct MI355X", fingerprint="kimi-k2.5-mi355x")
     protocol = json.loads(pathlib.Path(out).read_text())["protocol"]
 
-    assert json.loads(pathlib.Path(out).read_text())["results"][0]["via"] == "harness"
+    result = json.loads(pathlib.Path(out).read_text())["results"][0]
+    assert result["via"] == "harness"
+    # The record names its own unit, so it never reads as the tokens/sec default.
+    assert result["unit"] in ("goodput_requests/sec", "requests/sec")
     for field in ("kept", "metric"):
         assert "harness" in protocol[field], f"{field} does not describe harness records"
         assert protocol[field].startswith("per record"), f"{field} is stated as a blanket claim"

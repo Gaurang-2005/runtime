@@ -13,6 +13,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,26 @@ from gitm.optimizer.apply import (
 )
 from gitm.optimizer.attribution import attribute
 from gitm.optimizer.collective_signal import collective_causes, worst_device_comm
+from gitm.optimizer.degradation import (
+    AB_PROBE,
+    AB_UNIT,
+    AB_UNITS,
+    AFFECTS_AB,
+    AFFECTS_CLAIMS,
+    AFFECTS_RESIDUALS,
+    APPROXIMATE,
+    AR_SKIPPED,
+    GRAPH_BATCH,
+    GRAPH_HARDWARE,
+    GRAPH_MODEL,
+    TOKENS,
+    UNRELIABLE,
+    WORKLOAD_RUNNER,
+    Degradation,
+    DegradationLog,
+    ab_unit,
+    unreliable_ab,
+)
 from gitm.optimizer.deviation import deviation_summary, deviation_trace, write_deviation_jsonl
 from gitm.optimizer.dr import attribute_dr
 from gitm.optimizer.history import load_history
@@ -96,7 +117,18 @@ def _parse_budget_s(budget: str) -> float:
     value, unit = float(m.group(1)), m.group(2)
     return value * {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}[unit]
 
-def _engine_throughput_fn(engine: Any, runner: Any) -> Any:
+def _note_ab(
+    degradations: DegradationLog | None, stage: str, used: str, reason: str, severity: str
+) -> None:
+    """Record a throughput-probe fallback, when the caller passed a log."""
+    if degradations is not None:
+        degradations.record(stage, used=used, reason=reason, severity=severity,
+                            affects=(AFFECTS_AB, AFFECTS_CLAIMS))
+
+
+def _engine_throughput_fn(
+    engine: Any, runner: Any, degradations: DegradationLog | None = None
+) -> Any:
     """Resolve a decode-throughput probe for the live A/B.
 
     Prefers an explicit ``engine.gitm_throughput_fn`` (the engine owns what "a
@@ -109,24 +141,75 @@ def _engine_throughput_fn(engine: Any, runner: Any) -> Any:
     hot-swap A/Bs. A deployment that supplies ``gitm_restart_fn`` (structural-knob
     restart-apply, which swaps in a *new* engine) MUST also supply an engine-aware
     ``gitm_throughput_fn`` — the default cannot measure the restarted engine.
+
+    Both halves of that contract are now enforced rather than documented, and
+    each refusal is a raise: :func:`apply_intervention` turns a failed measure
+    into a restore with the error on the record, so the candidate is neither kept
+    nor written to ``verification.json`` as a measured loss.
+
+    * No runner: there is nothing to time. The old probe timed an empty call and
+      divided 1 by ~1e-9 s, so keep-or-rollback followed timer noise.
+    * A restarted engine: the runner drives the engine it was built with, so
+      timing it after a restart measures the old engine and credits the new one.
+    * No token count in the runner's output: the probe still works, as workload
+      runs per second, and the unit is recorded so no report calls it tok/s.
+    * The unit is fixed by an A/B's first call and held for that A/B. A speedup
+      is a ratio of two probe calls, so a runner that reports ``generated_tokens``
+      on one call and nothing (or ``decode_steps``) on the next would divide one
+      unit by another; that call raises and the A/B ends as an error. The lock is
+      keyed by :attr:`DegradationLog.current_scope`, so the next candidate starts
+      fresh and a consistent A/B in another unit is still measured.
+    * Any count other than ``generated_tokens`` is recorded as an
+      :data:`AB_UNIT` degradation naming its unit, so nothing reports steps or
+      events as tok/s.
     """
     explicit = getattr(engine, "gitm_throughput_fn", None)
     if callable(explicit):
         return explicit
 
+    if runner is None:
+        why = "no workload runner and no engine.gitm_throughput_fn: nothing to time"
+        _note_ab(degradations, AB_PROBE, "no throughput probe", why, UNRELIABLE)
+
+        def _no_probe(_engine: Any) -> float:
+            raise RuntimeError(why)
+
+        return _no_probe
+
+    # Per A/B: the unit of its first call, held for the rest of it. Keyed by the
+    # candidate being measured; one key for everything when there is no log.
+    locked: dict[str | None, str] = {}
+
     def _tps(_engine: Any) -> float:
+        if _engine is not engine:
+            why = ("the default probe drives the engine the runner was built with, "
+                   "not the restarted one; supply engine.gitm_throughput_fn")
+            _note_ab(degradations, AB_PROBE, "no measurement of the restarted engine", why,
+                     UNRELIABLE)
+            raise RuntimeError(why)
         t0 = time.perf_counter()
-        out = runner() if runner is not None else {}
+        out = runner()
         dt = max(time.perf_counter() - t0, 1e-9)
         # First key that is actually present wins — `or` would treat a legitimate
         # 0 (a window that produced no tokens) as missing and fabricate a count.
-        toks: float = 1.0
+        unit, count = "runs", 1.0
         if isinstance(out, dict):
             for key in ("generated_tokens", "decode_steps", "events"):
                 if out.get(key) is not None:
-                    toks = float(out[key])
+                    unit, count = key, float(out[key])
                     break
-        return toks / dt
+        ab = degradations.current_scope if degradations is not None else None
+        first = locked.setdefault(ab, unit)
+        if unit != first:
+            why = (f"the runner reported {unit!r} after reporting {first!r} in the same A/B; "
+                   "a speedup across the two would divide one unit by another")
+            _note_ab(degradations, AB_PROBE, "no measurement in a mixed unit", why, UNRELIABLE)
+            raise RuntimeError(why)
+        if unit != TOKENS:
+            counted = "" if unit == "runs" else f"; counted {unit} instead"
+            _note_ab(degradations, AB_UNIT, AB_UNITS[unit][2],
+                     "the runner reported no generated_tokens" + counted, APPROXIMATE)
+        return count / dt
 
     return _tps
 
@@ -254,6 +337,22 @@ def _model_spec_from_hf(hf: Any):
         )
     except Exception:
         return None
+
+
+def _model_spec_from_hf_explained(hf: Any):
+    """``(spec, None)``, or ``(None, why)`` when the default graph will be used.
+
+    :func:`_model_spec_from_hf` is kept for callers that only want the spec; this
+    is what the loop records, because "no engine" and "a config field this
+    reader could not parse" are different fixes for whoever reads the run.
+    """
+    if hf is None:
+        return None, "no HF config to read"
+    for need in ("hidden_size", "num_attention_heads", "num_hidden_layers", "vocab_size"):
+        if getattr(hf, need, None) is None:
+            return None, f"HF config has no {need!r}"
+    spec = _model_spec_from_hf(hf)
+    return (spec, None) if spec is not None else (None, "HF config fields did not parse")
 
 
 def _model_spec_from_engine(engine: Any):
@@ -393,7 +492,18 @@ def _quant_weight_bytes(quant: Any) -> int | None:
 
 
 def _execution_graph_family(engine: Any, hw: Any, batch: Any):
-    """The predicted graph for the model that actually ran, and its family.
+    """``(graph, family)`` — :func:`_execution_graph_basis` without the reason."""
+    graph, family, _why = _execution_graph_basis(engine, hw, batch)
+    return graph, family
+
+
+def _execution_graph_basis(engine: Any, hw: Any, batch: Any):
+    """The predicted graph for the model that actually ran, its family, and —
+    when it could not be read — why the default dense graph stands in.
+
+    The third element is ``None`` when the graph describes the engine's own
+    model. Otherwise every residual scored against it is scored against
+    Llama-2-7B, and the caller must say so rather than write it beside real ones.
 
     The family comes from :func:`gitm.planner.registry.detect_family` — the same
     dispatch ``gitm plan`` and ``gitm deviate`` use — so the live loop can never
@@ -424,18 +534,25 @@ def _execution_graph_family(engine: Any, hw: Any, batch: Any):
         name = str(cfg.get("model_type") or family)
         if family == "sparse_moe":
             spec = spec_from_hf_config(cfg, name=name)
-            return predict_moe_graph(spec, hw, batch, ShardingConfig()), family
+            return predict_moe_graph(spec, hw, batch, ShardingConfig()), family, None
         if family == "glm_moe_dsa":
             from gitm.planner.glm_graph import predict_glm_graph
 
             return predict_glm_graph(family_spec(cfg, name=name), hw, batch,
-                                     ShardingConfig()), family
+                                     ShardingConfig()), family, None
         if family == "hybrid":
             from gitm.planner.hybrid_graph import predict_hybrid_graph
 
             return predict_hybrid_graph(family_spec(cfg, name=name), hw, batch,
-                                        ShardingConfig()), family
-    return predict_graph(model=_model_spec_from_hf(hf), hw=hw, batch=batch), "dense"
+                                        ShardingConfig()), family, None
+    if hf is None:
+        # More specific than the helper's "no HF config": which of the two it is
+        # decides the fix (attach an engine vs. teach the reader a config path).
+        spec, why = None, ("no engine attached" if engine is None
+                           else "the engine exposes no HF config at any known path")
+    else:
+        spec, why = _model_spec_from_hf_explained(hf)
+    return predict_graph(model=spec, hw=hw, batch=batch), "dense", why
 
 
 def _execution_graph(engine: Any, hw: Any, batch: Any):
@@ -478,6 +595,51 @@ def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float
     do not all display a misleading +0.0% gap.
     """
     return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
+
+
+def _ab_evidence(ab: Any, rolled_back: bool, measured_under: Iterable[Any]) -> str:
+    """The claim sentence for a live A/B, in the unit the probe actually measured.
+
+    ``measured_under`` is this candidate's own list
+    (:meth:`DegradationLog.measured_under`), never the run's: a runs/s fallback
+    in a later A/B says nothing about the unit of this one.
+    """
+    what, unit, _export = AB_UNITS[ab_unit(measured_under)]
+    outcome = "rolled back" if rolled_back else "kept"
+    return (
+        f"live A/B: {outcome} ({ab.speedup - 1.0:+.1%} {what}, via {ab.via}); "
+        f"baseline {ab.baseline_tps:.1f} → candidate {ab.candidate_tps:.1f} {unit}"
+    )
+
+
+def _record_graph_basis(
+    log: DegradationLog, *, pctx: Any, batch: Any, sched: Any, graph_default_why: str | None
+) -> None:
+    """Record each default the predicted graph was built on.
+
+    The model is ``unreliable``: a default dense graph is another model, and
+    residuals against it describe nothing about this run. Hardware and batch are
+    ``approximate``: the graph is still this model, priced under a stated default.
+    """
+    if graph_default_why is not None:
+        log.record(GRAPH_MODEL, used="default dense graph (Llama-2-7B shape)",
+                   reason=graph_default_why, severity=UNRELIABLE,
+                   affects=(AFFECTS_RESIDUALS, AFFECTS_CLAIMS))
+    if getattr(pctx, "peak", None) is None:
+        sku = getattr(pctx, "sku", None)
+        log.record(GRAPH_HARDWARE, used="A100-SXM4-80GB peaks",
+                   reason=(f"GPU SKU {sku!r} has no entry in the peak table" if sku
+                           else "no GPU SKU (GITM_GPU_SKU unset and NVML gave no name)"),
+                   severity=APPROXIMATE, affects=(AFFECTS_RESIDUALS,))
+    if batch is None:
+        n = getattr(sched, "n_samples", 0) if sched is not None else 0
+        log.record(GRAPH_BATCH, used="batch=1",
+                   reason=("no scheduler samples (no engine stats in the window)" if not n
+                           else "scheduler samples carry no running-sequence count"),
+                   severity=APPROXIMATE, affects=(AFFECTS_RESIDUALS,))
+    log.record(GRAPH_BATCH, used="kv_cache_len=128 (BatchConfig default)",
+               reason="the sampled scheduler stats carry no context length",
+               severity=APPROXIMATE, affects=(AFFECTS_RESIDUALS,))
 
 
 RERANK_MODES = ("off", "recapture")
@@ -526,7 +688,23 @@ def _recapture(
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
-    """Execute the 24-hour loop and return ``{summary, report_md, ...}``."""
+    """Execute the 24-hour loop and return ``{summary, report_md, ...}``.
+
+    Every fallback the run takes is recorded in one
+    :class:`~gitm.optimizer.degradation.DegradationLog`: it travels on the
+    provenance (report, ``verification.json``), is written to
+    ``degradations.json`` on every path, and is summarised in the summary as
+    ``degraded`` / ``degradations``.
+    """
+    degradations = DegradationLog()
+    out = _run_loop(cfg, degradations)
+    degradations.write(out["run_dir"])
+    out["summary"]["degraded"] = bool(degradations.unreliable)
+    out["summary"]["degradations"] = degradations.summary()
+    return out
+
+
+def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     workload = cfg.workload or (getattr(cfg.engine, "workload_id", None) or "vllm-decode")
     if cfg.rerank not in RERANK_MODES:
         # Silently reading as "off" would let a scripted run spend its whole
@@ -604,6 +782,15 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 sync_device()  # ensure all kernels land in the trace before stop
             except Exception as exc:
                 runner_error = f"workload run failed: {exc}"
+    if runner_error is not None:
+        # Carried on every path, not only the no-data one: a runner that failed
+        # part-way still leaves kernels, and residuals, deviations and an A/B
+        # re-running the same runner all describe that fragment, not the workload.
+        degradations.record(
+            WORKLOAD_RUNNER,
+            used="a partial workload run" if runner is not None else "no workload run",
+            reason=runner_error, severity=UNRELIABLE,
+            affects=(AFFECTS_RESIDUALS, AFFECTS_AB, AFFECTS_CLAIMS))
 
     # Persist the scheduler series + summary when an engine actually produced one.
     # Turn the summary into ranked causal hypotheses (feeds attribution / claim
@@ -652,6 +839,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         applicator = getattr(runner, "applicator", None)
         if applicator is not None:
             return _hft_intervention_result(
+                degradations=degradations,
                 run_dir=run_dir,
                 run_id=run_id,
                 workload=workload,
@@ -670,6 +858,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         applicator = getattr(runner, "applicator", None)
         if applicator is not None:
             return _openfold_intervention_result(
+                degradations=degradations,
                 run_dir=run_dir,
                 run_id=run_id,
                 workload=workload,
@@ -688,6 +877,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         applicator = getattr(runner, "applicator", None)
         if applicator is not None:
             return _edge_intervention_result(
+                degradations=degradations,
                 run_dir=run_dir,
                 run_id=run_id,
                 workload=workload,
@@ -707,6 +897,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             "or the workload did not run under the runtime."
         )
         return _no_data_result(
+            degradations=degradations,
             run_dir=run_dir,
             run_id=run_id,
             workload=workload,
@@ -722,6 +913,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # honest measurement report computed from the actual captured kernels.
     if workload not in _LIBRARY_WORKLOADS:
         return _measurement_result(
+            degradations=degradations,
             run_dir=run_dir,
             run_id=run_id,
             workload=workload,
@@ -752,7 +944,9 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     # expert traffic ~12x. Read the real concurrency off the sampled scheduler
     # rather than defaulting.
     _batch = _batch_config_from_stats(sched_summary)
-    graph, family = _execution_graph_family(cfg.engine, _hw, _batch)
+    graph, family, graph_default_why = _execution_graph_basis(cfg.engine, _hw, _batch)
+    _record_graph_basis(degradations, pctx=pctx, batch=_batch, sched=sched_summary,
+                        graph_default_why=graph_default_why)
     is_moe = family != "dense"
     _graph_summary: dict[str, Any] = {
         "graph": "moe" if is_moe else "dense",
@@ -772,6 +966,10 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 ("weight", "weight_dtype"), ("expert", "expert_dtype"), ("kv", "kv_dtype"))},
             has_unpriced_collectives=graph.has_unpriced_collectives,
         )
+    # What the graph was built from, beside what it is: a residual is only as
+    # good as the model, hardware and batch it was predicted for.
+    _graph_summary["basis"] = [d.to_dict() for d in degradations
+                               if d.stage in (GRAPH_MODEL, GRAPH_HARDWARE, GRAPH_BATCH)]
     (run_dir / "predicted_graph.json").write_text(json.dumps(_graph_summary, indent=2))
 
     # Phase 2 — residuals + attribution
@@ -863,6 +1061,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             "runs_read": prior_runs.runs_read,
             "filtered": prior_runs.filtered,
             "skipped": prior_runs.skipped,
+            "excluded": prior_runs.excluded,
             "levers": len(prior_runs.records),
             "gpu_sku": pctx.sku,
             "fingerprint": qual.fingerprint,
@@ -897,7 +1096,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
     if cfg.engine is not None:
         applicator: Applicator = LiveEngineApplicator(
             cfg.engine,
-            throughput_fn=_engine_throughput_fn(cfg.engine, runner),
+            throughput_fn=_engine_throughput_fn(cfg.engine, runner, degradations),
             restart_fn=live_restart_fn,
             baseline_restart_fn=getattr(cfg.engine, "gitm_baseline_restart_fn", None),
             restart_mode=os.environ.get("GITM_RESTART_MODE", "parallel"),
@@ -956,7 +1155,9 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         # kwargs in place and a restart replaces the engine outright, so reading
         # them afterwards would report the candidate on both sides of the diff.
         baseline_cfg = dict(getattr(getattr(applicator, "engine", cfg.engine), "gitm_llm_kwargs", None) or {})
-        result = apply_intervention(c.spec, applicator, min_keep_delta=0.0)
+        with degradations.scope(c.spec.name):
+            result = apply_intervention(c.spec, applicator, min_keep_delta=0.0)
+        measured_under = degradations.measured_under(c.spec.name)
         ab = (
             getattr(applicator, "last_result", None)
             if result.measured_delta is not None
@@ -971,6 +1172,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                     c.spec, ab, result,
                     baseline_config=baseline_cfg,
                     candidate_config=candidate_cfg,
+                    degradations=measured_under,
                 )
             )
         # Causal evidence: the measured A/B verdict when live, else the Granger
@@ -978,11 +1180,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
         # from the authoritative ApplyResult (the real gate decision), not from
         # EngineABResult.kept (a measure-time delta>=0 indicator).
         if ab is not None:
-            outcome = "rolled back" if result.rolled_back else "kept"
-            causal_evidence = (
-                f"live A/B: {outcome} ({ab.speedup - 1.0:+.1%} decode throughput, via {ab.via}); "
-                f"baseline {ab.baseline_tps:.1f} → candidate {ab.candidate_tps:.1f} tok/s"
-            )
+            causal_evidence = _ab_evidence(ab, result.rolled_back, measured_under)
         else:
             causal_evidence = ", ".join(
                 f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
@@ -1006,6 +1204,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 # with its real (small) number, not a distorted one.
                 measured_delta=((ab.speedup - 1.0) if ab is not None else result.measured_delta),
                 rolled_back=result.rolled_back,
+                unreliable_ab=unreliable_ab(measured_under) if ab is not None else [],
             )
         )
         if time.time_ns() - started_ns >= int(budget_s * 1e9):
@@ -1088,9 +1287,17 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             history=prior_runs,
             gpu_sku=pctx.sku,
             fingerprint=qual.fingerprint,
+            degradations=degradations,
         )
     else:
+        # An empty result list reads the same as "searched and found nothing";
+        # say that the pass never ran, and why.
         ar_run = AutoresearchRun(bottleneck_class=classify_bottleneck(trace, res), results=[])
+        ar_run.degradations.append(Degradation(
+            AR_SKIPPED, used="no autoresearch pass",
+            reason=f"budget {cfg.budget} exhausted by Phase 4",
+            severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,)))
+    degradations.extend(ar_run.degradations)
 
     ar_granger_evidence = ", ".join(
         f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
@@ -1104,11 +1311,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
             rolled_back.append(r.spec.name)
         ar_ab = r.ab_result
         if ar_ab is not None:
-            outcome = "rolled back" if r.rolled_back else "kept"
-            evidence = (
-                f"live A/B: {outcome} ({ar_ab.speedup - 1.0:+.1%} decode throughput, via {ar_ab.via}); "
-                f"baseline {ar_ab.baseline_tps:.1f} → candidate {ar_ab.candidate_tps:.1f} tok/s"
-            )
+            evidence = _ab_evidence(ar_ab, r.rolled_back, r.degradations)
         else:
             evidence = ar_granger_evidence
         if r.measured_delta is None and r.apply_error:
@@ -1128,6 +1331,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                 predicted_delta=r.predicted_delta,
                 measured_delta=true_delta,
                 rolled_back=r.rolled_back,
+                unreliable_ab=unreliable_ab(r.degradations) if ar_ab is not None else [],
             )
         )
         if ar_ab is not None and r.apply_result is not None:
@@ -1136,6 +1340,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                     r.spec, ar_ab, r.apply_result,
                     baseline_config=r.baseline_config or {},
                     candidate_config=r.candidate_config or {},
+                    degradations=r.degradations,
                 )
             )
     (run_dir / "autoresearch.json").write_text(
@@ -1166,6 +1371,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
                     }
                     for r in ar_run.results
                 ],
+                "degradations": [d.to_dict() for d in ar_run.degradations],
             },
             indent=2,
         )
@@ -1173,6 +1379,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
     # Phase 5 — stabilize + write report
     provenance = build_provenance(
+        degradations=degradations,
         workload_id=workload,
         fingerprint=qual.fingerprint,
         run_id=run_id,
@@ -1225,6 +1432,7 @@ def run_loop(cfg: LoopConfig) -> dict[str, Any]:
 
 def _measurement_result(
     *,
+    degradations: DegradationLog | None = None,
     run_dir: Path,
     run_id: str,
     workload: str,
@@ -1260,6 +1468,7 @@ def _measurement_result(
     )
 
     provenance = build_provenance(
+        degradations=degradations,
         workload_id=workload,
         fingerprint=qual.fingerprint,
         run_id=run_id,
@@ -1296,6 +1505,7 @@ def _measurement_result(
 
 def _hft_intervention_result(
     *,
+    degradations: DegradationLog | None = None,
     run_dir: Path,
     run_id: str,
     workload: str,
@@ -1398,6 +1608,7 @@ def _hft_intervention_result(
     )
 
     provenance = build_provenance(
+        degradations=degradations,
         workload_id=workload,
         fingerprint=qual.fingerprint,
         run_id=run_id,
@@ -1438,6 +1649,7 @@ def _hft_intervention_result(
 
 def _openfold_intervention_result(
     *,
+    degradations: DegradationLog | None = None,
     run_dir: Path,
     run_id: str,
     workload: str,
@@ -1535,6 +1747,7 @@ def _openfold_intervention_result(
     )
 
     provenance = build_provenance(
+        degradations=degradations,
         workload_id=workload,
         fingerprint=qual.fingerprint,
         run_id=run_id,
@@ -1575,6 +1788,7 @@ def _openfold_intervention_result(
 
 def _edge_intervention_result(
     *,
+    degradations: DegradationLog | None = None,
     run_dir: Path,
     run_id: str,
     workload: str,
@@ -1672,6 +1886,7 @@ def _edge_intervention_result(
     )
 
     provenance = build_provenance(
+        degradations=degradations,
         workload_id=workload,
         fingerprint=qual.fingerprint,
         run_id=run_id,
@@ -1712,6 +1927,7 @@ def _edge_intervention_result(
 
 def _no_data_result(
     *,
+    degradations: DegradationLog | None = None,
     run_dir: Path,
     run_id: str,
     workload: str,
@@ -1726,6 +1942,7 @@ def _no_data_result(
     never ran. We emit zero claims rather than fabricating results from nothing.
     """
     provenance = build_provenance(
+        degradations=degradations,
         workload_id=workload,
         fingerprint=qual.fingerprint,
         run_id=run_id,
