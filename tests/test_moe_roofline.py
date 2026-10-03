@@ -459,9 +459,44 @@ def test_batch_config_from_stats_uses_observed_concurrency():
     class Sched:
         n_samples = 12
         mean_running = 15.6
+        mean_unfinished = 64.0  # ignored: the running count is the decode batch
+        max_num_seqs = 256
 
-    cfg = _batch_config_from_stats(Sched())
+    cfg, source = _batch_config_from_stats(Sched())
     assert cfg is not None and cfg.batch == 16  # rounded
+    assert source == "running"
+
+
+def test_batch_config_falls_back_to_in_flight_requests():
+    """The offline engine keeps its scheduler in another process, so the running
+    count is unreachable and the in-flight count is all there is."""
+    from gitm.scheduler.loop import _batch_config_from_stats
+
+    class Sched:
+        n_samples = 12
+        mean_running = None
+        mean_unfinished = 31.4
+        max_num_seqs = 256
+
+    cfg, source = _batch_config_from_stats(Sched())
+    assert cfg is not None and cfg.batch == 31
+    assert source == "unfinished"
+
+
+def test_batch_config_clamps_in_flight_to_capacity():
+    """In-flight counts queued requests too; the engine never decodes more than
+    max_num_seqs at once, so the surplus is queue depth, not batch."""
+    from gitm.scheduler.loop import _batch_config_from_stats
+
+    class Sched:
+        n_samples = 12
+        mean_running = None
+        mean_unfinished = 400.0
+        max_num_seqs = 32
+
+    cfg, source = _batch_config_from_stats(Sched())
+    assert cfg is not None and cfg.batch == 32
+    assert source == "unfinished"
 
 
 def test_batch_config_falls_back_when_no_samples():
@@ -472,14 +507,27 @@ def test_batch_config_falls_back_when_no_samples():
     class NoSamples:
         n_samples = 0
         mean_running = 8.0
+        mean_unfinished = 8.0
+        max_num_seqs = 256
 
     class NoRunning:
         n_samples = 5
         mean_running = None
+        mean_unfinished = None
+        max_num_seqs = 256
 
-    assert _batch_config_from_stats(None) is None
-    assert _batch_config_from_stats(NoSamples()) is None
-    assert _batch_config_from_stats(NoRunning()) is None
+    class NoCapacity:
+        """An in-flight count with nothing to bound it stays unused: unclamped it
+        is queue depth plus batch, which on a drain workload is neither."""
+        n_samples = 5
+        mean_running = None
+        mean_unfinished = 400.0
+        max_num_seqs = None
+
+    assert _batch_config_from_stats(None) == (None, None)
+    assert _batch_config_from_stats(NoSamples()) == (None, None)
+    assert _batch_config_from_stats(NoRunning()) == (None, None)
+    assert _batch_config_from_stats(NoCapacity()) == (None, None)
 
 
 def test_wrong_batch_badly_misprices_expert_traffic():

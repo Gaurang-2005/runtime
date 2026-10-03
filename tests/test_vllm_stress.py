@@ -141,6 +141,30 @@ def test_summarize_single_sample():
     assert summ.peak_running == 2
 
 
+def test_summarize_in_flight_ignores_the_idle_head_and_tail():
+    """The sampler snapshots before the workload is submitted and after it
+    drains. Averaging those zeros in would halve the batch the graph is priced
+    for, so only the samples that had work in flight count."""
+    from gitm.tracer.vllm_stats import SchedulerSample
+
+    samples = [SchedulerSample(t_ns=0, num_unfinished=0),
+               SchedulerSample(t_ns=1, num_unfinished=16),
+               SchedulerSample(t_ns=2, num_unfinished=16),
+               SchedulerSample(t_ns=3, num_unfinished=0)]
+    summ = summarize(samples, max_num_seqs=256)
+    assert summ.mean_unfinished == 16.0
+    assert summ.peak_unfinished == 16
+    assert summ.max_num_seqs == 256
+
+
+def test_summarize_in_flight_absent_when_never_exposed():
+    from gitm.tracer.vllm_stats import SchedulerSample
+
+    summ = summarize([SchedulerSample(t_ns=0, num_waiting=3)])
+    assert summ.mean_unfinished is None and summ.peak_unfinished is None
+    assert summarize([]).mean_unfinished is None
+
+
 # --------------------------------------------------------------------------- #
 # scheduler_causes edge cases                                                 #
 # --------------------------------------------------------------------------- #
