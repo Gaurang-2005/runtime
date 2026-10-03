@@ -492,11 +492,19 @@ def write_comparisons(
     filed under ``Kimi-K2.5`` is written and then filtered straight back out —
     invisible, not merely coarse.
 
-    The trace comes from an arm that was **accepted**, and from the first such
-    arm that can actually be fingerprinted. Taking the first candidate as given
-    was wrong twice over: a refused arm is not part of this sweep, so filing the
-    accepted results under its workload digest hides them behind a filter; and an
-    untraced first arm raised, discarding a sweep whose other arms were fine.
+    The trace comes from the **baseline**, and only from an accepted candidate if
+    the baseline has none. The digest is over kernel shapes, and a lever changes
+    shapes — so an arm's own digest differs from the baseline's, while the
+    workload is the same one by construction (``compare`` refuses two arms that
+    disagree on model, load or tracing). Keying a sweep on the baseline is what
+    makes every arm of it findable under one workload, and what makes it the same
+    key ``gitm propose`` ranks history under. Keying on a candidate instead left
+    the two commands filing and looking under different digests, so a measured
+    result could not reach the next proposal.
+
+    Taking ``candidates[0]`` as given was wrong for two further reasons, and both
+    still hold: a refused arm is not part of this sweep, and an untraced first
+    arm raised and discarded a sweep whose other arms were fine.
 
     Every arm is compared, and one unusable arm does not discard the others:
     :func:`compare` refuses an arm that is not an A/B of the baseline, and that
@@ -537,19 +545,23 @@ def write_comparisons(
             "no arm could be compared against this baseline:\n  "
             + "\n  ".join(refused))
 
+    unfingerprintable: list[str] = []
     if fingerprint is None:
-        for cand in accepted:
+        for source in (baseline, *accepted):
             try:
-                fingerprint = fingerprint_of(cand)
+                fingerprint = fingerprint_of(source)
                 break
             except CaptureError as exc:
-                refused.append(f"{cand.path.name}: not fingerprintable: {exc}")
+                # Its own list, not ``refused``. These arms were compared and
+                # their measurements are in the export; saying they were refused
+                # would tell the operator a result was dropped when it was kept.
+                unfingerprintable.append(f"{source.path.name}: {exc}")
         if fingerprint is None:
             raise CaptureError(
-                "no accepted arm could be fingerprinted, so these results cannot "
-                "be filed against a workload the loop would recognise. Pass "
-                "--fingerprint, or capture an arm with tracing on:\n  "
-                + "\n  ".join(refused))
+                "neither the baseline nor any accepted arm could be "
+                "fingerprinted, so these results cannot be filed against a "
+                "workload the loop would recognise. Pass --fingerprint, or "
+                "capture with tracing on:\n  " + "\n  ".join(unfingerprintable))
 
     if dry_run:
         return str(export)
@@ -559,13 +571,19 @@ def write_comparisons(
     # publishing it before the account of what was refused means a failure in
     # between leaves records on disk, no reasons beside them, and a retry
     # refused. Written in the order a reader needs them to be complete.
-    if refused:
+    if refused or unfingerprintable:
         # Beside the export, not inside it: the export is the evidence the
         # ranking reads, and an arm that could not be compared is not evidence
         # about a lever. It still has to be visible, or a sweep of nine that
         # ingested four looks like a sweep of four.
+        #
+        # The two lists are separate because they mean opposite things to a
+        # reader checking a partial sweep. ``refused`` is a measurement that did
+        # not make it in. ``not_fingerprintable`` is one that did, from an arm
+        # that merely could not supply the workload digest.
         (out_dir / "ingest_refused.json").write_text(
-            json.dumps({"refused": refused}, indent=2) + "\n")
+            json.dumps({"refused": refused,
+                        "not_fingerprintable": unfingerprintable}, indent=2) + "\n")
     prov = Provenance(
         workload_id="vllm-serve",
         fingerprint=fingerprint,

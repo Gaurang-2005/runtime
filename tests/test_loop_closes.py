@@ -170,3 +170,67 @@ def test_an_untraced_baseline_is_refused_rather_than_ranked_on_nothing(tmp_path)
     rc = cli_main(["propose", "--baseline", str(base), "--out", str(tmp_path / "e.json")])
     assert rc == 2
     assert not (tmp_path / "e.json").exists()
+
+
+def test_the_loop_closes_on_the_commands_defaults_with_no_keys_supplied(tmp_path):
+    """The failure this nearly shipped with: `propose` looked history up under
+    the baseline's fingerprint while `ingest` filed under an accepted arm's, and
+    a lever changes kernel shapes so those differ. The generated ingest command
+    passed neither key, so an operator following it verbatim got results the next
+    proposal could not find — and the loop silently did not close.
+
+    Nothing here passes --fingerprint. That is the point.
+    """
+    scratch = str(tmp_path / "scratch")
+    base = _baseline(tmp_path, ["--tensor-parallel-size", "8", "--enforce-eager"])
+
+    def propose(out):
+        assert cli_main(["propose", "--baseline", str(base), "--gpu-sku", SKU,
+                         "--scratch", scratch, "--out", str(out)]) == 0
+        return json.loads(out.read_text())
+
+    first = propose(tmp_path / "b1.json")
+    order_before = [a["lever"] for a in first["arms"]]
+
+    # The file has to carry both keys, or the command it prints cannot close it.
+    assert first["gpu_sku"] == SKU
+    assert first["fingerprint"]
+    cmd = first["ingest"]["command"]
+    assert f"--gpu-sku '{SKU}'" in cmd
+    assert f"--fingerprint {first['fingerprint']}" in cmd
+
+    underdog = next(a for a in reversed(first["arms"]) if a["ingestable"])
+    assert underdog["lever"] != order_before[0]
+
+    # The arm is traced in its own right, so its kernel shapes — and therefore
+    # its own digest — are not the baseline's. Ingest keys on the baseline.
+    won = _run_arm(tmp_path, underdog, rps=120.0)
+    assert cli_main(["ingest", "--baseline", str(base), "--candidate", str(won),
+                     "--scratch", scratch, "--gpu-sku", SKU]) == 0
+
+    second = propose(tmp_path / "b2.json")
+    assert second["arms"][0]["lever"] == underdog["lever"], (
+        "a measured win did not reach the next proposal on default keys")
+
+
+def test_an_arm_that_was_ingested_is_not_reported_as_refused(tmp_path):
+    """An arm with no trace can still be compared. Listing it under `refused`
+    because it could not supply the workload digest tells the operator a
+    measurement was dropped when it was kept."""
+    scratch = str(tmp_path / "scratch")
+    base = _baseline(tmp_path, ["--tensor-parallel-size", "8", "--enforce-eager"])
+    untraced = _arm(tmp_path / "results", "untraced-arm",
+                    argv=["--tensor-parallel-size", "8"], rps=70.0, trace=False)
+
+    assert cli_main(["ingest", "--baseline", str(base), "--candidate", str(untraced),
+                     "--scratch", scratch, "--gpu-sku", SKU, "--run-id", "one"]) == 0
+
+    run = tmp_path / "scratch" / "runs" / "one"
+    doc = json.loads((run / "verification.json").read_text())
+    assert len(doc["results"]) == 1          # it was ingested
+    assert doc["results"][0]["intervention_name"] == "cuda_graphs_enable"
+
+    # The baseline supplied the digest, so nothing had to be reported at all.
+    if (run / "ingest_refused.json").exists():
+        side = json.loads((run / "ingest_refused.json").read_text())
+        assert side["refused"] == [], side

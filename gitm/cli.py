@@ -523,7 +523,7 @@ def _run_propose(args) -> int:
     written = write_experiments(
         out, baseline_argv=baseline.serve_argv, arms=arms, unreachable=unreachable,
         served_model=baseline.served_model or "unknown", load=baseline.load,
-        run_id=args.run_id,
+        run_id=args.run_id, fingerprint=fingerprint, gpu_sku=args.gpu_sku,
         notes=(f"ranked against {baseline.trace_path.name} "
                f"({len(trace.kernels())} kernels); "
                f"{measured} lever(s) scored from measured results, "
@@ -532,10 +532,9 @@ def _run_propose(args) -> int:
 
     print(f"wrote {written}")
     if fingerprint:
-        # Printed so the same one can be passed to `gitm ingest`. A lever changes
-        # kernel shapes, so an arm's own fingerprint can differ from the
-        # baseline's, and records filed under one are not found under the other.
-        print(f"fingerprint: {fingerprint}  (pass to 'gitm ingest --fingerprint')")
+        # Also written into the file's ingest command, so an operator following
+        # that verbatim files the results under the key this ranking reads.
+        print(f"fingerprint: {fingerprint}")
     if history is not None:
         print(f"history   : {history.runs_read} run(s) read, "
               f"{measured} lever(s) scored from measurement")

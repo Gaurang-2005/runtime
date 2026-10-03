@@ -269,6 +269,7 @@ def write_experiments(
     path: str | Path, *, baseline_argv: Sequence[str], arms: Sequence[Arm],
     served_model: str, load: dict[str, Any], unreachable: Sequence[Unreachable] = (),
     run_id: str | None = None, notes: str | None = None,
+    fingerprint: str | None = None, gpu_sku: str | None = None,
 ) -> str:
     """Write the sweep as JSON. Returns the path written.
 
@@ -276,6 +277,12 @@ def write_experiments(
     is the baseline is not recoverable from a set of directories afterwards — the
     one with fewer flags is a guess, and a wrong guess inverts the sign of every
     delta — so the file that commissioned the sweep is where it has to be said.
+
+    ``fingerprint`` and ``gpu_sku`` are written into the ingest command this file
+    carries, because the two halves of the loop have to agree on them or the
+    results never reach the next proposal. The command used to be emitted without
+    either: an operator following it verbatim got a sweep filed under a key the
+    next ``gitm propose`` did not look under, and the loop silently did not close.
 
     ``load`` is required and written exactly as given, one shape for every arm.
     ``read_capture`` refuses two arms whose load shapes differ, since a lever
@@ -297,12 +304,18 @@ def write_experiments(
         # its candidates looks like a sweep of the ones that remained, and the
         # reasons are the most useful thing here when a lever never gets tested.
         "unreachable": [asdict(u) for u in unreachable],
+        "fingerprint": fingerprint,
+        "gpu_sku": gpu_sku,
         "ingest": {
-            "command": (
-                "gitm ingest --baseline <baseline dir> "
-                + " ".join(f"--candidate <{a.lever} dir>" for a in arms if a.ingestable)
-                + " --gpu-sku '<sku>'"
-            ),
+            # Complete, including the keys. The ranking filters history on the
+            # GPU and the workload digest, so a command missing either files
+            # results the next proposal cannot find.
+            "command": " ".join([
+                "gitm ingest --baseline <baseline dir>",
+                *(f"--candidate <{a.lever} dir>" for a in arms if a.ingestable),
+                *( [f"--gpu-sku '{gpu_sku}'"] if gpu_sku else ["--gpu-sku '<sku>'"] ),
+                *( [f"--fingerprint {fingerprint}"] if fingerprint else [] ),
+            ]),
             "not_attributable": [a.lever for a in arms if not a.ingestable],
         },
     }
