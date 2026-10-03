@@ -67,12 +67,20 @@ class SchedulerStatsSummary:
     # series on the same wall clock as vLLM's per-request timestamps and as
     # ``Trace.captured_at_ns`` — the join across the three views. 0 when unset.
     t0_wall_ns: int = 0
-    # In-flight requests, averaged over the samples that had any. The running
-    # count is the decode batch and is preferred wherever the engine exposes it;
-    # these are the fallback for the common case where it does not (see
-    # ``summarize``), and are meaningless without ``max_num_seqs`` to bound them.
+    # In-flight requests, averaged over the samples that had any, and the most
+    # ever in flight at once. Raw observations: in-flight counts queued requests
+    # as well as decoding ones, so neither is a batch.
     mean_unfinished: float | None = None
     peak_unfinished: int | None = None
+    #: The decode-batch estimate: each busy sample's in-flight count bounded by
+    #: ``max_num_seqs`` *before* averaging, because the engine decodes at most
+    #: that many at once and the surplus is queue depth. Bounding the average
+    #: instead would be a different and wrong number — gitm submits every prompt
+    #: at once, so in-flight starts above capacity and drains through it, and
+    #: ``min(mean(x), cap)`` reads a window that straddled the cap as if it sat
+    #: at the cap throughout (64 and 2 in flight at a cap of 32 is a mean batch
+    #: of 17, not 32). ``None`` without a capacity to bound against.
+    mean_bounded_inflight: float | None = None
     max_num_seqs: int | None = None
 
 
@@ -498,12 +506,16 @@ def summarize(
 ) -> SchedulerStatsSummary:
     """Aggregate a sample series into the compact summary attribution consumes.
 
-    ``mean_unfinished`` averages only over the samples that had a request in
+    The in-flight aggregates average only over the samples that had a request in
     flight. The sampler deliberately takes a snapshot before the workload is
     submitted and keeps going until the window closes, so a plain mean over
     every sample is diluted by the idle head and tail — and what the predicted
     graph needs is the concurrency *while decoding*, since a step with nothing
     in flight is not a decode step at all.
+
+    ``mean_bounded_inflight`` bounds each of those samples by ``max_num_seqs``
+    before averaging rather than after; see the field for why the two differ and
+    which one is the batch.
     """
     if not samples:
         return SchedulerStatsSummary(
@@ -541,6 +553,10 @@ def summarize(
         t0_wall_ns=t0_wall_ns,
         mean_unfinished=(sum(busy) / len(busy)) if busy else None,
         peak_unfinished=int(max(busy)) if busy else None,
+        mean_bounded_inflight=(
+            sum(min(v, max_num_seqs) for v in busy) / len(busy)
+            if busy and max_num_seqs else None
+        ),
         max_num_seqs=max_num_seqs,
     )
 

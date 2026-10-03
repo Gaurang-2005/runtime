@@ -404,15 +404,18 @@ def _batch_config_from_stats(sched: Any) -> tuple[Any, str | None]:
     process (``VLLM_ENABLE_V1_MULTIPROCESSING`` defaults on), so nothing in this
     process can reach it.
 
-    ``mean_unfinished`` comes from ``get_num_unfinished_requests()``, a method on
-    the engine handle itself and therefore readable whatever the engine core does.
-    It counts requests in flight rather than requests decoding, so it is an upper
-    bound: anything the scheduler has admitted is decoding, anything it has not is
-    queued. Clamping to ``max_num_seqs`` — the most the engine will ever decode at
-    once — turns that bound into the batch wherever the queue is what the surplus
-    is, which is the shape of every workload gitm submits (all prompts at once,
-    then drain). Without a capacity to clamp against it stays unused rather than
-    becoming a guess.
+    ``mean_bounded_inflight`` comes from ``get_num_unfinished_requests()``, a
+    method on the engine handle itself and therefore readable whatever the engine
+    core does. It counts requests in flight rather than requests decoding, so
+    each sample is an upper bound: anything the scheduler has admitted is
+    decoding, anything it has not is queued. Bounding each sample by
+    ``max_num_seqs`` — the most the engine will ever decode at once — turns that
+    into the batch wherever the queue is what the surplus is, which is the shape
+    of every workload gitm submits (all prompts at once, then drain). The
+    bounding happens per sample in :func:`~gitm.tracer.vllm_stats.summarize`,
+    which is not the same as bounding the average and is the reason this reads a
+    separate field rather than clamping ``mean_unfinished`` here. Without a
+    capacity to bound against it stays unused rather than becoming a guess.
 
     Returns ``(None, None)`` when neither is available — a CPU box, a dry run, or
     an engine that exposes no stats. Better a documented default than a fabricated
@@ -435,10 +438,9 @@ def _batch_config_from_stats(sched: Any) -> tuple[Any, str | None]:
     if running is not None and running >= 1:
         return _batch(running), "running"
 
-    unfinished = getattr(sched, "mean_unfinished", None)
-    capacity = getattr(sched, "max_num_seqs", None)
-    if unfinished is not None and unfinished >= 1 and capacity:
-        return _batch(min(float(unfinished), float(capacity))), "unfinished"
+    bounded = getattr(sched, "mean_bounded_inflight", None)
+    if bounded is not None and bounded >= 1:
+        return _batch(bounded), "unfinished"
     return None, None
 
 
@@ -1015,6 +1017,25 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         )
     # What the graph was built from, beside what it is: a residual is only as
     # good as the model, hardware and batch it was predicted for.
+    #
+    # The batch is stated outright rather than left to be read out of ``basis``.
+    # ``basis`` is built from degradations, and a batch read straight off the
+    # engine's running count is not a degradation — so on the one path where the
+    # batch is fully trustworthy the artifact said nothing about it at all, and a
+    # reader could not tell which batch priced the graph or where it came from.
+    # That is the path whose number you most want recorded when comparing two
+    # runs.
+    # Read off the graph rather than rebuilt from ``_batch``: every predict_*
+    # entry point does ``batch = batch or BatchConfig()`` and stores the result,
+    # so the graph holds the config it was actually priced with, defaults
+    # included. Reconstructing it here would be a second copy of that fallback,
+    # free to drift from the one that did the work.
+    _eff_batch = getattr(graph, "batch", None)
+    _graph_summary["batch"] = {
+        "batch": getattr(_eff_batch, "batch", None),
+        "kv_cache_len": getattr(_eff_batch, "kv_cache_len", None),
+        "source": _batch_source or "default",
+    }
     _graph_summary["basis"] = [d.to_dict() for d in degradations
                                if d.stage in (GRAPH_MODEL, GRAPH_HARDWARE, GRAPH_BATCH)]
     (run_dir / "predicted_graph.json").write_text(json.dumps(_graph_summary, indent=2))
