@@ -81,6 +81,13 @@ class InterventionSpec(BaseModel):
     #: two fields as one would reject them on a sound measurement and wrong
     #: reasoning.
     #:
+    #: "Makes the op faster" is also narrower than "shortens the step by way of
+    #: that op". ``enable_eplb`` cuts expert stragglers, but a straggler rank
+    #: runs *more* expert GEMMs rather than slower ones, so each kernel sits at
+    #: its floor while the step waits — a distribution problem the per-op gap
+    #: cannot see. Only a lever whose gain is the slack between one op and its
+    #: own floor belongs here.
+    #:
     #: Only consulted by the selection gate, and defaults false so a lever is
     #: never filtered on a mechanism nobody has stated.
     recovers_kernel_time: bool = False

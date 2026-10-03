@@ -513,9 +513,12 @@ interventions:
     knob: enable_eplb
     value: true
     applies_to_kernels: [moe_routed]  # expert load is the routed-expert GEMMs
-    # Stragglers are expert GEMMs running above their floor because the load is
-    # skewed. Balanced experts already at the floor have nothing to rebalance.
-    recovers_kernel_time: true
+    # Deliberately NOT recovers_kernel_time, though "cut stragglers" reads like
+    # it. A straggler rank runs *more* expert GEMMs, not slower ones, so each of
+    # its kernels can sit exactly at its floor while the step waits on that rank.
+    # The per-op roofline gap cannot see a distribution problem; rank skew is
+    # measured separately (importers/node_rollup.py, busy_fraction max - min),
+    # and that is the signal this lever should one day be gated on.
     expected_delta_mean: 0.03
     expected_delta_lo: -0.02
     expected_delta_hi: 0.15

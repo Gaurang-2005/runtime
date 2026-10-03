@@ -296,9 +296,30 @@ def test_the_real_catalogue_only_exposes_stated_mechanisms_to_the_gate():
 
     lib = load_library(workload="vllm-decode")
     gated = {s.name for s in lib if s.recovers_kernel_time}
-    assert gated == {"attention_backend_flashinfer", "moe_backend_deep_gemm",
-                     "enable_eplb"}
+    # Both are "same work, different kernel": if the op already runs at its
+    # roofline floor, another implementation of it has no slack to take.
+    assert gated == {"attention_backend_flashinfer", "moe_backend_deep_gemm"}
     # Every one of them is op-scoped: a whole-step lever could never be gated,
     # so declaring it there would be meaningless rather than merely unused.
     assert all(s.applies_to_kernels and not s.whole_step
                for s in lib if s.recovers_kernel_time)
+
+
+def test_eplb_is_not_gated_on_a_per_op_floor():
+    """"Cut stragglers" reads like kernel time and is not. A straggler rank runs
+    *more* expert GEMMs, not slower ones, so each kernel sits at its floor while
+    the step waits on that rank. Rank skew is measured separately
+    (importers/node_rollup.py); the per-op gap cannot see a distribution
+    problem, and gating on it would skip a lever that would have helped."""
+    from gitm.kernels.library import load_library
+
+    eplb = next(s for s in load_library(workload="vllm-decode")
+                if s.name == "enable_eplb")
+    assert eplb.applies_to_kernels == ["moe_routed"]  # still scoped there
+    assert not eplb.recovers_kernel_time              # but not gated on it
+
+    ranked = select_interventions(
+        _trace(), [eplb], Policy(require_qualification_commit=True), top_n=5,
+        recoverable={"moe_routed": 0.0},
+    )
+    assert ranked[0].rejected_reason is None
