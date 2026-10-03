@@ -10,6 +10,8 @@ lever stays visible as skipped.
 
 from __future__ import annotations
 
+import pytest
+
 from gitm.kernels.library import load_library, parse_skips, skipped_by
 from gitm.kernels.spec import Applicability, InterventionSpec, SafetyGate
 
@@ -138,3 +140,24 @@ def test_flag_and_env_patterns_merge_without_duplicating():
     Kubernetes manifest; naming the same pattern in both is not two patterns."""
     merged = parse_skips(["speculative*", "other", "speculative*"])
     assert merged == ("speculative*", "other")
+
+
+# --- the paths that return before the catalogue -----------------------------
+
+
+def test_the_curated_workloads_each_have_a_lever_a_pattern_can_reach():
+    """hft, openfold and edge each return from the loop before the catalogue is
+    read, so their one curated lever has to be checked on its own path. If a
+    pattern cannot name it, --skip-lever is silently ignored on those
+    workloads — asked for and not done, which is worse than absent."""
+    pytest.importorskip("torch")
+    specs = []
+    for mod, fn in (("gitm.benchmarks.hft.optimize", "hft_intervention_spec"),
+                    ("gitm.benchmarks.edge.optimize", "edge_intervention_spec")):
+        m = pytest.importorskip(mod)
+        specs.append(getattr(m, fn)())
+
+    for spec in specs:
+        assert skipped_by(spec, (spec.name,)) == spec.name
+        assert skipped_by(spec, ("*",)) == "*"
+        assert skipped_by(spec, ("something-else",)) is None
