@@ -42,6 +42,7 @@ from gitm.optimizer.verification_export import VerificationRecord, write_verific
 __all__ = [
     "Capture",
     "fingerprint_of",
+    "realises",
     "resolve_lever",
     "LAUNCH_ONLY_FLAGS",
     "CaptureError",
@@ -155,7 +156,7 @@ def _as_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _realises(value: Any, spec_value: Any) -> bool:
+def realises(value: Any, spec_value: Any) -> bool:
     """Whether an arm setting a knob to ``value`` is the setting ``spec_value``.
 
     A lever is a knob *and* the value it puts there — :func:`apply_intervention`
@@ -198,7 +199,7 @@ def resolve_lever(knob: str, value: Any, library: Iterable[Any]) -> Any | None:
     matches = [s for s in library if s.knob == knob_name]
     if value is None:
         return next((s for s in matches if isinstance(s.value, bool) and not s.value), None)
-    return next((s for s in matches if _realises(value, s.value)), None)
+    return next((s for s in matches if realises(value, s.value)), None)
 
 
 def _read_json(path: Path) -> dict[str, Any]:

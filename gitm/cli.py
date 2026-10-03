@@ -203,6 +203,27 @@ def _parser() -> argparse.ArgumentParser:
         epilog="Streams the trace, so a multi-GB capture is fine.",
     ))
 
+    prop = sub.add_parser(
+        "propose",
+        help="Emit the next batch of experiments from a baseline capture.",
+        epilog="The other half of 'gitm ingest': this writes the arms, that reads "
+               "their results back. Every arm is the baseline's own server argv "
+               "plus one lever, so the results round-trip by construction.",
+    )
+    prop.add_argument("--baseline", required=True, metavar="DIR",
+                      help="A capture to propose against. Supplies the server argv "
+                           "the arms are built from, the model, the load shape, and "
+                           "the trace the ranking reads.")
+    prop.add_argument("--out", default=None, metavar="FILE",
+                      help="Where to write the sweep. Defaults to experiments.json "
+                           "inside the baseline capture.")
+    prop.add_argument("--max-arms", type=int, default=None,
+                      help="Cap the sweep. One arm is one cluster job.")
+    prop.add_argument("--top-n", type=int, default=25,
+                      help="How many candidates to rank before planning arms "
+                           "(default: the whole catalogue).")
+    prop.add_argument("--run-id", default=None, help="Run id to record in the sweep.")
+
     ing = sub.add_parser(
         "ingest",
         help="Read cluster harness results into the history the ranking reads.",
@@ -394,6 +415,67 @@ def _apply_hft_run_flags(args) -> None:
     for k, v in flags.items():
         if v is not None:
             os.environ[k] = v
+
+
+def _run_propose(args) -> int:
+    """Emit the arms for the next batch, from a baseline capture.
+
+    The baseline is a capture rather than a pile of flags because every input
+    this needs is already in one: the server argv the arms are built from, the
+    model and load shape they must share to be an A/B, and the trace the ranking
+    reads. Asking for them separately would be asking the operator to restate
+    what the capture already says, with a chance of disagreeing with it.
+    """
+    from gitm.agents.policy import Policy, select_interventions
+    from gitm.kernels.library import load_library
+    from gitm.optimizer.experiment_specs import plan_arms, write_experiments
+    from gitm.optimizer.harness_results import CaptureError, read_capture
+    from gitm.optimizer.replay import _load_trace_jsonl
+
+    try:
+        baseline = read_capture(args.baseline)
+    except CaptureError as exc:
+        print(f"gitm propose: {exc}", file=sys.stderr)
+        return 2
+    if baseline.trace_path is None or not baseline.trace_path.exists():
+        print(f"gitm propose: {Path(args.baseline).name} has no trace, so there is "
+              "nothing to rank against. Capture it with tracing on.", file=sys.stderr)
+        return 2
+
+    trace = _load_trace_jsonl(baseline.trace_path)
+    library = load_library(workload="vllm-decode")
+    # The qualification gate is deliberately open here. These arms run on the
+    # cluster behind the harness's own rollback, and refusing to *propose* a
+    # high-risk lever is a different decision from refusing to apply one
+    # in-process; the sweep records what each arm is for whoever launches it.
+    ranked = select_interventions(
+        trace, library, Policy(require_qualification_commit=True),
+        top_n=args.top_n,
+    )
+    arms, unreachable = plan_arms(baseline.serve_argv, ranked, max_arms=args.max_arms)
+
+    out = Path(args.out) if args.out else Path(args.baseline) / "experiments.json"
+    written = write_experiments(
+        out, baseline_argv=baseline.serve_argv, arms=arms, unreachable=unreachable,
+        served_model=baseline.served_model or "unknown", load=baseline.load,
+        run_id=args.run_id,
+        notes=f"ranked against {baseline.trace_path.name} ({len(trace.kernels())} kernels)",
+    )
+
+    print(f"wrote {written}")
+    print(f"{len(arms)} arm(s), {len(unreachable)} lever(s) not reachable "
+          f"against this baseline")
+    for arm in arms:
+        env = f"  env {' '.join(f'{k}={v}' for k, v in arm.env.items())}" if arm.env else ""
+        mark = "" if arm.ingestable else "  (result not attributable automatically)"
+        print(f"  {arm.lever}{env}{mark}")
+    if not arms:
+        # Not an error: a baseline that already runs everything rankable is a
+        # real answer. But an empty sweep looks like a failure, so say which.
+        print("nothing to run: every ranked lever is already in the baseline or "
+              "cannot be reached from it. See the file for the reasons.",
+              file=sys.stderr)
+    return 0
 
 
 def _run_ingest(args) -> int:
@@ -599,6 +681,9 @@ def main(argv: list[str] | None = None) -> int:
             args.capture_help()
             return 2
         return _run_capture(args, serve_argv)
+
+    if args.cmd == "propose":
+        return _run_propose(args)
 
     if args.cmd == "ingest":
         return _run_ingest(args)
