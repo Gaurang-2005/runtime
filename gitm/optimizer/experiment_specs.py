@@ -63,9 +63,10 @@ __all__ = [
 
 SCHEMA = "gitm/experiments/v1"
 
-#: Default load shape for an emitted sweep. Every arm carries the same one, and
-#: ``read_capture`` refuses two arms whose load shapes differ — a lever measured
-#: under a different load is not an A/B of the baseline.
+#: A serving-shaped load for a caller that has no baseline to take one from.
+#: Never substituted for a missing one: ``read_capture`` refuses two arms whose
+#: load shapes differ, so a sweep written under an invented load is a sweep whose
+#: results the return path rejects.
 DEFAULT_LOAD: dict[str, Any] = {
     "requests": 512, "concurrency": 256, "input_tokens": 1024,
     "output_tokens": 256, "seed": 42,
@@ -189,12 +190,20 @@ def plan_arms(
     specs. A candidate the ranking already rejected is not emitted: the gate's
     answer is categorical and re-asking it here would spend cluster time on a
     lever the loop declined locally.
+
+    ``max_arms`` is checked before an arm is built rather than after it is
+    appended, so it holds on every path. Checking it after meant an
+    environment-variable arm — which takes an early exit — never saw the cap, and
+    ``max_arms=0`` still emitted one. One arm is one cluster job, so the cap is a
+    budget and has to be exact.
     """
     arms: list[Arm] = []
     out: list[Unreachable] = []
     base = list(base_argv)
 
     for item in ranked:
+        if max_arms is not None and len(arms) >= max_arms:
+            break
         spec = getattr(item, "spec", item)
         rejected = getattr(item, "rejected_reason", None)
         predicted = getattr(item, "predicted_delta", None)
@@ -252,17 +261,14 @@ def plan_arms(
         arms.append(Arm(
             lever=name, knob=knob, value=spec.value,
             serve_argv=tuple(argv), predicted_delta=predicted))
-        if max_arms is not None and len(arms) >= max_arms:
-            break
 
     return arms, out
 
 
 def write_experiments(
     path: str | Path, *, baseline_argv: Sequence[str], arms: Sequence[Arm],
-    served_model: str, unreachable: Sequence[Unreachable] = (),
-    load: dict[str, Any] | None = None, run_id: str | None = None,
-    notes: str | None = None,
+    served_model: str, load: dict[str, Any], unreachable: Sequence[Unreachable] = (),
+    run_id: str | None = None, notes: str | None = None,
 ) -> str:
     """Write the sweep as JSON. Returns the path written.
 
@@ -271,16 +277,19 @@ def write_experiments(
     one with fewer flags is a guess, and a wrong guess inverts the sign of every
     delta — so the file that commissioned the sweep is where it has to be said.
 
-    ``load`` is one shape for every arm on purpose. ``read_capture`` refuses two
-    arms whose load shapes differ, since a lever measured under a different load
-    is not an A/B of the baseline.
+    ``load`` is required and written exactly as given, one shape for every arm.
+    ``read_capture`` refuses two arms whose load shapes differ, since a lever
+    measured under a different load is not an A/B of the baseline — so
+    substituting a default for a baseline that declared none would commission a
+    sweep the return path then refuses wholesale. The caller establishes the load
+    or there is no comparable sweep to write.
     """
     path = Path(path)
     doc = {
         "schema": SCHEMA,
         "run_id": run_id,
         "served_model": served_model,
-        "load": dict(load or DEFAULT_LOAD),
+        "load": dict(load),
         "notes": notes,
         "baseline": {"name": "baseline", "serve_argv": list(baseline_argv)},
         "arms": [a.to_dict() for a in arms],

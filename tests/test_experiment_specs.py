@@ -189,7 +189,7 @@ def test_the_file_names_the_baseline_explicitly(tmp_path):
     arms, out = plan_arms(BASE, LIB, max_arms=2)
     path = write_experiments(tmp_path / "experiments.json", baseline_argv=BASE,
                              arms=arms, unreachable=out, served_model="Kimi-K2.5",
-                             run_id="sweep1")
+                             load=DEFAULT_LOAD, run_id="sweep1")
     doc = json.loads(open(path).read())
 
     assert doc["schema"] == SCHEMA
@@ -202,7 +202,8 @@ def test_the_file_names_the_baseline_explicitly(tmp_path):
 def test_the_file_carries_the_command_that_reads_the_results_back(tmp_path):
     arms, out = plan_arms(BASE, LIB, max_arms=3)
     path = write_experiments(tmp_path / "e.json", baseline_argv=BASE, arms=arms,
-                             unreachable=out, served_model="Kimi-K2.5")
+                             unreachable=out, served_model="Kimi-K2.5",
+                             load=DEFAULT_LOAD)
     doc = json.loads(open(path).read())
     assert doc["ingest"]["command"].startswith("gitm ingest --baseline")
     for arm in arms:
@@ -218,7 +219,8 @@ def test_unreachable_levers_are_always_in_the_file(tmp_path):
     _, out = plan_arms(["--tensor-parallel-size", "8"],
                        [s for s in LIB if s.name == "cuda_graphs_enable"])
     path = write_experiments(tmp_path / "e.json", baseline_argv=["--tensor-parallel-size", "8"],
-                             arms=[], unreachable=out, served_model="m")
+                             arms=[], unreachable=out, served_model="m",
+                             load=DEFAULT_LOAD)
     doc = json.loads(open(path).read())
     assert doc["arms"] == []
     assert len(doc["unreachable"]) == 1 and doc["unreachable"][0]["reason"]

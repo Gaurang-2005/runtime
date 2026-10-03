@@ -49,6 +49,7 @@ __all__ = [
     "read_capture",
     "knob_difference",
     "compare",
+    "sweep_id",
     "write_comparison",
     "write_comparisons",
 ]
@@ -427,6 +428,33 @@ def compare(
     )
 
 
+def sweep_id(baseline: Capture, candidates: Iterable[Capture]) -> str:
+    """A run id for this sweep, derived from what it measured.
+
+    Not from the directory paths. Paths identify a copy, not a sweep: an
+    operator who re-downloads the same results into a second directory gets a
+    different id, the existing-export refusal does not fire, and history counts
+    one sweep twice — reading it as corroboration of itself, which is the single
+    thing the record is least able to be.
+
+    Derived instead from the model, the load shape, and each arm's server argv
+    with the throughput it produced. Two ingests of the same measurements agree
+    wherever the files live; a re-run of the same arms that measured something
+    different is a different sweep, which it is.
+    """
+    def arm(c: Capture) -> str:
+        return f"{'|'.join(c.serve_argv)}={c.throughput!r}"
+
+    parts = [
+        str(baseline.served_model),
+        "|".join(f"{k}={v}" for k, v in sorted(baseline.load.items())),
+        arm(baseline),
+        # Sorted, so naming the same arms in another order is the same sweep.
+        *sorted(arm(c) for c in candidates),
+    ]
+    return "harness-" + hashlib.sha256("\n".join(parts).encode()).hexdigest()[:12]
+
+
 def write_comparison(
     baseline: Capture, candidate: Capture, *, out_dir: str | Path,
     library: Iterable[Any], gpu_sku: str | None = None,
@@ -446,6 +474,7 @@ def write_comparisons(
     baseline: Capture, candidates: Iterable[Capture], *, out_dir: str | Path,
     library: Iterable[Any], gpu_sku: str | None = None,
     fingerprint: str | None = None, run_id: str | None = None,
+    dry_run: bool = False,
 ) -> str:
     """Write every candidate's comparison against one baseline, as one export.
 
@@ -457,11 +486,17 @@ def write_comparisons(
     inventing a run id per arm, and a run id is how a result is traced back to
     the thing that produced it.
 
-    ``fingerprint`` is computed from the first candidate's own trace when not
-    given, by the same rule :func:`gitm.optimizer.qualification.fingerprint`
-    uses. It is never defaulted to the model name: the loop filters history on
-    the trace digest, so a record filed under ``Kimi-K2.5`` is written and then
-    filtered straight back out — invisible, not merely coarse.
+    ``fingerprint`` is computed from a trace when not given, by the same rule
+    :func:`gitm.optimizer.qualification.fingerprint` uses. It is never defaulted
+    to the model name: the loop filters history on the trace digest, so a record
+    filed under ``Kimi-K2.5`` is written and then filtered straight back out —
+    invisible, not merely coarse.
+
+    The trace comes from an arm that was **accepted**, and from the first such
+    arm that can actually be fingerprinted. Taking the first candidate as given
+    was wrong twice over: a refused arm is not part of this sweep, so filing the
+    accepted results under its workload digest hides them behind a filter; and an
+    untraced first arm raised, discarding a sweep whose other arms were fine.
 
     Every arm is compared, and one unusable arm does not discard the others:
     :func:`compare` refuses an arm that is not an A/B of the baseline, and that
@@ -472,6 +507,10 @@ def write_comparisons(
     Refuses to overwrite an existing export. A reused run id would otherwise
     replace a directory's records, and the loop's own exports live under the
     same tree.
+
+    ``dry_run`` performs every check and writes nothing, returning the path it
+    would have written. It exists so ``--dry-run`` can refuse what the real
+    command would refuse, rather than predicting a write that cannot happen.
     """
     out_dir = Path(out_dir)
     export = out_dir / EXPORT_NAME
@@ -485,10 +524,12 @@ def write_comparisons(
         raise CaptureError("no candidate arms to compare against the baseline")
 
     records: list[VerificationRecord] = []
+    accepted: list[Capture] = []
     refused: list[str] = []
     for cand in candidates:
         try:
             records.append(compare(baseline, cand, library=library))
+            accepted.append(cand)
         except CaptureError as exc:
             refused.append(f"{cand.path.name}: {exc}")
     if not records:
@@ -496,14 +537,28 @@ def write_comparisons(
             "no arm could be compared against this baseline:\n  "
             + "\n  ".join(refused))
 
+    if fingerprint is None:
+        for cand in accepted:
+            try:
+                fingerprint = fingerprint_of(cand)
+                break
+            except CaptureError as exc:
+                refused.append(f"{cand.path.name}: not fingerprintable: {exc}")
+        if fingerprint is None:
+            raise CaptureError(
+                "no accepted arm could be fingerprinted, so these results cannot "
+                "be filed against a workload the loop would recognise. Pass "
+                "--fingerprint, or capture an arm with tracing on:\n  "
+                + "\n  ".join(refused))
+
+    if dry_run:
+        return str(export)
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    prov = Provenance(
-        workload_id="vllm-serve",
-        fingerprint=fingerprint or fingerprint_of(candidates[0]),
-        run_id=run_id or out_dir.name,
-        git_sha="", gitm_version="", started_at_ns=0, ended_at_ns=0,
-    )
-    path = write_verification(records, prov, export, gpu_sku=gpu_sku)
+    # The sidecar first. The export is what the "already exists" check guards, so
+    # publishing it before the account of what was refused means a failure in
+    # between leaves records on disk, no reasons beside them, and a retry
+    # refused. Written in the order a reader needs them to be complete.
     if refused:
         # Beside the export, not inside it: the export is the evidence the
         # ranking reads, and an arm that could not be compared is not evidence
@@ -511,4 +566,10 @@ def write_comparisons(
         # ingested four looks like a sweep of four.
         (out_dir / "ingest_refused.json").write_text(
             json.dumps({"refused": refused}, indent=2) + "\n")
-    return path
+    prov = Provenance(
+        workload_id="vllm-serve",
+        fingerprint=fingerprint,
+        run_id=run_id or out_dir.name,
+        git_sha="", gitm_version="", started_at_ns=0, ended_at_ns=0,
+    )
+    return write_verification(records, prov, export, gpu_sku=gpu_sku)

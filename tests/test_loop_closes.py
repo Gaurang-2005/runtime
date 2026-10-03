@@ -82,43 +82,87 @@ def test_propose_then_ingest_puts_measured_levers_in_the_history(tmp_path):
 
 
 def test_the_next_batch_is_ranked_from_the_last_one(tmp_path):
-    """The clause that makes it a loop rather than a pipeline: results change
-    what gets proposed next."""
+    """The clause that makes it a loop rather than a pipeline: a measured result
+    changes what the *next* propose call puts first.
+
+    Asserting only that the record landed in history was the weaker claim, and
+    the one this test used to make. A record nothing reads back is the same
+    failure as no record, one layer in.
+    """
+    scratch = str(tmp_path / "scratch")
     base = _baseline(tmp_path, ["--tensor-parallel-size", "8", "--enforce-eager"])
-    cli_main(["propose", "--baseline", str(base), "--max-arms", "3",
-              "--out", str(tmp_path / "b1.json")])
-    first = json.loads((tmp_path / "b1.json").read_text())
-    lever = next(a for a in first["arms"] if a["ingestable"])
+    fp = "kimi-mi355x"
 
-    # It wins on the cluster, by a lot.
-    won = _run_arm(tmp_path, lever, rps=80.0)
+    def propose(out, **kw):
+        argv = ["propose", "--baseline", str(base), "--gpu-sku", SKU,
+                "--fingerprint", fp, "--scratch", scratch, "--out", str(out)]
+        for k, v in kw.items():
+            argv += [f"--{k.replace('_', '-')}"] + ([] if v is True else [str(v)])
+        assert cli_main(argv) == 0
+        return json.loads(out.read_text())
+
+    first = propose(tmp_path / "b1.json")
+    order_before = [a["lever"] for a in first["arms"]]
+    assert len(order_before) > 1
+
+    # Take a lever the catalogue ranked *last* and have it win big on the cluster.
+    underdog = next(a for a in reversed(first["arms"]) if a["ingestable"])
+    assert underdog["lever"] != order_before[0], "pick one the prior did not favour"
+
+    won = _run_arm(tmp_path, underdog, rps=120.0)   # 40.0 -> 120.0, +200%
     assert cli_main(["ingest", "--baseline", str(base), "--candidate", str(won),
-                     "--scratch", str(tmp_path / "scratch"), "--gpu-sku", SKU,
-                     "--fingerprint", "kimi-mi355x", "--run-id", "batch1"]) == 0
+                     "--scratch", scratch, "--gpu-sku", SKU,
+                     "--fingerprint", fp, "--run-id", "batch1"]) == 0
 
-    # The record is there for the ranking to read, and says what was measured
-    # rather than what the catalogue guessed.
-    hist = load_history(tmp_path / "scratch" / "runs", gpu_sku=SKU)
-    rec = record_for(hist, lever["lever"], gpu_sku=SKU, fingerprint="kimi-mi355x")
-    assert rec is not None and rec.mean_delta > 0.9   # 40.0 -> 80.0 rps
+    # The measurement, not the estimate, now decides the order.
+    second = propose(tmp_path / "b2.json")
+    assert second["arms"][0]["lever"] == underdog["lever"], (
+        f"a +200% measured win did not reach the front: {order_before[:3]} -> "
+        f"{[a['lever'] for a in second['arms']][:3]}")
+    assert "scored from measured results" in second["notes"]
 
-    catalogue_guess = lever["predicted_delta"]
-    assert rec.mean_delta > catalogue_guess, (
-        "the measured delta should differ from the prior, or this test is not "
-        "showing that measurement replaces estimate")
+    # And --no-history puts it back where the catalogue had it, so the change
+    # above is the history being read and not something else moving.
+    third = propose(tmp_path / "b3.json", no_history=True)
+    assert [a["lever"] for a in third["arms"]] == order_before
 
 
 def test_an_arm_the_baseline_already_runs_is_never_proposed(tmp_path):
     """Proposing it would spend a cluster job measuring the baseline against
     itself."""
     base = _baseline(tmp_path, ["--tensor-parallel-size", "8",
-                                "--enable-expert-parallel", "--enforce-eager"])
-    cli_main(["propose", "--baseline", str(base), "--out", str(tmp_path / "e.json")])
+                                "--enable-chunked-prefill", "--enforce-eager"])
+    cli_main(["propose", "--baseline", str(base), "--gpu-sku", SKU,
+              "--out", str(tmp_path / "e.json")])
     doc = json.loads((tmp_path / "e.json").read_text())
 
-    assert "enable_expert_parallel" not in {a["lever"] for a in doc["arms"]}
+    assert "enable_chunked_prefill" not in {a["lever"] for a in doc["arms"]}
     why = {u["lever"]: u["reason"] for u in doc["unreachable"]}
-    assert "already runs" in why["enable_expert_parallel"]
+    assert "already runs" in why["enable_chunked_prefill"]
+
+
+def test_a_lever_that_does_not_apply_to_this_box_is_not_proposed(tmp_path):
+    """A cluster job is expensive, so a lever restricted to NVIDIA parts must not
+    become an arm on an MI355X sweep."""
+    base = _baseline(tmp_path, ["--tensor-parallel-size", "8"])
+    cli_main(["propose", "--baseline", str(base), "--gpu-sku", SKU,
+              "--dtype", "bf16", "--out", str(tmp_path / "e.json")])
+    doc = json.loads((tmp_path / "e.json").read_text())
+
+    assert "attention_backend_flashinfer" not in {a["lever"] for a in doc["arms"]}
+    why = {u["lever"]: u["reason"] for u in doc["unreachable"]}
+    assert "A100" in why["attention_backend_flashinfer"], why["attention_backend_flashinfer"]
+
+
+def test_a_dtype_restricted_lever_is_not_proposed_when_the_dtype_is_unknown(tmp_path):
+    """A capture does not record the serving dtype, so without --dtype the levers
+    that need a specific one are held back rather than guessed at."""
+    base = _baseline(tmp_path, ["--tensor-parallel-size", "8"])
+    cli_main(["propose", "--baseline", str(base), "--gpu-sku", SKU,
+              "--out", str(tmp_path / "e.json")])
+    why = {u["lever"]: u["reason"]
+           for u in json.loads((tmp_path / "e.json").read_text())["unreachable"]}
+    assert "dtype" in why["attention_backend_flashinfer"]
 
 
 def test_an_untraced_baseline_is_refused_rather_than_ranked_on_nothing(tmp_path):
