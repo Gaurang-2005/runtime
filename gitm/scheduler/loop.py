@@ -28,7 +28,7 @@ from gitm.agents.autoresearch import (
     classify_bottleneck,
 )
 from gitm.agents.policy import Policy, select_interventions
-from gitm.kernels.library import load_library
+from gitm.kernels.library import load_library, parse_skips, skipped_by
 from gitm.optimizer.apply import (
     Applicator,
     DryRunApplicator,
@@ -254,6 +254,16 @@ class LoopConfig:
     #: always behaved. ``"recapture"`` traces the workload again after each
     #: applied candidate and re-ranks what is left against it.
     rerank: str = "off"
+    #: Levers this run must not try, as names or knobs with shell globs (see
+    #: :func:`gitm.kernels.library.skipped_by`). Merged with ``GITM_SKIP_LEVERS``
+    #: so a Kubernetes manifest can set it without a new flag in the pod spec.
+    #:
+    #: Exists because a lever can hang the model rather than merely regress: on
+    #: Kimi at TP=8 on ROCm, n-gram speculative decoding stalls in an RCCL
+    #: all-gather, and it ranks first in the catalogue, so every run met it
+    #: before anything else. Without this the only way past was to edit the
+    #: library.
+    skip_levers: tuple[str, ...] = ()
     # Optional explicit driver for the embedded/engine path. When unset, the
     # loop looks up ``workload`` in the workload registry (gitm.workloads).
     workload_runner: WorkloadRunner | None = None
@@ -1044,11 +1054,30 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # pctx was built earlier (Phase 1) so its hardware peak could feed predict_graph.
     # Relative/swept levers resolve against the live engine here, once, before
     # ranking. See expand_relative_candidates.
+    # Levers the operator excluded, before anything resolves them against the
+    # engine. Applied here rather than inside load_library so the exclusion
+    # covers this run only and the catalogue on disk stays the catalogue.
+    # One parse over both sources, so a pattern named in the flag and in the env
+    # is one pattern rather than two.
+    _skips = parse_skips([*cfg.skip_levers, os.environ.get("GITM_SKIP_LEVERS") or ""])
+    _excluded: list[dict[str, str]] = []
+    _catalogue = []
+    for s in load_library(workload=workload):
+        why = skipped_by(s, _skips) if _skips else None
+        if why is None:
+            _catalogue.append(s)
+        else:
+            _excluded.append({"lever": s.name, "knob": s.knob, "pattern": why})
     library = [
         resolved
-        for s in load_library(workload=workload)
+        for s in _catalogue
         for resolved in expand_relative_candidates(s, cfg.engine)
     ]
+    # Written whether or not anything was excluded. A lever missing from a report
+    # otherwise reads the same as one that was tried and failed, and an empty
+    # list is the evidence that nothing was quietly held back.
+    (run_dir / "skipped_levers.json").write_text(
+        json.dumps({"patterns": list(_skips), "excluded": _excluded}, indent=2))
     policy = Policy(require_qualification_commit=qual.commit, skip_high_risk=not qual.commit,
                     use_history=use_history)
     # Read once per run, filtered to this box. A lever measured on another GPU is
@@ -1252,6 +1281,14 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
 
         def _unenactable(spec: Any) -> str | None:
+            # The exclusion has to reach here too. Autoresearch proposes its own
+            # candidates rather than drawing from the catalogue, so a knob the
+            # operator excluded because it hangs the model would otherwise come
+            # straight back as a proposal.
+            if _skips:
+                why = skipped_by(spec, _skips)
+                if why is not None:
+                    return f"excluded by --skip-lever {why!r}"
             if (
                 cfg.engine is not None
                 and live_restart_fn is None
@@ -1424,6 +1461,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         "n_rejected": len(rejected),
         "bottleneck_class": ar_run.bottleneck_class,
         "n_autoresearch": len(ar_run.results),
+        # In the summary, not only the run dir: a reader comparing two runs needs
+        # to know one of them was not asked to try everything.
+        "n_skipped_levers": len(_excluded),
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
         "report_path": str(run_dir / "report.md"),
     }
