@@ -208,9 +208,32 @@ def test_the_file_carries_the_command_that_reads_the_results_back(tmp_path):
     assert doc["ingest"]["command"].startswith("gitm ingest --baseline")
     for arm in arms:
         if arm.ingestable:
-            assert f"--candidate <{arm.lever} dir>" in doc["ingest"]["command"]
+            assert f"'<{arm.lever} dir>'" in doc["ingest"]["command"]
         else:
             assert arm.lever in doc["ingest"]["not_attributable"]
+
+
+def test_the_command_survives_being_pasted_into_a_shell(tmp_path):
+    """It is a line someone copies. A SKU has spaces, a fingerprint is whatever
+    the operator passed, and the directory placeholders are angle brackets — a
+    shell reads those as redirection rather than as blanks to fill in."""
+    import shlex
+
+    arms, out = plan_arms(BASE, LIB, max_arms=2)
+    path = write_experiments(
+        tmp_path / "e.json", baseline_argv=BASE, arms=arms, unreachable=out,
+        served_model="Kimi-K2.5", load=DEFAULT_LOAD,
+        gpu_sku="Bob's Instinct MI355X", fingerprint="Kimi MI355X",
+    )
+    cmd = json.loads(open(path).read())["ingest"]["command"]
+
+    # Tokenises the way a shell would, with each value arriving as one argument.
+    tokens = shlex.split(cmd)
+    assert tokens[tokens.index("--gpu-sku") + 1] == "Bob's Instinct MI355X"
+    assert tokens[tokens.index("--fingerprint") + 1] == "Kimi MI355X"
+    assert tokens[tokens.index("--baseline") + 1] == "<baseline dir>"
+    # No stray redirection left in the line.
+    assert "<" not in cmd.replace("'<", "").replace(" dir>'", "")
 
 
 def test_unreachable_levers_are_always_in_the_file(tmp_path):

@@ -44,6 +44,7 @@ of the ones that remained.
 from __future__ import annotations
 
 import json
+import shlex
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -310,11 +311,18 @@ def write_experiments(
             # Complete, including the keys. The ranking filters history on the
             # GPU and the workload digest, so a command missing either files
             # results the next proposal cannot find.
+            #
+            # Every substituted value goes through shlex.quote, because this is a
+            # line someone pastes into a shell. A SKU has spaces in it, a
+            # fingerprint is whatever the operator passed, and the directory
+            # placeholders are angle brackets — which a shell reads as
+            # redirection, not as a blank to fill in.
             "command": " ".join([
-                "gitm ingest --baseline <baseline dir>",
-                *(f"--candidate <{a.lever} dir>" for a in arms if a.ingestable),
-                *( [f"--gpu-sku '{gpu_sku}'"] if gpu_sku else ["--gpu-sku '<sku>'"] ),
-                *( [f"--fingerprint {fingerprint}"] if fingerprint else [] ),
+                "gitm ingest --baseline", shlex.quote("<baseline dir>"),
+                *(f"--candidate {shlex.quote(f'<{a.lever} dir>')}"
+                  for a in arms if a.ingestable),
+                "--gpu-sku", shlex.quote(gpu_sku or "<sku>"),
+                *(["--fingerprint", shlex.quote(fingerprint)] if fingerprint else []),
             ]),
             "not_attributable": [a.lever for a in arms if not a.ingestable],
         },
