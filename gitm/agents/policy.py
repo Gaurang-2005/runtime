@@ -66,12 +66,23 @@ def _at_its_floor(
 ) -> str | None:
     """Why this lever cannot recover anything, or ``None`` if it might.
 
-    Only an op-scoped lever can be ruled out this way. A ``whole_step`` lever
-    reshapes the step itself — batch shape, admission order, graph capture — so
-    no per-op gap speaks to it, and a lever that names no op at all has declared
-    no target to check.
+    The question is narrower than "does this lever touch a region at its floor".
+    It is "does this lever's *gain* come from making that region faster" — only
+    then does the region's floor bound what the lever can deliver. So the lever
+    has to have said so, via ``recovers_kernel_time``.
 
-    Three states per op, and only one of them rules the lever out:
+    That rules out most of the catalogue, correctly. Five of the six levers
+    scoped to ``attn_score_value`` work through cache capacity, host swap or
+    avoided recomputation rather than through faster attention kernels, and none
+    of them need attention to be above its floor to pay off. ``applies_to_kernels``
+    answers which kernels a lever touches, which is what coverage needs; reading
+    it as a claim about mechanism is a different and wrong question, and would
+    reject those five on a sound measurement.
+
+    A ``whole_step`` lever is never ruled out: it reshapes the step itself —
+    batch shape, admission order, graph capture — so no per-op gap speaks to it.
+
+    Then, per op, three states, and the lever survives any of them:
 
     * **present and positive** — the region is over its floor. Keep.
     * **present and ``None``** — the op's layers disagree and the gap cannot be
@@ -80,17 +91,21 @@ def _at_its_floor(
     * **absent** — no kernel of that op was classified in this window. Keep.
       Absence is ambiguous between "did not run" and "ran but the classifier
       could not name it", and on a trace where most kernels match no graph op the
-      second is the common case. Rejecting on absence would discard most of the
-      op-scoped catalogue for a reason that is about graph coverage rather than
-      about the lever.
+      second is the common case. Rejecting on absence would discard levers for a
+      reason that is about graph coverage rather than about the lever.
 
-    So a lever is dropped only when *every* op it names was measured, soundly,
-    at or under its predicted floor.
+    A lever is dropped only when **every** op it names was measured, soundly, at
+    or under its predicted floor. Every op it names, not every op that happened
+    to be in the map: one op at its floor beside another that was never judged is
+    partial evidence, and the catalogue does carry multi-op levers
+    (``quantization_awq`` names five) where that distinction decides the outcome.
     """
     if spec.whole_step or not spec.applies_to_kernels:
         return None
-    judged = [(op, recoverable[op]) for op in spec.applies_to_kernels if op in recoverable]
-    if not judged or any(gap is None or gap > 0 for _, gap in judged):
+    if not spec.recovers_kernel_time:
+        return None
+    judged = [(op, recoverable.get(op)) for op in spec.applies_to_kernels]
+    if any(gap is None or gap > 0 for _, gap in judged):
         return None
     return ", ".join(op for op, _ in judged) + " at predicted floor"
 

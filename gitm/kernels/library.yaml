@@ -279,6 +279,9 @@ interventions:
     knob: VLLM_ATTENTION_BACKEND
     value: FLASHINFER
     applies_to_kernels: [attn_score_value]  # attention kernel swap only
+    # A different attention kernel for the same work: if the attention already
+    # runs at its roofline floor there is no slack for a faster kernel to take.
+    recovers_kernel_time: true
     expected_delta_mean: 0.07
     expected_delta_lo: -0.03
     expected_delta_hi: 0.15
@@ -452,6 +455,9 @@ interventions:
     # classify to moe_routed, never to the dense mlp_* ops, so a dense-op scope
     # covered nothing on a real MoE trace.
     applies_to_kernels: [moe_routed]
+    # A different kernel for the same expert GEMMs, so its gain is the slack
+    # between the observed GEMM time and its floor.
+    recovers_kernel_time: true
     expected_delta_mean: 0.05
     expected_delta_lo: -0.05
     expected_delta_hi: 0.20
@@ -507,6 +513,9 @@ interventions:
     knob: enable_eplb
     value: true
     applies_to_kernels: [moe_routed]  # expert load is the routed-expert GEMMs
+    # Stragglers are expert GEMMs running above their floor because the load is
+    # skewed. Balanced experts already at the floor have nothing to rebalance.
+    recovers_kernel_time: true
     expected_delta_mean: 0.03
     expected_delta_lo: -0.02
     expected_delta_hi: 0.15

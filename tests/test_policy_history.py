@@ -26,11 +26,11 @@ def _trace() -> Trace:
     )
 
 
-def _spec(name, kernels, *, mean=0.05) -> InterventionSpec:
+def _spec(name, kernels, *, mean=0.05, kernel_time=False) -> InterventionSpec:
     return InterventionSpec(
         name=name, summary="s", knob=name, value=1,
         expected_delta_mean=mean, expected_delta_lo=0.0, expected_delta_hi=0.1,
-        source="t", applies_to_kernels=kernels,
+        source="t", applies_to_kernels=kernels, recovers_kernel_time=kernel_time,
         applicability=Applicability(workloads=["vllm-decode"]),
         safety=SafetyGate(tier="moderate"),
     )
@@ -192,7 +192,8 @@ def test_no_fingerprint_means_no_substitution():
 def test_lever_aimed_at_a_region_at_its_floor_is_not_a_candidate():
     """The point of the gate: coverage says the lever touches the trace, the
     residuals say the region it touches has nothing to give back."""
-    specs = [_spec("fix_moe", ["moe_routed"]), _spec("fix_gemm", ["gemm"])]
+    specs = [_spec("fix_moe", ["moe_routed"], kernel_time=True),
+             _spec("fix_gemm", ["gemm"], kernel_time=True)]
     ranked = select_interventions(
         _trace(), specs, Policy(), top_n=5,
         recoverable={"moe_routed": 0.0, "gemm": 0.004},
@@ -208,7 +209,7 @@ def test_lever_aimed_at_a_region_at_its_floor_is_not_a_candidate():
 
 def test_no_recoverable_map_gates_nothing():
     """Every caller that does not pass one keeps exactly its old behaviour."""
-    specs = [_spec("fix_moe", ["moe_routed"])]
+    specs = [_spec("fix_moe", ["moe_routed"], kernel_time=True)]
     ranked = select_interventions(_trace(), specs, Policy(), top_n=5)
     assert ranked[0].rejected_reason is None
 
@@ -227,7 +228,8 @@ def test_whole_step_lever_is_never_gated_by_a_per_op_floor():
 def test_unjudgeable_and_absent_ops_are_kept():
     """An unanswered question is not a no. ``None`` means the gap could not be
     measured soundly; an op missing from the map was never classified at all."""
-    specs = [_spec("unjudgeable", ["moe_routed"]), _spec("absent", ["attn_prefill"])]
+    specs = [_spec("unjudgeable", ["moe_routed"], kernel_time=True),
+             _spec("absent", ["attn_prefill"], kernel_time=True)]
     ranked = select_interventions(
         _trace(), specs, Policy(), top_n=5, recoverable={"moe_routed": None},
     )
@@ -236,7 +238,7 @@ def test_unjudgeable_and_absent_ops_are_kept():
 
 def test_a_lever_is_kept_if_any_op_it_names_is_over_its_floor():
     """Dropping it would discard the one region it could still help."""
-    spec = _spec("both", ["moe_routed", "gemm"])
+    spec = _spec("both", ["moe_routed", "gemm"], kernel_time=True)
     ranked = select_interventions(
         _trace(), [spec], Policy(), top_n=5,
         recoverable={"moe_routed": 0.0, "gemm": 0.004},
@@ -247,10 +249,56 @@ def test_a_lever_is_kept_if_any_op_it_names_is_over_its_floor():
 def test_the_gate_runs_before_safety_reasons_but_does_not_mask_them():
     """A lever that is both unsafe and pointless reports one reason, and either
     way it is rejected — the ordering must not let one state hide the other."""
-    spec = _spec("risky", ["moe_routed"])
+    spec = _spec("risky", ["moe_routed"], kernel_time=True)
     spec = spec.model_copy(update={"safety": SafetyGate(tier="high_risk")})
     ranked = select_interventions(
         _trace(), [spec], Policy(skip_high_risk=True), top_n=5,
         recoverable={"moe_routed": 0.0},
     )
     assert ranked[0].rejected_reason is not None
+
+
+def test_a_lever_that_has_not_claimed_a_kernel_local_mechanism_is_never_gated():
+    """``applies_to_kernels`` says which kernels a lever touches, not where its
+    gain comes from. Five of the six real levers scoped to attention work through
+    cache capacity, host swap or avoided recomputation, and none of them need
+    attention to be above its floor to pay off."""
+    spec = _spec("bigger_kv_cache", ["attn_score_value"])  # kernel_time defaults off
+    ranked = select_interventions(
+        _trace(), [spec], Policy(), top_n=5, recoverable={"attn_score_value": 0.0},
+    )
+    assert ranked[0].rejected_reason is None
+
+
+def test_one_op_at_its_floor_beside_an_unjudged_one_is_partial_evidence():
+    """``quantization_awq`` names five ops. Rejecting on the subset that happens
+    to be in the map would drop it on evidence about one op while another was
+    never measured at all."""
+    spec = _spec("quantise", ["qkv_proj", "lm_head"], kernel_time=True)
+    ranked = select_interventions(
+        _trace(), [spec], Policy(), top_n=5,
+        recoverable={"qkv_proj": 0.0},  # lm_head never classified
+    )
+    assert ranked[0].rejected_reason is None
+
+    # With both measured at their floor, it is complete evidence and it goes.
+    ranked = select_interventions(
+        _trace(), [spec], Policy(), top_n=5,
+        recoverable={"qkv_proj": 0.0, "lm_head": 0.0},
+    )
+    assert ranked[0].rejected_reason is not None
+
+
+def test_the_real_catalogue_only_exposes_stated_mechanisms_to_the_gate():
+    """Pins the audit behind the flag: a lever reaches the gate only by declaring
+    that its gain is the slack between an op and its floor."""
+    from gitm.kernels.library import load_library
+
+    lib = load_library(workload="vllm-decode")
+    gated = {s.name for s in lib if s.recovers_kernel_time}
+    assert gated == {"attention_backend_flashinfer", "moe_backend_deep_gemm",
+                     "enable_eplb"}
+    # Every one of them is op-scoped: a whole-step lever could never be gated,
+    # so declaring it there would be meaningless rather than merely unused.
+    assert all(s.applies_to_kernels and not s.whole_step
+               for s in lib if s.recovers_kernel_time)
