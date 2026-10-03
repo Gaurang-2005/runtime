@@ -61,7 +61,7 @@ from gitm.optimizer.deviation import deviation_summary, deviation_trace, write_d
 from gitm.optimizer.dr import attribute_dr
 from gitm.optimizer.history import load_history
 from gitm.optimizer.measure import measure_trace, measurement_claims, measurement_summary
-from gitm.optimizer.monitor import check_invariants, residuals
+from gitm.optimizer.monitor import check_invariants, recoverable_by_op, residuals
 from gitm.optimizer.qualification import qualify
 from gitm.optimizer.report import Claim, build_provenance, write_report
 from gitm.optimizer.scheduler_attribution import scheduler_causes
@@ -1066,9 +1066,17 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             "gpu_sku": pctx.sku,
             "fingerprint": qual.fingerprint,
         }, indent=2))
+    # Where time is actually recoverable, per op, from the residuals already
+    # computed above. This is the first thing in selection that depends on the
+    # trace rather than on the catalogue: a lever aimed at a region measured at
+    # its predicted floor is not a candidate, however well it scores. Only valid
+    # when the graph is this model's — against a default dense graph the floors
+    # describe another model, so gating on them would reject real levers for a
+    # reason that is about the graph.
+    _recoverable = recoverable_by_op(res) if graph_default_why is None else None
     ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions,
                                   ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
-                                  fingerprint=qual.fingerprint)
+                                  fingerprint=qual.fingerprint, recoverable=_recoverable)
     (run_dir / "ranked_candidates.json").write_text(
         json.dumps(
             [
@@ -1079,6 +1087,22 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 }
                 for c in ranked
             ],
+            indent=2,
+        )
+    )
+    # The gate's own input, saved beside what it decided. A lever dropped for
+    # "no_recoverable_time" is a claim about the trace, and the claim is only
+    # checkable if the measured gaps are written down next to it.
+    (run_dir / "recoverable_ops.json").write_text(
+        json.dumps(
+            {
+                "basis": ("per-kernel residuals against this model's graph"
+                          if _recoverable is not None else None),
+                "not_gated_because": (None if _recoverable is not None
+                                      else "the predicted graph is a default, so its "
+                                           "per-op floors describe another model"),
+                "recoverable_s": _recoverable,
+            },
             indent=2,
         )
     )
@@ -1219,10 +1243,15 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 workload=workload, run_id=run_id, runner=runner)
             was = [x.spec.name for x in queue]
             if fresh is not None and fresh.kernels():
+                # Re-derived from the fresh trace, not reused: a region the
+                # last candidate fixed is now at its floor, and the whole point
+                # of re-capturing is that the deviation profile has moved.
                 queue = select_interventions(
                     fresh, [x.spec for x in queue], policy, top_n=len(queue),
                     ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
-                    fingerprint=qual.fingerprint)
+                    fingerprint=qual.fingerprint,
+                    recoverable=(recoverable_by_op(residuals(fresh, graph))
+                                 if _recoverable is not None else None))
             now = [x.spec.name for x in queue]
             reranks.append({
                 "after": c.spec.name,

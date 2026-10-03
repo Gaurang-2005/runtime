@@ -184,3 +184,73 @@ def test_no_fingerprint_means_no_substitution():
                      fingerprint=None)
 
     assert all(c.delta_source == "prior" for c in ranked)
+
+
+# ── gating on where time is actually recoverable ─────────────────────────────
+
+
+def test_lever_aimed_at_a_region_at_its_floor_is_not_a_candidate():
+    """The point of the gate: coverage says the lever touches the trace, the
+    residuals say the region it touches has nothing to give back."""
+    specs = [_spec("fix_moe", ["moe_routed"]), _spec("fix_gemm", ["gemm"])]
+    ranked = select_interventions(
+        _trace(), specs, Policy(), top_n=5,
+        recoverable={"moe_routed": 0.0, "gemm": 0.004},
+    )
+    by = {c.spec.name: c for c in ranked}
+    assert by["fix_moe"].rejected_reason is not None
+    assert "no_recoverable_time" in by["fix_moe"].rejected_reason
+    assert "moe_routed" in by["fix_moe"].rejected_reason
+    assert by["fix_gemm"].rejected_reason is None
+    # Rejected sorts last, so the one that can help is picked first.
+    assert ranked[0].spec.name == "fix_gemm"
+
+
+def test_no_recoverable_map_gates_nothing():
+    """Every caller that does not pass one keeps exactly its old behaviour."""
+    specs = [_spec("fix_moe", ["moe_routed"])]
+    ranked = select_interventions(_trace(), specs, Policy(), top_n=5)
+    assert ranked[0].rejected_reason is None
+
+
+def test_whole_step_lever_is_never_gated_by_a_per_op_floor():
+    """It reshapes the step rather than aiming at a region, so no per-op gap
+    speaks to it — gating it on one would be reading the map backwards."""
+    spec = _spec("cuda_graphs", [])
+    spec = spec.model_copy(update={"whole_step": True})
+    ranked = select_interventions(
+        _trace(), [spec], Policy(), top_n=5, recoverable={"moe_routed": 0.0},
+    )
+    assert ranked[0].rejected_reason is None
+
+
+def test_unjudgeable_and_absent_ops_are_kept():
+    """An unanswered question is not a no. ``None`` means the gap could not be
+    measured soundly; an op missing from the map was never classified at all."""
+    specs = [_spec("unjudgeable", ["moe_routed"]), _spec("absent", ["attn_prefill"])]
+    ranked = select_interventions(
+        _trace(), specs, Policy(), top_n=5, recoverable={"moe_routed": None},
+    )
+    assert all(c.rejected_reason is None for c in ranked)
+
+
+def test_a_lever_is_kept_if_any_op_it_names_is_over_its_floor():
+    """Dropping it would discard the one region it could still help."""
+    spec = _spec("both", ["moe_routed", "gemm"])
+    ranked = select_interventions(
+        _trace(), [spec], Policy(), top_n=5,
+        recoverable={"moe_routed": 0.0, "gemm": 0.004},
+    )
+    assert ranked[0].rejected_reason is None
+
+
+def test_the_gate_runs_before_safety_reasons_but_does_not_mask_them():
+    """A lever that is both unsafe and pointless reports one reason, and either
+    way it is rejected — the ordering must not let one state hide the other."""
+    spec = _spec("risky", ["moe_routed"])
+    spec = spec.model_copy(update={"safety": SafetyGate(tier="high_risk")})
+    ranked = select_interventions(
+        _trace(), [spec], Policy(skip_high_risk=True), top_n=5,
+        recoverable={"moe_routed": 0.0},
+    )
+    assert ranked[0].rejected_reason is not None
