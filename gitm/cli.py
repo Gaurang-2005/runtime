@@ -203,6 +203,34 @@ def _parser() -> argparse.ArgumentParser:
         epilog="Streams the trace, so a multi-GB capture is fine.",
     ))
 
+    ing = sub.add_parser(
+        "ingest",
+        help="Read cluster harness results into the history the ranking reads.",
+        epilog="One baseline and the arms measured against it. Writes "
+               "runs/<run-id>/verification.json, which 'gitm run --use-history' "
+               "then reads like any local result.",
+    )
+    ing.add_argument("--baseline", required=True, metavar="DIR",
+                     help="The baseline arm's capture directory.")
+    ing.add_argument("--candidate", required=True, action="append", metavar="DIR",
+                     help="An arm measured against it. Repeat for a sweep.")
+    ing.add_argument("--run-id", default=None,
+                     help="Run id to file these under. Defaults to a digest of the "
+                          "arms, so re-ingesting the same sweep collides instead of "
+                          "silently double-counting it.")
+    ing.add_argument("--gpu-sku", default=None,
+                     help="The GPU these ran on, e.g. 'AMD Instinct MI355X'. "
+                          "Required for the ranking to use them: a result measured "
+                          "on another box is not evidence about this one, and "
+                          "history drops records with no SKU.")
+    ing.add_argument("--fingerprint", default=None,
+                     help="Workload fingerprint. Defaults to one computed from the "
+                          "first candidate's own trace.")
+    ing.add_argument("--scratch", default=None,
+                     help="Scratch root holding runs/. Defaults to the usual one.")
+    ing.add_argument("--dry-run", action="store_true",
+                     help="Print what would be written and exit.")
+
     inst = sub.add_parser(
         "install",
         help="Prepare a CUDA host: driver-matched CUPTI, pinned vLLM/torch, tracer shim.",
@@ -368,6 +396,76 @@ def _apply_hft_run_flags(args) -> None:
             os.environ[k] = v
 
 
+def _run_ingest(args) -> int:
+    """Read harness captures into the history the ranking reads.
+
+    This is the loop's return edge. ``runtime-experiment-harness`` runs arms
+    across the cluster and leaves a summary and manifest in each one's
+    directory; the converter for them has existed and had no caller, so every
+    result measured on the cluster was invisible to the ranking that reads
+    history. There is nothing to add to the loop itself — the loop drives a
+    local engine and never sees a harness directory — so the operator is the
+    caller, after a sweep lands.
+    """
+    import hashlib
+
+    from gitm._paths import runs_dir
+    from gitm.kernels.library import load_library
+    from gitm.optimizer.harness_results import (
+        CaptureError,
+        read_capture,
+        write_comparisons,
+    )
+
+    try:
+        baseline = read_capture(args.baseline)
+        candidates = [read_capture(c) for c in args.candidate]
+    except CaptureError as exc:
+        print(f"gitm ingest: {exc}", file=sys.stderr)
+        return 2
+
+    # Default run id is a digest of the arms rather than a timestamp, so
+    # re-ingesting the same sweep hits the "already exists" refusal instead of
+    # filing the same measurements a second time and letting the ranking count
+    # them twice.
+    run_id = args.run_id or "harness-" + hashlib.sha256(
+        "\n".join(sorted(str(Path(p).resolve())
+                          for p in [args.baseline, *args.candidate])).encode()
+    ).hexdigest()[:12]
+    out_dir = runs_dir(args.scratch) / run_id
+
+    if args.dry_run:
+        print(f"run id   : {run_id}")
+        print(f"would write: {out_dir / 'verification.json'}")
+        print(f"baseline : {baseline.path}")
+        for c in candidates:
+            print(f"candidate: {c.path}")
+        if not args.gpu_sku:
+            print("note     : no --gpu-sku, so the ranking will not read these")
+        return 0
+
+    try:
+        written = write_comparisons(
+            baseline, candidates, out_dir=out_dir, library=load_library(),
+            gpu_sku=args.gpu_sku, fingerprint=args.fingerprint, run_id=run_id,
+        )
+    except CaptureError as exc:
+        print(f"gitm ingest: {exc}", file=sys.stderr)
+        return 1
+
+    refused = out_dir / "ingest_refused.json"
+    print(f"wrote {written}")
+    if refused.exists():
+        print(f"some arms could not be compared, see {refused}", file=sys.stderr)
+    if not args.gpu_sku:
+        # Not an error: the export is still correct and still readable by hand.
+        # But history filters on the SKU, so without one these records exist and
+        # are never read, which is the quieter failure of the two.
+        print("warning: no --gpu-sku given, so 'gitm run --use-history' will "
+              "filter these out", file=sys.stderr)
+    return 0
+
+
 def _run_capture(args, serve_argv: list[str] | None) -> int:
     if args.capture_mode == "serve":
         from gitm.serve.vllm import launch_and_capture
@@ -501,6 +599,9 @@ def main(argv: list[str] | None = None) -> int:
             args.capture_help()
             return 2
         return _run_capture(args, serve_argv)
+
+    if args.cmd == "ingest":
+        return _run_ingest(args)
 
     if args.cmd == "deviate":
         from gitm.optimizer.deviation import main as deviate_main
