@@ -121,6 +121,35 @@ def vllm_argv_start(cmdline: list[str]) -> int | None:
 _PYTHON = re.compile(r"(^|/)python[0-9.]*$")
 
 
+#: Interpreter options whose value is the next token: ``-X dev``, ``-W ignore``.
+#: Written joined (``-Xdev``) they are one token and need no special case.
+_PYTHON_VALUE_OPTIONS = frozenset({"-X", "-W"})
+
+
+def _interpreter_options(tokens: list[str]) -> list[str] | None:
+    """``tokens`` if they are all the interpreter's own options, else ``None``.
+
+    Single-dash options, with the separate value ``-X`` and ``-W`` take. Anything
+    else (a long option, a bare word that is not such a value) is not something
+    we can tell apart from a launcher, so it refuses rather than guesses.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if not tok.startswith("-") or tok.startswith("--"):
+            return None
+        if tok in _PYTHON_VALUE_OPTIONS:
+            if i + 1 >= len(tokens):
+                return None
+            out += [tok, tokens[i + 1]]
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
 def vllm_launch_argv(cmdline: list[str]) -> list[str] | None:
     """The command that would start this server again, or ``None``.
 
@@ -148,15 +177,15 @@ def vllm_launch_argv(cmdline: list[str]) -> list[str] | None:
         prefix = [str(a) for a in cmdline[:i]]
         if module and prefix and prefix[-1] == "-m":
             prefix = prefix[:-1]
-        if prefix and not (_PYTHON.search(prefix[0])
-                           and all(a.startswith("-") and not a.startswith("--")
-                                   for a in prefix[1:])):
+        if prefix and not _PYTHON.search(prefix[0]):
             return None
-        # The interpreter's own options (-O, -u, -X ...) change how the server
-        # runs, so an arm without them is not an A/B of this baseline. A module
-        # launch keeps them; `vllm` as a console script cannot take them, so a
-        # baseline that ran its script under options has no faithful command.
-        options = prefix[1:]
+        options = _interpreter_options(prefix[1:])
+        if options is None:
+            return None
+        # The interpreter's own options (-O, -u, -X dev ...) change how the
+        # server runs, so an arm without them is not an A/B of this baseline. A
+        # module launch keeps them; `vllm` as a console script cannot take them,
+        # so a baseline that ran its script under options has no faithful command.
         rest = [str(a) for a in cmdline[i + 1:]]
         if console:
             return None if options else ["vllm", *rest]

@@ -630,6 +630,11 @@ def test_a_launched_capture_still_wins_on_its_own_field(tmp_path):
     (["/usr/bin/python3.12", "-O", "-m", "vllm.entrypoints.openai.api_server",
       "--model", "Kimi-K2.5"],
      ("python", "-O", "-m", "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5")),
+    # An option that takes its value as the next token keeps it.
+    (["/usr/bin/python3", "-X", "dev", "-W", "ignore", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"],
+     ("python", "-X", "dev", "-W", "ignore", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5")),
     # `vllm` takes no interpreter options, so a console script run under them
     # has no faithful command.
     (["/usr/bin/python3.12", "-u", ".venv/bin/vllm", "serve", "Kimi-K2.5"], ()),
