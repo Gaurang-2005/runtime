@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import os
 import socket
+import time
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -71,6 +73,19 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return int(s.getsockname()[1])
+
+
+def _main_is_importable() -> bool:
+    """Whether a spawned child could re-import this process's ``__main__``.
+
+    Spawn starts the child by importing ``__main__`` from its file. A script or a
+    console script has one; ``python -c``, a stdin heredoc and a notebook kernel
+    do not, and a spawned engine dies before it builds.
+    """
+    import sys
+
+    path = getattr(sys.modules.get("__main__"), "__file__", None)
+    return bool(path) and Path(path).is_file()
 
 
 # --- built-in workloads ------------------------------------------------------
@@ -543,6 +558,111 @@ def _openfold_factory(cfg: LoopConfig) -> WorkloadRunner:
     )
     return run
 
+#: What vLLM names the processes that hold the model. ``EngineCore`` for a
+#: single engine, ``EngineCore_DP{n}`` under data parallelism
+#: (vllm/v1/engine/utils.py). Matching on the name keeps this to vLLM's own
+#: workers: a run has other children, and reaping one of those to free a GPU
+#: would be a cure worse than the disease.
+ENGINE_WORKER_PREFIX = "EngineCore"
+
+
+def _shutdown_timeout() -> float:
+    """Seconds to wait for workers before forcing them, from the environment.
+
+    A bad value warns and falls back rather than raising: this is read on the
+    teardown path, and an exception there would skip the cleanup entirely.
+    """
+    raw = os.environ.get("GITM_SHUTDOWN_TIMEOUT_S")
+    if not raw:
+        return 30.0
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        warnings.warn(
+            f"GITM_SHUTDOWN_TIMEOUT_S={raw!r} is not a number; waiting 30s for "
+            "engine workers instead", RuntimeWarning, stacklevel=2)
+        return 30.0
+
+
+def engine_worker_pids() -> set[int]:
+    """PIDs of vLLM engine-core processes that are children of this one.
+
+    Sampled around an engine build so each engine can be told which workers are
+    *its* own. The name alone cannot do that: in parallel restart mode the
+    baseline and the candidate are up at the same time and their workers are
+    named identically, so a name-matched sweep during the candidate's teardown
+    would take the baseline's down with it — and the restore path then
+    reactivates a baseline engine whose workers are gone.
+    """
+    import multiprocessing as mp
+
+    return {p.pid for p in mp.active_children()
+            if (p.name or "").startswith(ENGINE_WORKER_PREFIX) and p.pid}
+
+
+def reap_engine_workers(pids: set[int] | None, timeout_s: float = 30.0) -> list[str]:
+    """Wait for *these* engine-core workers to exit. Returns what had to be forced.
+
+    The model lives in those processes, not in this one. ``VLLM_ENABLE_V1_MULTIPROCESSING``
+    defaults on, so the weights and the KV cache are held by a child, and until
+    that child is gone its GPU memory is gone with it — the next engine build
+    then reports ``Free memory 0.0/287.98 GiB`` and the run ends there.
+
+    Calling ``shutdown()`` is not the same as the memory coming back, which is
+    why this waits instead of trusting the call. vLLM's ``MPClient.shutdown``
+    no-ops when its finalizer has already run, and gitm's teardown stops at the
+    first ``shutdown`` attribute it finds, which may not be the one that owns the
+    workers. Either way the call returns and the processes are still up.
+
+    Escalation is deliberate and ordered: wait, then ``terminate``, then
+    ``kill``. Terminating a worker mid-CUDA-teardown is not free, but it is
+    bounded, and the alternative is a run that cannot rebuild a baseline and
+    loses everything it had left to measure.
+
+    ``pids`` is what makes that safe. It comes from
+    :func:`engine_worker_pids` sampled around the build, so only the engine
+    being shut down loses its workers.
+    """
+    import multiprocessing as mp
+
+    if not pids:
+        # Either this engine ran its core in-process, or its workers are not
+        # multiprocessing children of ours. Nothing here can be attributed to
+        # it, and reaping by name instead would be reaping somebody else's.
+        return []
+
+    # active_children() also joins any child that has already exited, so this
+    # clears the finished ones before deciding who is late.
+    workers = [p for p in mp.active_children() if p.pid in pids]
+    if not workers:
+        return []
+
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    for proc in workers:
+        proc.join(max(0.0, deadline - time.monotonic()))
+
+    forced: list[str] = []
+    for proc in workers:
+        if not proc.is_alive():
+            continue
+        how = "terminate"
+        try:
+            proc.terminate()
+            proc.join(5.0)
+            if proc.is_alive():
+                how = "kill"
+                proc.kill()
+                proc.join(2.0)
+        except Exception as exc:  # noqa: BLE001 - a worker we cannot signal is
+            # still worth naming; swallowing it would report a clean teardown.
+            forced.append(f"{proc.name} (pid {proc.pid}): {how} failed: {exc}")
+            continue
+        forced.append(
+            f"{proc.name} (pid {proc.pid}): did not exit within {timeout_s:.0f}s, "
+            f"{how}d" + ("" if not proc.is_alive() else " and still alive"))
+    return forced
+
+
 @register("vllm-decode")
 def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     """Launch a vLLM decode job inside the tracer capture window.
@@ -587,6 +707,30 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         return _vllm_synthetic_runner(n_prompts, max_tokens)
 
     import time
+
+    from gitm.tracer import injection
+
+    # Before vLLM is imported or any engine is built, because it decides how the
+    # EngineCore child starts. ``capture serve`` gets the same settings from
+    # apply_tracing_env(); this covers `gitm run` launched with the collector
+    # variables exported by hand, which is how the runbook does it. setdefault,
+    # so an operator who chose a start method keeps it.
+    if injection.active_vendor() == "amd":
+        if _main_is_importable():
+            for key, value in injection.AMD_PROCESS_ENV.items():
+                os.environ.setdefault(key, value)
+        elif "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ:
+            # Spawn would fail to start even the first engine here: the child
+            # re-imports __main__, and `python -c`, a stdin heredoc or a notebook
+            # has none to import. Left on fork, which works at TP>1 and is the
+            # known empty-trace case at TP=1, so say which.
+            import warnings
+
+            warnings.warn(
+                "gitm: this process has no importable __main__ (python -c, stdin, "
+                "or a notebook), so vLLM's workers stay on fork. On ROCm a forked "
+                "EngineCore records no kernels at TP=1. Run from a script file or "
+                "the gitm command to get a trace.", RuntimeWarning, stacklevel=2)
 
     from vllm import LLM, SamplingParams
 
@@ -709,6 +853,30 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             except Exception:
                 pass
 
+        # Before the allocator cleanup below, which only touches this process.
+        # The device memory belongs to the workers, so nothing is free until
+        # they are gone.
+        #
+        # The timeout is resolved outside the try. Parsing it inside meant a
+        # typo'd GITM_SHUTDOWN_TIMEOUT_S raised, the handler set `forced` to
+        # empty, and the whole reap was skipped silently — the teardown this
+        # exists to perform, disabled by a bad environment variable with no
+        # warning.
+        try:
+            forced = reap_engine_workers(
+                getattr(engine, "gitm_worker_pids", None), _shutdown_timeout())
+        except Exception as exc:  # noqa: BLE001 - teardown must not raise into
+            # the run, but a reap that could not run is not a clean teardown.
+            forced = [f"worker cleanup failed: {exc}"]
+        if forced:
+            # Warned, not swallowed: a worker that needed killing is how a later
+            # baseline rebuild comes to fail, and tracing that back from
+            # "Free memory 0.0" is most of a day.
+            warnings.warn(
+                "gitm had to force vLLM engine workers down during teardown; "
+                "GPU memory may still be settling: " + "; ".join(forced),
+                RuntimeWarning, stacklevel=2)
+
         try:
             import gc
 
@@ -729,7 +897,13 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             pass
 
     def _build_engine(kwargs: dict[str, Any]) -> Any:
+        # Sampled either side of the build so this engine knows which workers
+        # are its own. In parallel restart mode two engines are up at once and
+        # their workers share a name, so ownership is the only thing that keeps
+        # a candidate's teardown from taking the baseline's workers with it.
+        before = engine_worker_pids()
         engine = LLM(model=model, **kwargs)
+        engine.gitm_worker_pids = engine_worker_pids() - before
         engine.gitm_llm_kwargs = dict(kwargs)
         engine.gitm_shutdown_fn = _shutdown_engine
         engine.gitm_activate_fn = _activate_engine

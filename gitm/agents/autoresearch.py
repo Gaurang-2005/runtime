@@ -41,7 +41,7 @@ import random
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from gitm.agents.policy import Policy, select_interventions
 from gitm.kernels.library import load_library
@@ -273,6 +273,9 @@ class AutoresearchRun:
     #: in for the generative proposer, an unscoped search, nothing to propose, or
     #: the pass not running at all. Empty means it searched what it meant to.
     degradations: list[Degradation] = field(default_factory=list)
+    #: Ranked candidates the pass never reached because the engine was lost
+    #: part-way. Counted here because only the pass knows what it had ranked.
+    n_untried: int = 0
 
 
 #: The honest, unproven delta band every candidate carries until the measured A/B
@@ -1196,7 +1199,13 @@ class StochasticProposer(_ProposerBase):
         return out
 
 
-def autoresearch_v0(
+def autoresearch_v0(trace: Trace, bottleneck_class: str, **kw: Any) -> list[AutoresearchResult]:
+    """The results of one pass. See :func:`_autoresearch_pass`, which also says
+    how many ranked candidates were left untried."""
+    return _autoresearch_pass(trace, bottleneck_class, **kw)[0]
+
+
+def _autoresearch_pass(
     trace: Trace,
     bottleneck_class: str,
     *,
@@ -1211,7 +1220,7 @@ def autoresearch_v0(
     gpu_sku: str | None = None,
     fingerprint: str | None = None,
     degradations: DegradationLog | None = None,
-) -> list[AutoresearchResult]:
+) -> tuple[list[AutoresearchResult], int]:
     """Propose → gate → (apply + measure + rollback) for one bottleneck class.
 
     Proposals are ranked and pre-filtered by :func:`select_interventions` (the
@@ -1241,7 +1250,7 @@ def autoresearch_v0(
     else:
         proposals = proposer.propose(bottleneck_class, target_op=target_op)
     if not proposals:
-        return []
+        return [], 0
 
     # ``history``/``gpu_sku``/``fingerprint`` are what the catalog is ranked
     # with. Autoresearch results are exported to the same verification.json the
@@ -1255,6 +1264,12 @@ def autoresearch_v0(
     aimed_at = target.op if target is not None else None
 
     results: list[AutoresearchResult] = []
+    n_untried = 0
+    # Set once a restore fails. The pass keeps walking the ranking, but only to
+    # record what the gate had already rejected — that verdict needs no engine,
+    # and dropping it would leave those candidates in neither the rejected count
+    # nor the untried one. Every survivor after that point is counted untried.
+    lost = False
     for c in ranked:
         # Gate rejection wins; else the caller's veto (e.g. a live structural knob
         # with no restart hook) can reject before we touch the engine. Rejected
@@ -1265,8 +1280,15 @@ def autoresearch_v0(
         # cannot stop a known loser: sorted last, it still ran. A candidate this
         # box already measured at no gain is a result in hand, not an experiment,
         # and re-running it spends an A/B (often a restart) to learn it again.
+        # Checked before the lost-engine exit below: like the gate, it is a
+        # verdict from the record, and needs no engine to reach.
         if reason is None and c.delta_source == "measured" and c.predicted_delta <= 0:
             reason = f"history: measured {c.predicted_delta:+.1%} on this box; not re-run"
+        if lost and reason is None:
+            n_untried += 1
+            continue
+        # The caller's veto can read the engine (a prerequisite, a restart hook),
+        # so it is only asked while there is one.
         if reason is None and reject is not None:
             reason = reject(c.spec)
         pre_cfg: dict | None = None
@@ -1307,7 +1329,12 @@ def autoresearch_v0(
                               if degradations is not None and applied is not None else []),
             )
         )
-    return results
+        if applied is not None and applied.restore_failed:
+            # The baseline is gone, so every candidate after this one would be
+            # measured against nothing. The caller reads the flag off this
+            # result and records why the pass ended early.
+            lost = True
+    return results, n_untried
 
 
 def autoresearch(
@@ -1346,7 +1373,7 @@ def autoresearch(
     """
     bottleneck_class = classify_bottleneck(trace, residuals)
     target = largest_residual(residuals) if residuals is not None else None
-    results = autoresearch_v0(
+    results, n_untried = _autoresearch_pass(
             trace,
             bottleneck_class,
             applicator=applicator,
@@ -1366,6 +1393,7 @@ def autoresearch(
         target=target,
         results=results,
         degradations=_search_degradations(trace, bottleneck_class, target, proposer, results),
+        n_untried=n_untried,
     )
 
 

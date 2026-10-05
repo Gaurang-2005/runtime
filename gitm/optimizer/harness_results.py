@@ -38,6 +38,7 @@ from typing import Any
 from gitm.optimizer.history import EXPORT_NAME
 from gitm.optimizer.report import Provenance
 from gitm.optimizer.verification_export import VerificationRecord, write_verification
+from gitm.serve.discover import vllm_argv_start
 
 __all__ = [
     "Capture",
@@ -53,6 +54,11 @@ __all__ = [
     "write_comparison",
     "write_comparisons",
 ]
+
+#: What an attached capture can honestly say about its tracing: the collector was
+#: running, and whether NVTX markers were on is not recorded. Distinct from both
+#: ``"cupti"`` and ``"cupti+nvtx"`` on purpose — see :func:`_tracing_from_attach`.
+TRACING_NVTX_UNKNOWN = "cupti(nvtx:unknown)"
 
 SUMMARY_NAME = "serving_summary.json"
 MANIFEST_NAME = "run_manifest.json"
@@ -268,6 +274,73 @@ def _find_trace(path: Path, manifest: dict[str, Any]) -> Path | None:
     return Path(declared) if declared else None
 
 
+def _argv_from_attach(manifest: dict[str, Any]) -> list[str]:
+    """The server's flags from an ``attach`` manifest, which has no ``serve_argv``.
+
+    ``gitm capture serve`` launches the server and records the argv it used.
+    ``gitm capture attach`` did not launch it, so it records what it found in
+    ``/proc`` instead, under ``target.cmdline`` — the whole command, interpreter
+    and all.
+
+    Reading only ``serve_argv`` meant every attached capture came back with no
+    flags at all. That is not a missing nicety: the baseline's flags are what
+    every proposed arm is built from, so a sweep proposed against an attached
+    baseline would launch servers carrying one flag and nothing else. It also
+    silently inverted a lever — ``cuda_graphs_enable`` is realised by *removing*
+    ``--enforce-eager``, so an empty baseline reports it unreachable on a server
+    that was in fact started with it.
+
+    Everything before the first flag is dropped: the interpreter, the console
+    script, the subcommand and the positional model are how the server was
+    invoked, not what it was configured with, and ``knob_difference`` compares
+    flags.
+
+    Where the flags start is :func:`gitm.serve.discover.vllm_argv_start`, which
+    anchors on the vLLM entry point. Two cheaper anchors are both wrong. A
+    ``serve`` token misses ``python -m vllm.entrypoints.openai.api_server …``,
+    a form discovery already supports, which then comes back with no flags at
+    all. The first ``--`` picks up a launcher's own options — under
+    ``torchrun --nproc-per-node 2 -m vllm… --model m`` it starts at
+    ``--nproc-per-node``, and a proposed arm would hand the server a flag it has
+    never heard of.
+    """
+    cmdline = (manifest.get("target") or {}).get("cmdline")
+    if not isinstance(cmdline, list):
+        return []
+    start = vllm_argv_start([str(a) for a in cmdline])
+    return [] if start is None else [str(a) for a in cmdline[start:]]
+
+
+def _tracing_from_attach(manifest: dict[str, Any]) -> str | None:
+    """Whether an attached capture was traced, which its summary does not say.
+
+    ``comparable_key`` includes this because tracing costs throughput, so an arm
+    traced against one that was not measures the tracer rather than the knob.
+    Left at ``None`` on every attached capture, two of them compared fine with
+    each other but never against a launched one, and the reason would have read
+    as a mismatch in the data rather than a gap in what was recorded.
+
+    What it cannot say is whether NVTX was on. An attach target records
+    ``traceable``, ``inject_lib`` and ``trace_out``, and nothing about markers —
+    so ``"cupti"`` would be a claim that NVTX was *off*, which is not something
+    the manifest establishes. A traced arm with markers and one without would
+    then compare as though they matched, and the marker overhead would land on
+    whatever knob was under test.
+
+    So the label says what is known: traced, NVTX unestablished. It equals
+    itself, so two attached arms still compare; it equals neither ``"cupti"``
+    nor ``"cupti+nvtx"``, so an attached arm and a launched one are refused
+    rather than quietly compared. That refusal is the honest outcome until the
+    attach path records the marker setting it can already read off the server's
+    environment — which is the real fix, and belongs where the capture is
+    written rather than where it is read.
+    """
+    target = manifest.get("target")
+    if not isinstance(target, dict) or "traceable" not in target:
+        return None
+    return TRACING_NVTX_UNKNOWN if target.get("traceable") else "off"
+
+
 def read_capture(path: str | Path) -> Capture:
     """One arm's directory, read into a :class:`Capture`.
 
@@ -286,13 +359,15 @@ def read_capture(path: str | Path) -> Capture:
     trace_path = _find_trace(path, manifest)
 
     argv = manifest.get("serve_argv")
+    if not isinstance(argv, list):
+        argv = _argv_from_attach(manifest)
     load = manifest.get("load")
     return Capture(
         path=path,
         served_model=manifest.get("served_model"),
         serve_argv=tuple(str(a) for a in argv) if isinstance(argv, list) else (),
         load=load if isinstance(load, dict) else {},
-        tracing=summary.get("tracing"),
+        tracing=summary.get("tracing") or _tracing_from_attach(manifest),
         throughput=throughput,
         window_s=window,
         goodput=is_goodput,

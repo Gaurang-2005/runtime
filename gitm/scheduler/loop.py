@@ -13,6 +13,7 @@ import os
 import re
 import time
 import uuid
+import warnings
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ from gitm.optimizer.apply import (
     DryRunApplicator,
     LiveEngineApplicator,
     apply_intervention,
+    resolve_restart_mode,
 )
 from gitm.optimizer.attribution import attribute
 from gitm.optimizer.collective_signal import collective_causes, worst_device_comm
@@ -46,6 +48,7 @@ from gitm.optimizer.degradation import (
     AFFECTS_RESIDUALS,
     APPROXIMATE,
     AR_SKIPPED,
+    ENGINE_LOST,
     GRAPH_BATCH,
     GRAPH_HARDWARE,
     GRAPH_MODEL,
@@ -635,7 +638,9 @@ def _ar_target_residual(ar_run: AutoresearchRun, fallback: float = 0.0) -> float
     return _clamp_pct(ar_run.target.residual) if ar_run.target is not None else fallback
 
 
-def _ab_evidence(ab: Any, rolled_back: bool, measured_under: Iterable[Any]) -> str:
+def _ab_evidence(
+    ab: Any, rolled_back: bool, measured_under: Iterable[Any], *, restore_failed: bool = False,
+) -> str:
     """The claim sentence for a live A/B, in the unit the probe actually measured.
 
     ``measured_under`` is this candidate's own list
@@ -643,7 +648,8 @@ def _ab_evidence(ab: Any, rolled_back: bool, measured_under: Iterable[Any]) -> s
     in a later A/B says nothing about the unit of this one.
     """
     what, unit, _export = AB_UNITS[ab_unit(measured_under)]
-    outcome = "rolled back" if rolled_back else "kept"
+    outcome = ("not kept, baseline not restored" if restore_failed
+               else "rolled back" if rolled_back else "kept")
     return (
         f"live A/B: {outcome} ({ab.speedup - 1.0:+.1%} {what}, via {ab.via}); "
         f"baseline {ab.baseline_tps:.1f} → candidate {ab.candidate_tps:.1f} {unit}"
@@ -1312,17 +1318,43 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # claimed as won.
     live_restart_fn = getattr(cfg.engine, "gitm_restart_fn", None) if cfg.engine else None
     if cfg.engine is not None:
+        # Serial wherever a baseline rebuild is available, rather than parallel
+        # by default. Parallel holds the baseline and the candidate at once, and
+        # at any realistic gpu_memory_utilization the second one cannot fit: it
+        # is what cost the MI355X run 27 of its 29 candidates.
+        _restart_mode, _restart_why = resolve_restart_mode(
+            cfg.engine, os.environ.get("GITM_RESTART_MODE"))
         applicator: Applicator = LiveEngineApplicator(
             cfg.engine,
             throughput_fn=_engine_throughput_fn(cfg.engine, runner, degradations),
             restart_fn=live_restart_fn,
             baseline_restart_fn=getattr(cfg.engine, "gitm_baseline_restart_fn", None),
-            restart_mode=os.environ.get("GITM_RESTART_MODE", "parallel"),
+            restart_mode=_restart_mode,
             reps=int(os.environ.get("GITM_AB_REPS", "1")),
             # Compatibility escape hatch for custom scheduling-classified knobs
             # that should still be measured through engine rebuild.
             force_restart=os.environ.get("GITM_KNOBS_VIA_RESTART") == "1",
         )
+        (run_dir / "restart_mode.json").write_text(json.dumps({
+            "mode": _restart_mode,
+            "why": _restart_why,
+            "cannot_fit": applicator.restart_mode_warning,
+        }, indent=2))
+        if applicator.restart_mode_warning:
+            # Warned, not recorded as a degradation. A run-wide AFFECTS_AB entry
+            # would mark every candidate unreliable, including the hot-swapped
+            # ones that never reach a rebuild — excluding their perfectly good
+            # measurements from history and from the report's verified count.
+            # The condition only harms candidates that need a restart, and those
+            # already carry their own error when the rebuild is refused.
+            #
+            # Said once, at the start, because the alternative is learning it
+            # from an OOM traceback per candidate: how the last run spent 93% of
+            # its budget.
+            warnings.warn(
+                "gitm: most structural candidates will be refused in this run — "
+                + applicator.restart_mode_warning,
+                RuntimeWarning, stacklevel=2)
     else:
         applicator = DryRunApplicator()
 
@@ -1357,6 +1389,11 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # applied or rejected, cannot return.
     queue = list(ranked)
     reranks: list[dict[str, Any]] = []
+    # Set when a candidate's rollback failed. From then on there is no baseline
+    # to measure against, so the run stops trying candidates and goes straight
+    # to writing up what it has.
+    engine_lost: str | None = None
+    n_untried = 0
     while queue:
         c = queue.pop(0)
         if c.rejected_reason is not None:
@@ -1398,7 +1435,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         # from the authoritative ApplyResult (the real gate decision), not from
         # EngineABResult.kept (a measure-time delta>=0 indicator).
         if ab is not None:
-            causal_evidence = _ab_evidence(ab, result.rolled_back, measured_under)
+            causal_evidence = _ab_evidence(ab, result.rolled_back, measured_under,
+                                           restore_failed=result.restore_failed)
         else:
             causal_evidence = ", ".join(
                 f"{h.cause_op}→{h.effect_op} (p={h.p_value:.2g})" for h in hypotheses.top(2)
@@ -1422,9 +1460,26 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 # with its real (small) number, not a distorted one.
                 measured_delta=((ab.speedup - 1.0) if ab is not None else result.measured_delta),
                 rolled_back=result.rolled_back,
+                restore_failed=result.restore_failed,
                 unreliable_ab=unreliable_ab(measured_under) if ab is not None else [],
             )
         )
+        if result.restore_failed:
+            engine_lost = result.error or f"restore failed after {c.spec.name}"
+            n_untried = sum(1 for x in queue if x.rejected_reason is None)
+            # What the gate rejected is a verdict that needed no engine, so it is
+            # still recorded. Breaking here without it left those candidates in
+            # neither the rejected list nor the untried count.
+            rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
+                            for x in queue if x.rejected_reason is not None)
+            # Approximate, not unreliable. The A/Bs measured before this one
+            # were taken against a sound baseline, and an unreliable mark here
+            # would exclude them from history along with everything else.
+            degradations.record(
+                ENGINE_LOST, used=f"a run that stopped after {c.spec.name}",
+                reason=f"{engine_lost}; {n_untried} ranked candidate(s) not tried",
+                severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+            break
         if time.time_ns() - started_ns >= int(budget_s * 1e9):
             break
 
@@ -1478,7 +1533,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         }, indent=2))
 
     # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
-    if time.time_ns() - started_ns < int(budget_s * 1e9):
+    if engine_lost is None and time.time_ns() - started_ns < int(budget_s * 1e9):
         proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
 
         def _unenactable(spec: Any) -> str | None:
@@ -1532,9 +1587,19 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         ar_run = AutoresearchRun(bottleneck_class=classify_bottleneck(trace, res), results=[])
         ar_run.degradations.append(Degradation(
             AR_SKIPPED, used="no autoresearch pass",
-            reason=f"budget {cfg.budget} exhausted by Phase 4",
+            reason=(f"engine lost in Phase 4: {engine_lost}" if engine_lost is not None
+                    else f"budget {cfg.budget} exhausted by Phase 4"),
             severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,)))
     degradations.extend(ar_run.degradations)
+    lost_in_ar = next((r for r in ar_run.results
+                       if r.apply_result is not None and r.apply_result.restore_failed), None)
+    if engine_lost is None and lost_in_ar is not None:
+        engine_lost = lost_in_ar.apply_error or f"restore failed after {lost_in_ar.spec.name}"
+        n_untried = ar_run.n_untried
+        degradations.record(
+            ENGINE_LOST, used=f"an autoresearch pass that stopped after {lost_in_ar.spec.name}",
+            reason=f"{engine_lost}; {n_untried} ranked candidate(s) not tried",
+            severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
     # Again, now that autoresearch has had its proposals vetoed: an exclusion
     # that only stopped a proposal is still something the run held back, and a
     # file written before that pass would report none of them.
@@ -1551,8 +1616,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         if r.rolled_back:
             rolled_back.append(r.spec.name)
         ar_ab = r.ab_result
+        ar_lost = r.apply_result is not None and r.apply_result.restore_failed
         if ar_ab is not None:
-            evidence = _ab_evidence(ar_ab, r.rolled_back, r.degradations)
+            evidence = _ab_evidence(ar_ab, r.rolled_back, r.degradations,
+                                    restore_failed=ar_lost)
         else:
             evidence = ar_granger_evidence
         if r.measured_delta is None and r.apply_error:
@@ -1572,6 +1639,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 predicted_delta=r.predicted_delta,
                 measured_delta=true_delta,
                 rolled_back=r.rolled_back,
+                restore_failed=ar_lost,
                 unreliable_ab=unreliable_ab(r.degradations) if ar_ab is not None else [],
             )
         )
@@ -1668,6 +1736,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         # In the summary, not only the run dir: a reader comparing two runs needs
         # to know one of them was not asked to try everything.
         "n_skipped_levers": len(_excluded),
+        # Set when a rollback failed and the run stopped trying candidates. The
+        # report is still written; this is what says it is a partial one.
+        "engine_lost": engine_lost,
+        "n_untried": n_untried,
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
         "report_path": str(run_dir / "report.md"),
     }
