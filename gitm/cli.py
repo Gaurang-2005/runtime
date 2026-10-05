@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -524,12 +525,17 @@ def _run_propose(args) -> int:
         top_n=args.top_n, ctx=ctx, history=history,
         gpu_sku=args.gpu_sku, fingerprint=fingerprint,
     )
-    arms, unreachable = plan_arms(baseline.serve_argv, ranked, max_arms=args.max_arms)
+    # Built from the command that starts the baseline, not from its flags: an
+    # arm is something the harness runs. For a launched capture the two are the
+    # same list; for an attached one the flags alone would start nothing.
+    base_argv = baseline.launch_argv or baseline.serve_argv
+    arms, unreachable = plan_arms(base_argv, ranked, max_arms=args.max_arms,
+                                  model=baseline.served_model)
 
     measured = sum(1 for c in ranked if getattr(c, "delta_source", "") == "measured")
     out = Path(args.out) if args.out else Path(args.baseline) / "experiments.json"
     written = write_experiments(
-        out, baseline_argv=baseline.serve_argv, arms=arms, unreachable=unreachable,
+        out, baseline_argv=base_argv, arms=arms, unreachable=unreachable,
         served_model=baseline.served_model or "unknown", load=baseline.load,
         run_id=args.run_id, fingerprint=fingerprint, gpu_sku=args.gpu_sku,
         notes=(f"ranked against {baseline.trace_path.name} "
@@ -732,8 +738,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "run":
         from gitm import optimize
+        from gitm.tracer import injection
 
         _apply_hft_run_flags(args)
+        # Here and not in the vLLM factory: this entry point is the `gitm`
+        # console script, which a spawned worker can re-import safely. An
+        # embedded caller's script may not be, so the factory only warns.
+        # setdefault, so an operator who chose a start method keeps it.
+        if injection.active_vendor() == "amd":
+            for key, value in injection.AMD_PROCESS_ENV.items():
+                os.environ.setdefault(key, value)
         # Asked here, before the loop starts any capture, so nobody answers a
         # prompt that arrived an hour into a 24h run.
         result = optimize(

@@ -234,3 +234,23 @@ def test_an_arm_that_was_ingested_is_not_reported_as_refused(tmp_path):
     if (run / "ingest_refused.json").exists():
         side = json.loads((run / "ingest_refused.json").read_text())
         assert side["refused"] == [], side
+
+
+def test_arms_proposed_from_an_attached_baseline_are_commands_that_run(tmp_path):
+    """An attached capture's flags are what it is compared on, but an arm is a
+    command the harness runs. Built from the flags alone, every arm started
+    nothing."""
+    from .test_harness_results import SERVE_CMD, _attach_arm
+
+    base = _attach_arm(tmp_path / "results", "baseline", cmdline=SERVE_CMD,
+                       model="Qwen/Qwen2.5-0.5B-Instruct")
+    rc = cli_main(["propose", "--baseline", str(base), "--max-arms", "3",
+                   "--out", str(tmp_path / "experiments.json")])
+    assert rc == 0
+
+    sweep = json.loads((tmp_path / "experiments.json").read_text())
+    launch = ["vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct"]
+    assert sweep["baseline"]["serve_argv"][:3] == launch
+    assert sweep["arms"], "proposed nothing to run"
+    for arm in sweep["arms"]:
+        assert arm["serve_argv"][:3] == launch, arm["serve_argv"]

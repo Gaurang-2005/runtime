@@ -118,6 +118,31 @@ def vllm_argv_start(cmdline: list[str]) -> int | None:
     return None
 
 
+def vllm_launch_argv(cmdline: list[str]) -> list[str] | None:
+    """The command that would start this server again, or ``None``.
+
+    :func:`vllm_argv_start` gives the flags, which is what two arms are compared
+    on. A proposed arm needs more than that: it is a command the harness runs,
+    so it has to keep the entry point and the positional model. Without them an
+    arm built from an attached baseline is a list of flags, and running it
+    starts nothing.
+
+    Starts at the vLLM entry point for the same reason the flags do: a launcher
+    in front of it (``torchrun``, ``nsys profile --``) is how this process was
+    run, not part of the server. The entry point is rewritten to a form that runs
+    anywhere: a console script at any path becomes ``vllm``, and a module becomes
+    ``python -m <module>``.
+    """
+    for i, token in enumerate(cmdline):
+        token = str(token)
+        rest = [str(a) for a in cmdline[i + 1:]]
+        if _VLLM_PATTERNS[0].search(token):
+            return ["vllm", *rest]
+        if any(p.search(token) for p in _VLLM_PATTERNS[1:]):
+            return ["python", "-m", token, *rest]
+    return None
+
+
 def iter_pids(proc: Path = PROC) -> list[int]:
     try:
         return sorted(int(p.name) for p in proc.iterdir() if p.name.isdigit())

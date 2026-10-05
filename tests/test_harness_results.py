@@ -611,3 +611,54 @@ def test_a_launched_capture_still_wins_on_its_own_field(tmp_path):
     m["serve_argv"] = ["--tensor-parallel-size", "2"]
     (d / "run_manifest.json").write_text(json.dumps(m))
     assert read_capture(d).serve_argv == ("--tensor-parallel-size", "2")
+
+
+# --------------------------------------------------------------------------- #
+# the launch command, kept apart from the flags arms are compared on           #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("cmdline,expected", [
+    # A console script at any path becomes `vllm`, so the arm runs anywhere.
+    (SERVE_CMD, ("vllm", "serve", "Qwen/Qwen2.5-0.5B-Instruct", "--port", "8000",
+                 "--enforce-eager")),
+    # A module keeps its module, run through `python -m`.
+    (["/usr/bin/python", "-m", "vllm.entrypoints.openai.api_server",
+      "--model", "Kimi-K2.5", "--port", "8000"],
+     ("python", "-m", "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5",
+      "--port", "8000")),
+    # A launcher in front of the entry point is how the process ran, not the server.
+    (["torchrun", "--nproc-per-node", "2", "-m",
+      "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"],
+     ("python", "-m", "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5")),
+])
+def test_an_attached_capture_keeps_a_command_that_starts_the_server(
+        tmp_path, cmdline, expected):
+    """An arm is a command the harness runs. Built from the flags alone it
+    started nothing: the entry point and the positional model were gone."""
+    cap = read_capture(_attach_arm(tmp_path, "a", cmdline=cmdline))
+    assert cap.launch_argv == expected
+
+
+def test_a_launched_capture_launches_with_the_command_it_recorded(tmp_path):
+    argv = ["vllm", "serve", "Kimi-K2.5", "--tensor-parallel-size", "8"]
+    cap = read_capture(_arm(tmp_path, "launched", argv=argv))
+    assert cap.launch_argv == tuple(argv) == cap.serve_argv
+
+
+def test_the_model_after_a_boolean_flag_is_not_that_flags_value():
+    """`vllm serve --enforce-eager MODEL` is valid. Read by lookahead alone the
+    model became --enforce-eager's value, so removing the flag for
+    cuda_graphs_enable removed the model with it."""
+    from gitm.optimizer.harness_results import parse_flags
+
+    argv = ["vllm", "serve", "--enforce-eager", "Kimi-K2.5", "--port", "8000"]
+    assert parse_flags(argv, positional="Kimi-K2.5") == [
+        (2, "--enforce-eager", True), (4, "--port", "8000")]
+
+
+def test_an_arm_removing_a_flag_keeps_the_model_that_follows_it():
+    from gitm.optimizer.experiment_specs import plan_arms
+
+    base = ["vllm", "serve", "--enforce-eager", "Kimi-K2.5", "--port", "8000"]
+    lever = next(s for s in LIB if s.name == "cuda_graphs_enable")
+    arms, _ = plan_arms(base, [lever], model="Kimi-K2.5")
+    assert arms[0].serve_argv == ("vllm", "serve", "Kimi-K2.5", "--port", "8000")
