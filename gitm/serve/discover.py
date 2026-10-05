@@ -130,8 +130,10 @@ def vllm_launch_argv(cmdline: list[str]) -> list[str] | None:
 
     The entry point is rewritten to a form that runs anywhere: a console script
     at any path becomes ``vllm``, and a module becomes ``python -m <module>``.
-    That is only a faithful rewrite when nothing but a Python interpreter (and
-    its own single-dash options) came before the entry point. Anything else in
+    That is only a faithful rewrite when nothing but a Python interpreter came
+    before the entry point. Its own single-dash options are kept for a module
+    launch; a console script run under options cannot be rewritten, since
+    ``vllm`` takes no interpreter options, and returns ``None``. Anything else in
     front of it — ``torchrun --nproc-per-node 2``, ``nsys profile --`` — shaped
     how the server ran, and dropping it would start a different layout from the
     baseline and measure that instead. Those return ``None``: no command is
@@ -150,8 +152,15 @@ def vllm_launch_argv(cmdline: list[str]) -> list[str] | None:
                            and all(a.startswith("-") and not a.startswith("--")
                                    for a in prefix[1:])):
             return None
+        # The interpreter's own options (-O, -u, -X ...) change how the server
+        # runs, so an arm without them is not an A/B of this baseline. A module
+        # launch keeps them; `vllm` as a console script cannot take them, so a
+        # baseline that ran its script under options has no faithful command.
+        options = prefix[1:]
         rest = [str(a) for a in cmdline[i + 1:]]
-        return ["vllm", *rest] if console else ["python", "-m", token, *rest]
+        if console:
+            return None if options else ["vllm", *rest]
+        return ["python", *options, "-m", token, *rest]
     return None
 
 

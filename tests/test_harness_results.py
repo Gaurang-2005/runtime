@@ -625,9 +625,14 @@ def test_a_launched_capture_still_wins_on_its_own_field(tmp_path):
       "--model", "Kimi-K2.5", "--port", "8000"],
      ("python", "-m", "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5",
       "--port", "8000")),
-    # Interpreter options are the interpreter's, and survive the rewrite.
-    (["/usr/bin/python3.12", "-u", ".venv/bin/vllm", "serve", "Kimi-K2.5"],
-     ("vllm", "serve", "Kimi-K2.5")),
+    # Interpreter options change how the server runs, so a module launch keeps
+    # them, and the arms run under the same settings as the baseline.
+    (["/usr/bin/python3.12", "-O", "-m", "vllm.entrypoints.openai.api_server",
+      "--model", "Kimi-K2.5"],
+     ("python", "-O", "-m", "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5")),
+    # `vllm` takes no interpreter options, so a console script run under them
+    # has no faithful command.
+    (["/usr/bin/python3.12", "-u", ".venv/bin/vllm", "serve", "Kimi-K2.5"], ()),
     # A launcher shaped how the server ran. Dropping it would start a different
     # layout from the baseline, so there is no command rather than a wrong one.
     (["torchrun", "--nproc-per-node", "2", "-m",
