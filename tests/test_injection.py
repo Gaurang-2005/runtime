@@ -437,10 +437,18 @@ def test_a_truncated_final_line_is_still_reported(tmp_path, monkeypatch):
 
 
 
-def _cli_run_env(monkeypatch, vendor):
-    """The environment `gitm run` hands the loop, without running the loop."""
+def _cli_run_env(monkeypatch, vendor, argv0="/venv/bin/gitm"):
+    """The environment `gitm run` hands the loop, without running the loop.
+
+    ``argv0`` is how the process was started: the ``gitm`` console script by
+    default, which is the entry point that may choose spawn.
+    """
+    import sys
+
     import gitm
     from gitm.cli import main
+
+    monkeypatch.setattr(sys, "argv", [argv0])
 
     seen: dict[str, str | None] = {}
 
@@ -464,6 +472,13 @@ def test_gitm_run_starts_workers_with_spawn_on_amd(monkeypatch):
 def test_gitm_run_keeps_an_explicit_start_method(monkeypatch):
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "fork")
     assert _cli_run_env(monkeypatch, "amd") == "fork"
+
+
+def test_main_called_from_another_entry_point_does_not_choose_spawn(monkeypatch):
+    """python -c, a notebook or an unguarded script can reach main() too, and a
+    spawned worker re-importing them can fail or re-run their work."""
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    assert _cli_run_env(monkeypatch, "amd", argv0="-c") is None
 
 
 def test_gitm_run_leaves_the_start_method_alone_on_nvidia(monkeypatch):

@@ -118,28 +118,40 @@ def vllm_argv_start(cmdline: list[str]) -> int | None:
     return None
 
 
+_PYTHON = re.compile(r"(^|/)python[0-9.]*$")
+
+
 def vllm_launch_argv(cmdline: list[str]) -> list[str] | None:
     """The command that would start this server again, or ``None``.
 
     :func:`vllm_argv_start` gives the flags, which is what two arms are compared
     on. A proposed arm needs more than that: it is a command the harness runs,
-    so it has to keep the entry point and the positional model. Without them an
-    arm built from an attached baseline is a list of flags, and running it
-    starts nothing.
+    so it has to keep the entry point and the positional model.
 
-    Starts at the vLLM entry point for the same reason the flags do: a launcher
-    in front of it (``torchrun``, ``nsys profile --``) is how this process was
-    run, not part of the server. The entry point is rewritten to a form that runs
-    anywhere: a console script at any path becomes ``vllm``, and a module becomes
-    ``python -m <module>``.
+    The entry point is rewritten to a form that runs anywhere: a console script
+    at any path becomes ``vllm``, and a module becomes ``python -m <module>``.
+    That is only a faithful rewrite when nothing but a Python interpreter (and
+    its own single-dash options) came before the entry point. Anything else in
+    front of it — ``torchrun --nproc-per-node 2``, ``nsys profile --`` — shaped
+    how the server ran, and dropping it would start a different layout from the
+    baseline and measure that instead. Those return ``None``: no command is
+    better than a command for some other server.
     """
     for i, token in enumerate(cmdline):
         token = str(token)
+        console = bool(_VLLM_PATTERNS[0].search(token))
+        module = not console and any(p.search(token) for p in _VLLM_PATTERNS[1:])
+        if not (console or module):
+            continue
+        prefix = [str(a) for a in cmdline[:i]]
+        if module and prefix and prefix[-1] == "-m":
+            prefix = prefix[:-1]
+        if prefix and not (_PYTHON.search(prefix[0])
+                           and all(a.startswith("-") and not a.startswith("--")
+                                   for a in prefix[1:])):
+            return None
         rest = [str(a) for a in cmdline[i + 1:]]
-        if _VLLM_PATTERNS[0].search(token):
-            return ["vllm", *rest]
-        if any(p.search(token) for p in _VLLM_PATTERNS[1:]):
-            return ["python", "-m", token, *rest]
+        return ["vllm", *rest] if console else ["python", "-m", token, *rest]
     return None
 
 

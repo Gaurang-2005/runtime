@@ -50,6 +50,7 @@ __all__ = [
     "read_capture",
     "knob_difference",
     "parse_flags",
+    "boolean_flags",
     "compare",
     "sweep_id",
     "write_comparison",
@@ -388,8 +389,21 @@ def read_capture(path: str | Path) -> Capture:
     )
 
 
+def boolean_flags(library: Iterable[Any]) -> frozenset[str]:
+    """The server flags the catalogue sets to ``True`` or ``False``.
+
+    Those flags never take a value, and that is the only reliable way to read a
+    command line where the model follows one: ``vllm serve --enforce-eager
+    CHECKPOINT``. Guessing which token is the model does not work. The served
+    name can be an alias (``--served-model-name``), and treating the alias as
+    the model then stops it being read as that flag's own value.
+    """
+    return frozenset("--" + s.knob.replace("_", "-") for s in library
+                     if getattr(s, "knob", None) and isinstance(s.value, bool))
+
+
 def parse_flags(
-    argv: Sequence[str], *, positional: str | None = None
+    argv: Sequence[str], *, booleans: frozenset[str] = frozenset()
 ) -> list[tuple[int, str, Any]]:
     """``[(index, flag, value)]`` for each ``--flag`` in ``argv``.
 
@@ -398,11 +412,11 @@ def parse_flags(
     copies of this rule is how an emitter and a reader come to disagree about
     what an arm says.
 
-    A token after a flag is that flag's value unless it is itself a flag, or it
-    is ``positional``. The second exception is the model. vLLM accepts it after
-    a boolean flag (``vllm serve --enforce-eager MODEL``), and read by lookahead
-    alone the model becomes ``--enforce-eager``'s value: removing that flag for
-    ``cuda_graphs_enable`` would then remove the model with it.
+    A token after a flag is that flag's value unless it is itself a flag or the
+    flag is one of ``booleans`` (see :func:`boolean_flags`). Without the second
+    rule, ``vllm serve --enforce-eager CHECKPOINT`` read the checkpoint as
+    ``--enforce-eager``'s value, and an arm removing that flag for
+    ``cuda_graphs_enable`` removed the checkpoint with it.
     """
     out: list[tuple[int, str, Any]] = []
     i = 0
@@ -412,7 +426,7 @@ def parse_flags(
             i += 1
             continue
         nxt = str(argv[i + 1]) if i + 1 < len(argv) else None
-        if nxt is not None and not nxt.startswith("--") and nxt != positional:
+        if token not in booleans and nxt is not None and not nxt.startswith("--"):
             out.append((i, token, nxt))
             i += 2
         else:
@@ -421,7 +435,9 @@ def parse_flags(
     return out
 
 
-def knob_difference(baseline: Capture, candidate: Capture) -> dict[str, Any]:
+def knob_difference(
+    baseline: Capture, candidate: Capture, *, booleans: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     """The server flags the candidate changed, as ``{flag: value}``.
 
     Launch-only flags are excluded: where a server binds says nothing about what
@@ -436,8 +452,7 @@ def knob_difference(baseline: Capture, candidate: Capture) -> dict[str, Any]:
     """
     def flags(c: Capture) -> dict[str, Any]:
         return {flag: value
-                for _, flag, value in parse_flags(
-                    c.serve_argv, positional=getattr(c, "served_model", None))
+                for _, flag, value in parse_flags(c.serve_argv, booleans=booleans)
                 if flag not in LAUNCH_ONLY_FLAGS}
 
     base, cand = flags(baseline), flags(candidate)
@@ -489,7 +504,8 @@ def compare(
     if not baseline.throughput:
         raise CaptureError(f"{baseline.path.name}: baseline throughput is zero")
 
-    knobs = knob_difference(baseline, candidate)
+    library = list(library)
+    knobs = knob_difference(baseline, candidate, booleans=boolean_flags(library))
     if not knobs:
         raise CaptureError(
             f"{baseline.path.name} and {candidate.path.name} ran the same server "

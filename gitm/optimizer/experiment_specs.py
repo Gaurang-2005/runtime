@@ -127,17 +127,19 @@ class Unreachable:
     reason: str
 
 
-def _find(argv: Sequence[str], flag: str, model: str | None = None) -> tuple[int, Any] | None:
+def _find(argv: Sequence[str], flag: str, booleans: frozenset[str] = frozenset()
+          ) -> tuple[int, Any] | None:
     # The reader's parser, not a copy of it: see parse_flags.
-    for i, tok, value in parse_flags(argv, positional=model):
+    for i, tok, value in parse_flags(argv, booleans=booleans):
         if tok == flag:
             return i, value
     return None
 
 
-def _without(argv: Sequence[str], flag: str, model: str | None = None) -> list[str]:
+def _without(argv: Sequence[str], flag: str, booleans: frozenset[str] = frozenset()
+             ) -> list[str]:
     """``argv`` with ``flag`` and the value that belongs to it removed."""
-    found = _find(argv, flag, model)
+    found = _find(argv, flag, booleans)
     if found is None:
         return list(argv)
     i, value = found
@@ -145,14 +147,15 @@ def _without(argv: Sequence[str], flag: str, model: str | None = None) -> list[s
     return [*argv[:i], *argv[i + span:]]
 
 
-def _with(argv: Sequence[str], flag: str, value: Any, model: str | None = None) -> list[str]:
+def _with(argv: Sequence[str], flag: str, value: Any,
+          booleans: frozenset[str] = frozenset()) -> list[str]:
     """``argv`` with ``flag`` set to ``value``, replacing any current setting.
 
     Replaced in place rather than appended, so an arm never carries the same
     flag twice. Two settings of one flag is a server-dependent precedence
     question, and the reader's parser would report only one of them.
     """
-    out = _without(argv, flag, model)
+    out = _without(argv, flag, booleans)
     if value is True:
         return [*out, flag]
     return [*out, flag, str(value)]
@@ -160,7 +163,7 @@ def _with(argv: Sequence[str], flag: str, value: Any, model: str | None = None) 
 
 def plan_arms(
     base_argv: Sequence[str], ranked: Iterable[Any], *, max_arms: int | None = None,
-    model: str | None = None,
+    booleans: frozenset[str] = frozenset(),
 ) -> tuple[list[Arm], list[Unreachable]]:
     """One arm per ranked candidate, plus the candidates that cannot become one.
 
@@ -169,9 +172,9 @@ def plan_arms(
     answer is categorical and re-asking it here would spend cluster time on a
     lever the loop declined locally.
 
-    ``model`` is the baseline's positional model, so a boolean flag placed
-    before it is not read as taking the model as its value (see
-    :func:`~gitm.optimizer.harness_results.parse_flags`).
+    ``booleans`` are the flags that never take a value (see
+    :func:`~gitm.optimizer.harness_results.boolean_flags`), so a model placed
+    after one is not read as its value and removed with it.
 
     ``max_arms`` is checked before an arm is built rather than after it is
     appended, so it holds on every path. Checking it after meant an
@@ -222,7 +225,7 @@ def plan_arms(
                 "flags it diffs and this arm would read as identical"))
             continue
 
-        current = _find(base, flag, model)
+        current = _find(base, flag, booleans)
         if spec.value is False:
             if current is None:
                 out.append(Unreachable(
@@ -230,7 +233,7 @@ def plan_arms(
                     f"realised only by removing {flag}, which this baseline does "
                     "not set, so the arm would be the baseline"))
                 continue
-            argv = _without(base, flag, model)
+            argv = _without(base, flag, booleans)
         elif current is not None and realises(current[1], spec.value):
             out.append(Unreachable(
                 name, knob,
@@ -238,7 +241,7 @@ def plan_arms(
                 "measure nothing"))
             continue
         else:
-            argv = _with(base, flag, spec.value, model)
+            argv = _with(base, flag, spec.value, booleans)
 
         arms.append(Arm(
             lever=name, knob=knob, value=spec.value,

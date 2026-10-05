@@ -254,3 +254,18 @@ def test_arms_proposed_from_an_attached_baseline_are_commands_that_run(tmp_path)
     assert sweep["arms"], "proposed nothing to run"
     for arm in sweep["arms"]:
         assert arm["serve_argv"][:3] == launch, arm["serve_argv"]
+
+
+def test_an_attached_baseline_under_a_launcher_is_refused(tmp_path, capsys):
+    """torchrun or a profiler in front of vLLM shaped how the server ran. An arm
+    rebuilt without it would measure another layout, so propose says so and
+    proposes nothing."""
+    from .test_harness_results import _attach_arm
+
+    base = _attach_arm(tmp_path / "results", "baseline", cmdline=[
+        "torchrun", "--nproc-per-node", "2", "-m",
+        "vllm.entrypoints.openai.api_server", "--model", "Kimi-K2.5"])
+    out = tmp_path / "experiments.json"
+    assert cli_main(["propose", "--baseline", str(base), "--out", str(out)]) == 2
+    assert not out.exists()
+    assert "launcher" in capsys.readouterr().err
