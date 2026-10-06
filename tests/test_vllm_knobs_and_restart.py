@@ -506,3 +506,21 @@ def test_ar_target_residual_uses_the_search_target_not_a_hardcoded_zero():
         target=ResidualTarget(op="attn_score_value", residual=17.8, n_kernels=8),
     )
     assert _ar_target_residual(huge) == 1.0
+
+
+def test_nested_knobs_reach_llm_as_the_argument_vllm_takes():
+    """P2-1, which was marked fixed but was not: LLM() rejects
+    num_speculative_tokens at the top level; it lives in speculative_config."""
+    from gitm.optimizer.vllm_knobs import engine_kwargs, knob_from_server_arg, server_arg
+
+    assert engine_kwargs({"num_speculative_tokens": 5, "max_num_seqs": 64}) == {
+        "speculative_config": {"method": "ngram", "num_speculative_tokens": 5},
+        "max_num_seqs": 64,
+    }
+    flag, value = server_arg("num_speculative_tokens", 5)
+    assert flag == "--speculative-config"
+    assert knob_from_server_arg("speculative_config", value) == ("num_speculative_tokens", 5)
+    # Something that is not the n-gram config gitm emits is not claimed as it.
+    other = '{"method": "eagle", "model": "x", "num_speculative_tokens": 5}'
+    assert knob_from_server_arg("speculative_config", other)[0] == "speculative_config"
+    assert server_arg("max_num_seqs", 64) == ("--max-num-seqs", 64)

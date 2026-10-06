@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any
 
 from gitm.optimizer.harness_results import LAUNCH_ONLY_FLAGS, parse_flags, realises
+from gitm.optimizer.vllm_knobs import knob_from_server_arg, server_arg
 
 __all__ = [
     "Arm",
@@ -217,7 +218,9 @@ def plan_arms(
                 predicted_delta=predicted, ingestable=False))
             continue
 
-        flag = flag_for(knob)
+        # The flag that actually sets this knob on the server, which for a knob
+        # vLLM takes nested (speculative decoding) is not flag_for(knob).
+        flag, arg_value = server_arg(knob, spec.value)
         if flag in LAUNCH_ONLY_FLAGS:
             out.append(Unreachable(
                 name, knob,
@@ -234,14 +237,16 @@ def plan_arms(
                     "not set, so the arm would be the baseline"))
                 continue
             argv = _without(base, flag, booleans)
-        elif current is not None and realises(current[1], spec.value):
+        elif current is not None and realises(
+                knob_from_server_arg(flag.lstrip("-").replace("-", "_"), current[1])[1],
+                spec.value):
             out.append(Unreachable(
                 name, knob,
                 f"the baseline already runs {flag}={current[1]}, so the arm would "
                 "measure nothing"))
             continue
         else:
-            argv = _with(base, flag, spec.value, booleans)
+            argv = _with(base, flag, arg_value, booleans)
 
         arms.append(Arm(
             lever=name, knob=knob, value=spec.value,

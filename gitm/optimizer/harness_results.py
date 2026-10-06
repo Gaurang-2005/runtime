@@ -38,6 +38,7 @@ from typing import Any
 from gitm.optimizer.history import EXPORT_NAME
 from gitm.optimizer.report import Provenance
 from gitm.optimizer.verification_export import VerificationRecord, write_verification
+from gitm.optimizer.vllm_knobs import knob_from_server_arg
 from gitm.serve.discover import vllm_argv_start, vllm_launch_argv
 
 __all__ = [
@@ -210,6 +211,8 @@ def resolve_lever(knob: str, value: Any, library: Iterable[Any]) -> Any | None:
     not know, so there is no lever to name and it resolves to ``None``.
     """
     knob_name = knob.lstrip("-").replace("-", "_")
+    # A nested argument (``--speculative-config '{...}'``) names the knob inside it.
+    knob_name, value = knob_from_server_arg(knob_name, value)
     matches = [s for s in library if s.knob == knob_name]
     if value is None:
         return next((s for s in matches if isinstance(s.value, bool) and not s.value), None)

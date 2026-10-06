@@ -695,6 +695,7 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     import time
 
+    from gitm.optimizer.vllm_knobs import engine_kwargs
     from gitm.tracer import injection
 
     # Spawn is what gives a ROCm EngineCore its profiler back (P1-1), but it is
@@ -946,7 +947,9 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         never a silent no-op.
         """
         kwargs = dict(getattr(_old_engine, "gitm_llm_kwargs", _base_kwargs))
-        kwargs.update(knob_values)
+        # Through vllm_knobs: a nested knob (speculative decoding) is not an
+        # argument LLM() accepts on its own.
+        kwargs.update(engine_kwargs(knob_values))
         # Give each restarted engine a fresh distributed port so V1 init does not
         # collide with any prior in-process engine state.
         os.environ["VLLM_PORT"] = str(_free_port())

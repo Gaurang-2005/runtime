@@ -20,6 +20,7 @@ set a structural field that the running engine won't actually honor.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -320,3 +321,70 @@ def expand_relative_candidates(spec: InterventionSpec, engine: Any | None) -> li
         suffix = f"x{m:g}".replace(".", "_").replace("-", "neg")
         out.append(resolved.model_copy(update={"name": f"{spec.name}_{suffix}"}))
     return out
+
+
+# --- knobs vLLM takes nested inside another argument ---------------------------
+#
+# The catalogue names a lever by the setting it changes. vLLM does not always
+# take that setting as an argument of its own: speculative decoding is configured
+# through one JSON argument, ``speculative_config``. Passing
+# ``num_speculative_tokens`` at the top level is rejected by the engine
+# (``LLM(num_speculative_tokens=5)``) and by the server
+# (``vllm: error: unrecognized arguments: --num-speculative-tokens 5``), so the
+# top-ranked lever of every run and every sweep could never start (P2-1, L-3).
+#
+# One table, read by the three places a knob leaves gitm: the restart path's
+# engine kwargs, the server flags ``gitm propose`` emits, and ``gitm ingest``
+# reading those flags back to the lever.
+
+#: knob -> (nested argument, build its value from the knob's value).
+_NESTED_KNOBS = {
+    # n-gram drafting: vLLM fills in the lookup window itself when it is unset.
+    "num_speculative_tokens": (
+        "speculative_config",
+        lambda v: {"method": "ngram", "num_speculative_tokens": int(v)},
+    ),
+}
+
+
+def engine_kwargs(values: dict[str, Any]) -> dict[str, Any]:
+    """``{knob: value}`` as the keyword arguments ``LLM()`` accepts."""
+    out: dict[str, Any] = {}
+    for knob, value in values.items():
+        nested = _NESTED_KNOBS.get(knob)
+        if nested is None:
+            out[knob] = value
+            continue
+        arg, build = nested
+        merged = dict(out.get(arg) or {})
+        merged.update(build(value))
+        out[arg] = merged
+    return out
+
+
+def server_arg(knob: str, value: Any) -> tuple[str, Any]:
+    """``(flag, value)`` that sets ``knob`` on ``vllm serve``."""
+    nested = _NESTED_KNOBS.get(knob)
+    if nested is None:
+        return "--" + knob.replace("_", "-"), value
+    arg, build = nested
+    return "--" + arg.replace("_", "-"), json.dumps(build(value), separators=(",", ":"))
+
+
+def knob_from_server_arg(name: str, value: Any) -> tuple[str, Any]:
+    """The catalogue ``(knob, value)`` a server argument sets; the inverse of
+    :func:`server_arg`. ``name`` is the flag without dashes, in snake case.
+    Anything that is not a nested argument it can read comes back unchanged."""
+    for knob, (arg, build) in _NESTED_KNOBS.items():
+        if name != arg or not isinstance(value, str):
+            continue
+        try:
+            got = json.loads(value)
+        except ValueError:
+            return name, value
+        if not isinstance(got, dict):
+            return name, value
+        for candidate in (got.get(knob),):
+            if candidate is not None and build(candidate) == got:
+                return knob, candidate
+    return name, value
