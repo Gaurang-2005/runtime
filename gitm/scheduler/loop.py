@@ -686,8 +686,10 @@ def _record_graph_basis(
     if getattr(pctx, "peak", None) is None:
         sku = getattr(pctx, "sku", None)
         log.record(GRAPH_HARDWARE, used="A100-SXM4-80GB peaks",
-                   reason=(f"GPU SKU {sku!r} has no entry in the peak table" if sku
-                           else "no GPU SKU (GITM_GPU_SKU unset and NVML gave no name)"),
+                   reason=(f"GPU SKU {sku!r} has no entry in the peak table"
+                           f" (found via {getattr(pctx, 'sku_source', '') or 'unknown'})"
+                           if sku else
+                           f"no GPU SKU ({getattr(pctx, 'sku_source', '') or 'GITM_GPU_SKU unset and NVML gave no name'})"),
                    severity=APPROXIMATE, affects=(AFFECTS_RESIDUALS,))
     if batch is None:
         n = getattr(sched, "n_samples", 0) if sched is not None else 0
