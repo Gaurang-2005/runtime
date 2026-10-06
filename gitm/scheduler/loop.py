@@ -1380,6 +1380,33 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # it happens. EngineABResult lives on applicator.last_result and is
     # overwritten by the next candidate, so it has to be taken per-iteration.
     verification: list[VerificationRecord] = []
+    # Autoresearch's records as each lands, until the pass returns and they are
+    # folded into ``verification`` with the rest.
+    ar_live: list[VerificationRecord] = []
+
+    def _flush_verification() -> None:
+        """Write what has been measured so far (K-3).
+
+        The export used to be written once, at the end. A run that hung or was
+        killed lost every A/B it had already measured: the first Kimi run on
+        MI355X measured graph replay at about +15% and has no record of it. The
+        final write at the end of the run replaces this one with the full set,
+        so a run that finishes is unchanged.
+        """
+        records = verification + ar_live
+        if not records:
+            return
+        try:
+            write_verification(
+                records,
+                build_provenance(
+                    degradations=degradations, workload_id=workload,
+                    fingerprint=qual.fingerprint, run_id=run_id,
+                    started_at_ns=started_ns, trace_path=str(trace_path)),
+                run_dir / "verification.json", gpu_sku=pctx.sku)
+        except Exception as exc:  # noqa: BLE001 - a failed checkpoint must not end the run
+            warnings.warn(f"gitm: could not checkpoint verification.json: {exc}",
+                          RuntimeWarning, stacklevel=2)
     # Aggregate kernel-time residual for the report (was hardcoded 0.0). Same for
     # every claim in a run — it describes the run's gap vs the predicted graph.
     kt_residual = _agg_kt_residual(res)
@@ -1439,6 +1466,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                     degradations=measured_under,
                 )
             )
+            _flush_verification()
         # Causal evidence: the measured A/B verdict when live, else the Granger
         # signal that motivated the candidate. The kept/rolled-back wording comes
         # from the authoritative ApplyResult (the real gate decision), not from
@@ -1578,6 +1606,15 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 return reason
             return None
 
+        def _checkpoint_ar(r: Any) -> None:
+            if r.ab_result is not None and r.apply_result is not None:
+                ar_live.append(build_record(
+                    r.spec, r.ab_result, r.apply_result,
+                    baseline_config=r.baseline_config or {},
+                    candidate_config=r.candidate_config or {},
+                    degradations=r.degradations))
+                _flush_verification()
+
         ar_run = autoresearch(
             trace,
             applicator=applicator,
@@ -1593,6 +1630,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             # The same deadline Phase 4 stops on. Without it the pass ran every
             # proposal regardless, and a 15-minute run took 36 (P2-7).
             deadline_ns=started_ns + int(budget_s * 1e9),
+            on_result=_checkpoint_ar,
         )
     else:
         # An empty result list reads the same as "searched and found nothing";

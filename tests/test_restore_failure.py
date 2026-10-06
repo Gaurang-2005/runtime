@@ -419,3 +419,44 @@ def test_the_headline_does_not_sum_independent_ab_deltas():
 
     text = _default_summary([claim("a", 0.03), claim("b", 0.10), claim("c", 0.02)])
     assert "+10.0% (b)" in text and "aggregate" not in text and "+15.0%" not in text
+
+
+def test_a_run_killed_mid_way_keeps_the_ab_it_had_measured(tmp_path, monkeypatch):
+    """K-3. The export was written once, at the end; the first Kimi run on
+    MI355X hung after measuring a candidate and kept nothing."""
+    from gitm.agents.policy import RankedCandidate
+    from gitm.optimizer.apply import EngineABResult
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=_spec("a", 1), predicted_delta=0.05),
+        RankedCandidate(spec=_spec("b", 1), predicted_delta=0.05)])
+    monkeypatch.setattr(loop.DryRunApplicator, "last_result", EngineABResult(
+        knob="a", value=1, baseline_tps=100.0, candidate_tps=110.0, speedup=1.1,
+        kept=True), raising=False)
+
+    class Killed(BaseException):
+        """Stands in for the run being killed while the second candidate hangs."""
+
+    calls = {"n": 0}
+
+    def apply_then_die(spec, applicator, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise Killed
+        return ApplyResult(True, rolled_back=False, measured_delta=0.1)
+
+    monkeypatch.setattr(loop, "apply_intervention", apply_then_die)
+    with pytest.raises(Killed):
+        loop.run_loop(loop.LoopConfig(budget="30s", scratch=str(tmp_path),
+                                      workload_runner=_Runner()))
+
+    exports = list(Path(tmp_path).glob("runs/*/verification.json"))
+    assert len(exports) == 1, "nothing was written before the run died"
+    names = [r["intervention_name"] for r in json.loads(exports[0].read_text())["results"]]
+    assert names == ["a"]
