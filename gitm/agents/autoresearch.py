@@ -66,7 +66,7 @@ from gitm.optimizer.degradation import (
 )
 from gitm.optimizer.deviation import observed_op
 from gitm.optimizer.monitor import Residuals, _serialized_fraction
-from gitm.optimizer.vllm_knobs import KNOB_PREREQUISITES
+from gitm.optimizer.vllm_knobs import KNOB_PREREQUISITES, engine_kwargs
 from gitm.tracer.schema import Trace
 
 if TYPE_CHECKING:
@@ -1342,7 +1342,7 @@ def _autoresearch_pass(
                 else None
             )
             if pre_cfg is not None:
-                post_cfg = {**pre_cfg, **(c.spec.knobs or {c.spec.knob: c.spec.value})}
+                post_cfg = {**pre_cfg, **engine_kwargs(c.spec.knob_values, pre_cfg)}
         else:
             applied = None
             ab = None

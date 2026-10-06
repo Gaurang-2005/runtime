@@ -75,6 +75,7 @@ from gitm.optimizer.verification_export import (
 )
 from gitm.optimizer.vllm_knobs import (
     KNOB_PREREQUISITES,
+    engine_kwargs,
     expand_relative_candidates,
     knob_kind,
     unmet_prerequisite,
@@ -740,9 +741,20 @@ def _swap_engine(old: Any, build: Any) -> tuple[Any, str | None]:
     return new, None
 
 
+def _motivation(sched_causes: Any, coll_causes: Any) -> dict[str, str]:
+    """Knob -> the observed cause that argues for it (S-3). Scheduler causes
+    first, the same precedence a claim's attribution uses, so the cause a lever
+    was ranked for is the cause its claim names."""
+    out: dict[str, str] = {}
+    for cause in (*sched_causes, *coll_causes):
+        for knob in cause.motivates_knobs:
+            out.setdefault(knob, cause.signal)
+    return out
+
+
 def _recapture(
-    path, *, workload: str, run_id: str, runner
-) -> tuple[Any, str | None]:
+    path, *, workload: str, run_id: str, runner, engine: Any = None
+) -> tuple[Any, str | None, dict[str, str]]:
     """Trace the workload again, as it stands after what has been applied.
 
     The deviation profile moves as candidates land: a region the last one fixed
@@ -756,7 +768,12 @@ def _recapture(
     the tracing overhead never lands on the numbers that decide keep or
     rollback.
 
-    Returns ``(trace, None)``, or ``(None, reason)`` when it could not be taken.
+    The scheduler is sampled over the same window, so the re-rank reads the
+    causes the workload shows now rather than the ones it showed at the start:
+    a kept lever can relieve the pressure that motivated the next one.
+
+    Returns ``(trace, None, motivated)``, or ``(None, reason, {})`` when it could
+    not be taken.
     A run that has already paid for its trace and its A/Bs must not be lost to a
     failed re-measurement, so the caller keeps the order it had — but the reason
     is carried out rather than swallowed. The workload failing during the extra
@@ -764,16 +781,21 @@ def _recapture(
     the run afterwards, and recording both as "no trace" hides the first.
     """
     try:
-        with capture(path, workload_id=workload, run_id=run_id) as trace:
+        with (
+            capture(path, workload_id=workload, run_id=run_id) as trace,
+            sample_scheduler_stats(engine) as stats,
+        ):
             if runner is not None:
                 try:
                     runner()
                 except Exception as exc:
-                    return None, f"workload run failed: {exc}"
+                    return None, f"workload run failed: {exc}", {}
                 sync_device()
-        return trace, None
+        motivated = _motivation(scheduler_causes(stats.summary()),
+                                collective_causes(worst_device_comm(trace)))
+        return trace, None, motivated
     except Exception as exc:
-        return None, f"capture failed: {exc}"
+        return None, f"capture failed: {exc}", {}
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
@@ -1295,13 +1317,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     _floors_priced_for_this_run = (graph_default_why is None
                                    and getattr(pctx, "peak", None) is not None)
     _recoverable = recoverable_by_op(res) if _floors_priced_for_this_run else None
-    # Knob -> the cause observed in this run that argues for it (S-3). Scheduler
-    # causes first, the same precedence the claim's attribution uses below, so
-    # the cause a lever was ranked for is the cause its claim names.
-    _motivated: dict[str, str] = {}
-    for _cause in (*sched_causes, *coll_causes):
-        for _knob in _cause.motivates_knobs:
-            _motivated.setdefault(_knob, _cause.signal)
+    # Knob -> the cause observed in this run that argues for it (S-3).
+    _motivated = _motivation(sched_causes, coll_causes)
     ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions,
                                   ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
                                   fingerprint=qual.fingerprint, recoverable=_recoverable,
@@ -1511,7 +1528,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         elif result.rolled_back:
             rolled_back.append(c.spec.name)
         if ab is not None:
-            candidate_cfg = {**baseline_cfg, **(c.spec.knobs or {c.spec.knob: c.spec.value})}
+            # As the restart built it: a nested knob sits inside its argument.
+            candidate_cfg = {**baseline_cfg, **engine_kwargs(c.spec.knob_values, baseline_cfg)}
             verification.append(
                 build_record(
                     c.spec, ab, result,
@@ -1590,11 +1608,12 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 traced_engine, swap_err = _swap_engine(eng_now, traced_fn)
                 tracing_swaps.append({"when": f"re-trace {step}", "to": "traced",
                                       "error": swap_err})
-                fresh, why = None, swap_err
+                fresh, why, motivated_now = None, swap_err, {}
                 if traced_engine is not None:
                     applicator.engine = traced_engine
-                    fresh, why = _recapture(rerank_path, workload=workload,
-                                            run_id=run_id, runner=runner)
+                    fresh, why, motivated_now = _recapture(
+                        rerank_path, workload=workload, run_id=run_id, runner=runner,
+                        engine=traced_engine)
                     back, swap_err = _swap_engine(
                         traced_engine, traced_engine.gitm_untraced_rebuild_fn)
                     tracing_swaps.append({"when": f"after re-trace {step}",
@@ -1612,8 +1631,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                         severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
                     break
             else:
-                fresh, why = _recapture(rerank_path, workload=workload,
-                                        run_id=run_id, runner=runner)
+                fresh, why, motivated_now = _recapture(
+                    rerank_path, workload=workload, run_id=run_id, runner=runner,
+                    engine=eng_now)
             was = [x.spec.name for x in queue]
             if fresh is not None and fresh.kernels():
                 # Deliberately not gated on recoverable time. The fresh trace
@@ -1627,7 +1647,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 # Little is lost: the queue was already filtered at selection,
                 # so re-gating could only add rejections, and those are exactly
                 # the ones resting on the stale floors. Coverage is still
-                # recomputed per trace, which is what re-ranking is for.
+                # recomputed per trace, which is what re-ranking is for, and so
+                # are the causes: the re-trace sampled the scheduler too.
+                _motivated = motivated_now
                 queue = select_interventions(
                     fresh, [x.spec for x in queue], policy, top_n=len(queue),
                     ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
@@ -1641,6 +1663,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 "order_before": was,
                 "order_after": now,
                 "changed": was != now,
+                "causes": sorted(set(_motivated.values())),
             })
             # The re-capture runs the workload, so it spends budget. Checked
             # again here because the check above ran before that spend: a

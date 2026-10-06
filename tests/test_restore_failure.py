@@ -489,6 +489,26 @@ def test_a_hung_engine_call_is_killed_and_raises(monkeypatch):
     assert time.monotonic() - t0 < 3
 
 
+def test_a_hang_with_nothing_to_kill_is_abandoned_at_the_deadline(monkeypatch):
+    """A build can stall before its engine process exists, so killing frees
+    nothing. The watchdog then stops waiting for the call instead of hanging."""
+    import signal
+    import time
+
+    from gitm import workloads
+    from gitm.optimizer.apply import EngineTimeout
+
+    monkeypatch.setattr(workloads, "_WATCHDOG_GRACE_S", 0.2)
+    before = signal.getsignal(signal.SIGUSR1)
+
+    t0 = time.monotonic()
+    with pytest.raises(EngineTimeout, match="abandoned"):
+        workloads._with_watchdog(lambda: time.sleep(30), what="build", timeout_s=0.2,
+                                 pids=lambda: set())
+    assert time.monotonic() - t0 < 5
+    assert signal.getsignal(signal.SIGUSR1) == before      # handler put back
+
+
 def test_a_call_that_finishes_in_time_is_left_alone(monkeypatch):
     from gitm import workloads
 

@@ -229,6 +229,10 @@ def plan_arms(
             continue
 
         current = _find(base, flag, booleans)
+        if current is not None:
+            # Merged into what the baseline passes, so the arm changes this one
+            # setting rather than replacing the baseline's whole nested config.
+            _, arg_value = server_arg(knob, spec.value, current[1])
         if spec.value is False:
             if current is None:
                 out.append(Unreachable(

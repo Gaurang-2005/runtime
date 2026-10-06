@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -337,54 +338,71 @@ def expand_relative_candidates(spec: InterventionSpec, engine: Any | None) -> li
 # engine kwargs, the server flags ``gitm propose`` emits, and ``gitm ingest``
 # reading those flags back to the lever.
 
-#: knob -> (nested argument, build its value from the knob's value).
-_NESTED_KNOBS = {
+# The lever changes its one field and nothing else. A baseline that already
+# speculates keeps its method, draft model and lookup window, so the A/B differs
+# from it only in the token count; the n-gram method is filled in only when the
+# baseline does not speculate at all.
+
+#: knob -> (nested argument, field inside it, its type, fields filled in only if absent).
+_NESTED_KNOBS: dict[str, tuple[str, str, Callable[[Any], Any], dict[str, Any]]] = {
     # n-gram drafting: vLLM fills in the lookup window itself when it is unset.
-    "num_speculative_tokens": (
-        "speculative_config",
-        lambda v: {"method": "ngram", "num_speculative_tokens": int(v)},
-    ),
+    "num_speculative_tokens": ("speculative_config", "num_speculative_tokens", int,
+                               {"method": "ngram"}),
 }
 
 
-def engine_kwargs(values: dict[str, Any]) -> dict[str, Any]:
-    """``{knob: value}`` as the keyword arguments ``LLM()`` accepts."""
+def _as_dict(value: Any) -> dict[str, Any]:
+    """A nested argument as a dict, whether it came as a dict or as the JSON a
+    server flag carries. Anything unreadable counts as unset."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _nested_value(knob: str, value: Any, current: Any) -> dict[str, Any]:
+    _arg, field, cast, defaults = _NESTED_KNOBS[knob]
+    return {**defaults, **_as_dict(current), field: cast(value)}
+
+
+def engine_kwargs(values: dict[str, Any],
+                  base: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """``{knob: value}`` as the keyword arguments ``LLM()`` accepts, to update
+    ``base`` (the engine's current kwargs) with. A nested knob is merged into
+    the argument ``base`` already has, not put in place of it."""
     out: dict[str, Any] = {}
     for knob, value in values.items():
         nested = _NESTED_KNOBS.get(knob)
         if nested is None:
             out[knob] = value
             continue
-        arg, build = nested
-        merged = dict(out.get(arg) or {})
-        merged.update(build(value))
-        out[arg] = merged
+        arg = nested[0]
+        current = out[arg] if arg in out else (base or {}).get(arg)
+        out[arg] = _nested_value(knob, value, current)
     return out
 
 
-def server_arg(knob: str, value: Any) -> tuple[str, Any]:
-    """``(flag, value)`` that sets ``knob`` on ``vllm serve``."""
+def server_arg(knob: str, value: Any, current: Any = None) -> tuple[str, Any]:
+    """``(flag, value)`` that sets ``knob`` on ``vllm serve``. ``current`` is the
+    value the baseline already passes for that flag, which a nested knob is
+    merged into."""
     nested = _NESTED_KNOBS.get(knob)
     if nested is None:
         return "--" + knob.replace("_", "-"), value
-    arg, build = nested
-    return "--" + arg.replace("_", "-"), json.dumps(build(value), separators=(",", ":"))
+    merged = _nested_value(knob, value, current)
+    return "--" + nested[0].replace("_", "-"), json.dumps(merged, separators=(",", ":"))
 
 
 def knob_from_server_arg(name: str, value: Any) -> tuple[str, Any]:
     """The catalogue ``(knob, value)`` a server argument sets; the inverse of
     :func:`server_arg`. ``name`` is the flag without dashes, in snake case.
     Anything that is not a nested argument it can read comes back unchanged."""
-    for knob, (arg, build) in _NESTED_KNOBS.items():
-        if name != arg or not isinstance(value, str):
+    for knob, (arg, field, _cast, _defaults) in _NESTED_KNOBS.items():
+        if name != arg:
             continue
-        try:
-            got = json.loads(value)
-        except ValueError:
-            return name, value
-        if not isinstance(got, dict):
-            return name, value
-        for candidate in (got.get(knob),):
-            if candidate is not None and build(candidate) == got:
-                return knob, candidate
+        got = _as_dict(value)
+        if got.get(field) is not None:
+            return knob, got[field]
     return name, value

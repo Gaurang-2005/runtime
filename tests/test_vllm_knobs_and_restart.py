@@ -520,7 +520,29 @@ def test_nested_knobs_reach_llm_as_the_argument_vllm_takes():
     flag, value = server_arg("num_speculative_tokens", 5)
     assert flag == "--speculative-config"
     assert knob_from_server_arg("speculative_config", value) == ("num_speculative_tokens", 5)
-    # Something that is not the n-gram config gitm emits is not claimed as it.
+    # The lever is the token count, whatever method carries it: an arm built on
+    # an eagle baseline is eagle with the lever's count, and reads back as it.
     other = '{"method": "eagle", "model": "x", "num_speculative_tokens": 5}'
-    assert knob_from_server_arg("speculative_config", other)[0] == "speculative_config"
+    assert knob_from_server_arg("speculative_config", other) == ("num_speculative_tokens", 5)
+    assert knob_from_server_arg("speculative_config", '{"method": "eagle"}')[0] == \
+        "speculative_config"
+    assert knob_from_server_arg("speculative_config", "not json")[0] == "speculative_config"
+
+
+def test_a_nested_knob_is_merged_into_the_baselines_config_not_put_in_its_place():
+    """Replacing it would drop the baseline's method, draft model and lookup
+    window, and the A/B would measure all of that, not the lever."""
+    import json
+
+    from gitm.optimizer.vllm_knobs import engine_kwargs, server_arg
+
+    base = {"speculative_config": {"method": "eagle", "model": "x",
+                                   "num_speculative_tokens": 2}}
+    assert engine_kwargs({"num_speculative_tokens": 5}, base) == {
+        "speculative_config": {"method": "eagle", "model": "x", "num_speculative_tokens": 5}}
+    assert base["speculative_config"]["num_speculative_tokens"] == 2     # not mutated
+    _, value = server_arg("num_speculative_tokens", 5,
+                          '{"method":"ngram","prompt_lookup_max":4}')
+    assert json.loads(value) == {"method": "ngram", "prompt_lookup_max": 4,
+                                 "num_speculative_tokens": 5}
     assert server_arg("max_num_seqs", 64) == ("--max-num-seqs", 64)

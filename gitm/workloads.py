@@ -616,6 +616,11 @@ def _kill_engine_processes(pids: set[int]) -> list[int]:
     return killed
 
 
+#: After the watchdog kills the engine, how long the blocked call gets to notice
+#: before the watchdog stops waiting for it.
+_WATCHDOG_GRACE_S = 60.0
+
+
 def _with_watchdog(fn: Callable[[], Any], *, what: str, timeout_s: float | None,
                    pids: Callable[[], set[int]]) -> Any:
     """``fn()``, killing the engine's processes if it runs past ``timeout_s`` (K-2).
@@ -627,32 +632,57 @@ def _with_watchdog(fn: Callable[[], Any], *, what: str, timeout_s: float | None,
     (its client notices the engine died), and that surfaces here as
     :class:`~gitm.optimizer.apply.EngineTimeout`, which the apply path treats as
     a failed candidate, or as a lost engine for a baseline.
+
+    Killing is not always enough: a build can stall before its engine process
+    exists, or in this process, and then there is nothing to kill. So if the call
+    is still blocked :data:`_WATCHDOG_GRACE_S` after the kill, the watchdog
+    interrupts it with a signal and raises ``EngineTimeout`` regardless. That
+    needs a signal handler, so it is only available on the main thread; off it,
+    the kill is all the watchdog can do.
     """
     from gitm.optimizer.apply import EngineTimeout
 
     if timeout_s is None:
         return fn()
+    import signal
     import threading
 
     done = threading.Event()
     fired: list[int] = []
+    why = f"{what} ran past {timeout_s:g}s; its engine was killed"
+
+    def _interrupt(_signum: int, _frame: Any) -> None:
+        if not done.is_set():
+            raise EngineTimeout(f"{what} ran past {timeout_s:g}s and did not return "
+                                "after its engine was killed; abandoned")
+
+    main = threading.current_thread() is threading.main_thread()
+    previous = signal.signal(signal.SIGUSR1, _interrupt) if main else None
+    main_id = threading.get_ident()
 
     def _watch() -> None:
-        if not done.wait(timeout_s):
-            fired.extend(_kill_engine_processes(pids()) or [-1])
+        if done.wait(timeout_s):
+            return
+        fired.extend(_kill_engine_processes(pids()) or [-1])
+        if main and not done.wait(_WATCHDOG_GRACE_S):
+            signal.pthread_kill(main_id, signal.SIGUSR1)
 
     watcher = threading.Thread(target=_watch, name=f"gitm-watchdog:{what}", daemon=True)
     watcher.start()
     try:
         result = fn()
+    except EngineTimeout:
+        raise
     except Exception as exc:
         if fired:
-            raise EngineTimeout(f"{what} ran past {timeout_s:g}s; its engine was killed") from exc
+            raise EngineTimeout(why) from exc
         raise
     finally:
         done.set()
+        if main:
+            signal.signal(signal.SIGUSR1, signal.SIG_DFL if previous is None else previous)
     if fired:
-        raise EngineTimeout(f"{what} ran past {timeout_s:g}s; its engine was killed")
+        raise EngineTimeout(why)
     return result
 
 
@@ -1059,7 +1089,7 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         kwargs = dict(getattr(_old_engine, "gitm_llm_kwargs", _base_kwargs))
         # Through vllm_knobs: a nested knob (speculative decoding) is not an
         # argument LLM() accepts on its own.
-        kwargs.update(engine_kwargs(knob_values))
+        kwargs.update(engine_kwargs(knob_values, kwargs))
         # Give each restarted engine a fresh distributed port so V1 init does not
         # collide with any prior in-process engine state.
         os.environ["VLLM_PORT"] = str(_free_port())
