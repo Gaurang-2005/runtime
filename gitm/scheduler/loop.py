@@ -1580,6 +1580,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             gpu_sku=pctx.sku,
             fingerprint=qual.fingerprint,
             degradations=degradations,
+            # The same deadline Phase 4 stops on. Without it the pass ran every
+            # proposal regardless, and a 15-minute run took 36 (P2-7).
+            deadline_ns=started_ns + int(budget_s * 1e9),
         )
     else:
         # An empty result list reads the same as "searched and found nothing";
@@ -1599,6 +1602,13 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         degradations.record(
             ENGINE_LOST, used=f"an autoresearch pass that stopped after {lost_in_ar.spec.name}",
             reason=f"{engine_lost}; {n_untried} ranked candidate(s) not tried",
+            severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+    elif ar_run.stopped_by == "budget":
+        n_untried += ar_run.n_untried
+        degradations.record(
+            AR_SKIPPED, used="an autoresearch pass stopped at the budget",
+            reason=(f"budget {cfg.budget} spent; {ar_run.n_untried} ranked "
+                    "candidate(s) not tried"),
             severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
     # Again, now that autoresearch has had its proposals vetoed: an exclusion
     # that only stopped a proposal is still something the run held back, and a

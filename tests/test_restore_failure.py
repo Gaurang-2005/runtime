@@ -346,3 +346,36 @@ def test_phase4_still_records_what_the_gate_rejected(tmp_path, monkeypatch):
                                         workload_runner=_Runner()))
     assert out["summary"]["n_untried"] == 1   # c
     assert out["summary"]["n_rejected"] == 2  # b, d
+
+
+def test_autoresearch_stops_at_the_budget(monkeypatch):
+    """P2-7. Phase 4 stops between candidates when the budget is spent, but
+    autoresearch ran every proposal regardless: a 15-minute run took 36."""
+    import gitm.agents.autoresearch as ar
+    from gitm.agents.policy import RankedCandidate
+
+    specs = [_spec(f"knob_{i}", 1) for i in range(5)]
+    monkeypatch.setattr(ar, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=s, predicted_delta=0.05) for s in specs])
+
+    class _Proposer:
+        def propose(self, cls, target_op=None):
+            return specs
+
+    clock = {"now": 0}
+    applied = []
+
+    def apply_and_tick(spec, applicator, **kw):
+        applied.append(spec.name)
+        clock["now"] += 10          # each candidate costs 10 units of wall time
+        return ApplyResult(True, rolled_back=True, measured_delta=-0.01)
+
+    monkeypatch.setattr(ar, "apply_intervention", apply_and_tick)
+    monkeypatch.setattr(ar.time, "time_ns", lambda: clock["now"])
+    seen = []
+    run = ar.autoresearch(_trace(), applicator=object(), proposer=_Proposer(),
+                          deadline_ns=25, on_result=seen.append)
+
+    assert applied == ["knob_0", "knob_1", "knob_2"]   # the third starts at t=20 < 25
+    assert run.stopped_by == "budget" and run.n_untried == 2
+    assert [r.spec.name for r in seen] == applied       # each result reported as it landed
