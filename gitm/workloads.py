@@ -27,6 +27,7 @@ makes the autonomous loop observe a real workload.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import socket
 import time
@@ -880,20 +881,32 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         except NameError:
             pass
 
-    def _build_engine(kwargs: dict[str, Any]) -> Any:
+    # Whether this run is traced at all. Only engines that are actually traced
+    # carry the collector (K-1): the opening engine, and a re-trace's engine. A
+    # candidate or baseline that is only A/B-measured is built without it.
+    tracing = injection.active_vendor() is not None
+    # The loop's hooks, attached to every engine built here rather than only the
+    # first: the loop may swap in a rebuilt baseline and read them off that.
+    hooks: dict[str, Any] = {}
+
+    def _build_engine(kwargs: dict[str, Any], *, traced: bool = False) -> Any:
         # Sampled either side of the build so this engine knows which workers
         # are its own. In parallel restart mode two engines are up at once and
         # their workers share a name, so ownership is the only thing that keeps
         # a candidate's teardown from taking the baseline's workers with it.
         before = engine_worker_pids()
-        engine = LLM(model=model, **kwargs)
+        with contextlib.nullcontext() if traced else injection.untraced_env():
+            engine = LLM(model=model, **kwargs)
         engine.gitm_worker_pids = engine_worker_pids() - before
         engine.gitm_llm_kwargs = dict(kwargs)
+        engine.gitm_traced = traced and tracing
         engine.gitm_shutdown_fn = _shutdown_engine
         engine.gitm_activate_fn = _activate_engine
+        for name, fn in hooks.items():
+            setattr(engine, name, fn)
         return engine
 
-    llm = _build_engine(dict(_base_kwargs))
+    llm = _build_engine(dict(_base_kwargs), traced=True)
     _activate_engine(llm)
     prompts = [f"Benchmark decode prompt {i}." for i in range(n_prompts)]
     params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
@@ -983,6 +996,19 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         kwargs = dict(getattr(old_engine, "gitm_llm_kwargs", _base_kwargs))
         return _build_engine(kwargs)
 
+    def _traced_rebuild(old_engine: Any) -> Any:
+        """The current configuration, rebuilt with the collector, for a re-trace.
+
+        Forced eager. Graph replay hides decode kernels from the tracer (L-19),
+        and on MI355X the collector's queue interposition can deadlock against
+        it. ``gitm_llm_kwargs`` keeps the configuration as it was, so a rebuild
+        from this engine does not inherit the forced eager mode.
+        """
+        kwargs = dict(getattr(old_engine, "gitm_llm_kwargs", _base_kwargs))
+        engine = _build_engine({**kwargs, "enforce_eager": True}, traced=True)
+        engine.gitm_llm_kwargs = kwargs
+        return engine
+
     # Expose the live engine + its A/B hooks so the loop can (a) sample scheduler
     # stats and (b) run the Phase-4 decode-throughput A/B on it. ``run.engine`` is
     # picked up as ``cfg.engine``; the loop reads ``gitm_throughput_fn`` /
@@ -993,9 +1019,15 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     # ``.applicator`` convention the hft/edge/openfold factories use.
     run.engine = llm
     run.workload_id = "vllm-decode"
-    llm.gitm_throughput_fn = _throughput
-    llm.gitm_restart_fn = _restart
-    llm.gitm_baseline_restart_fn = _baseline_restart
+    hooks.update(
+        gitm_throughput_fn=_throughput,
+        gitm_restart_fn=_restart,
+        gitm_baseline_restart_fn=_baseline_restart,
+        gitm_traced_rebuild_fn=_traced_rebuild,
+        gitm_untraced_rebuild_fn=_baseline_restart,
+    )
+    for name, fn in hooks.items():
+        setattr(llm, name, fn)
     return run
 
 def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:

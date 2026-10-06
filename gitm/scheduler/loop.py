@@ -86,6 +86,7 @@ from gitm.planner.moe_graph import (
     spec_from_hf_config,
 )
 from gitm.safety.audit import AuditLog, _write_report
+from gitm.tracer import injection
 from gitm.tracer.capture import capture
 from gitm.tracer.vllm_stats import sample_scheduler_stats, summarize_requests
 from gitm.workloads import WorkloadRunner, get_factory, sync_device
@@ -718,6 +719,27 @@ without the thing it asked for.
 """
 
 
+def _swap_engine(old: Any, build: Any) -> tuple[Any, str | None]:
+    """Shut ``old`` down and replace it with ``build(old)``, made the live engine.
+
+    ``(new_engine, None)``, or ``(None, reason)`` when the rebuild failed. Used to
+    move between a traced and an untraced build of the same configuration (K-1):
+    only an engine that is traced carries the collector, so an A/B is always
+    between two untraced engines.
+    """
+    LiveEngineApplicator._shutdown(old)
+    try:
+        new = build(old)
+    except Exception as exc:  # noqa: BLE001 - reported as the engine being lost
+        return None, f"{type(exc).__name__}: {exc}"
+    if new is None:
+        return None, "the rebuild produced no engine"
+    activate = getattr(new, "gitm_activate_fn", None)
+    if callable(activate):
+        activate(new)
+    return new, None
+
+
 def _recapture(
     path, *, workload: str, run_id: str, runner
 ) -> tuple[Any, str | None]:
@@ -1318,6 +1340,29 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # construction time. With no engine it is predict-only (DryRunApplicator):
     # candidates land in the report as unverified (measured_delta=None), never
     # claimed as won.
+    # The opening engine carried the tracer for the capture. Every A/B is between
+    # two engines built without it (K-1), so swap in an untraced baseline before
+    # the first one; otherwise the first A/B would compare a traced baseline with
+    # an untraced candidate and credit the candidate with the tracer's overhead.
+    # One extra engine build, once.
+    tracing_swaps: list[dict[str, Any]] = []
+    early_engine_lost: str | None = None
+    if cfg.engine is not None and getattr(cfg.engine, "gitm_traced", False):
+        untraced = getattr(cfg.engine, "gitm_untraced_rebuild_fn", None)
+        if callable(untraced):
+            new_engine, err = _swap_engine(cfg.engine, untraced)
+            tracing_swaps.append({"when": "before the first A/B", "to": "untraced",
+                                  "error": err})
+            if new_engine is None:
+                early_engine_lost = f"could not rebuild the baseline without the tracer: {err}"
+                degradations.record(
+                    ENGINE_LOST, used="no live A/B (predict-only)",
+                    reason=early_engine_lost, severity=APPROXIMATE,
+                    affects=(AFFECTS_CLAIMS,))
+                cfg.engine = None
+            else:
+                cfg.engine = new_engine
+
     live_restart_fn = getattr(cfg.engine, "gitm_restart_fn", None) if cfg.engine else None
     if cfg.engine is not None:
         # Serial wherever a baseline rebuild is available, rather than parallel
@@ -1421,7 +1466,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # Set when a candidate's rollback failed. From then on there is no baseline
     # to measure against, so the run stops trying candidates and goes straight
     # to writing up what it has.
-    engine_lost: str | None = None
+    engine_lost: str | None = early_engine_lost
     n_untried = 0
     while queue:
         c = queue.pop(0)
@@ -1525,9 +1570,41 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             # After the gate has decided, so the tracing overhead never lands on
             # the A/B that decides keep or rollback.
             step = len(reranks) + 1
-            fresh, why = _recapture(
-                traces_dir(cfg.scratch) / f"{run_id}-rerank{step}.jsonl",
-                workload=workload, run_id=run_id, runner=runner)
+            rerank_path = traces_dir(cfg.scratch) / f"{run_id}-rerank{step}.jsonl"
+            # A/B engines carry no tracer (K-1), so a re-trace first swaps in a
+            # traced, eager build of the current configuration, then swaps back.
+            eng_now = getattr(applicator, "engine", None)
+            traced_fn = getattr(eng_now, "gitm_traced_rebuild_fn", None)
+            swap_err: str | None = None
+            if (eng_now is not None and injection.active_vendor() is not None
+                    and not getattr(eng_now, "gitm_traced", False) and callable(traced_fn)):
+                traced_engine, swap_err = _swap_engine(eng_now, traced_fn)
+                tracing_swaps.append({"when": f"re-trace {step}", "to": "traced",
+                                      "error": swap_err})
+                fresh, why = None, swap_err
+                if traced_engine is not None:
+                    applicator.engine = traced_engine
+                    fresh, why = _recapture(rerank_path, workload=workload,
+                                            run_id=run_id, runner=runner)
+                    back, swap_err = _swap_engine(
+                        traced_engine, traced_engine.gitm_untraced_rebuild_fn)
+                    tracing_swaps.append({"when": f"after re-trace {step}",
+                                          "to": "untraced", "error": swap_err})
+                    if back is not None:
+                        applicator.engine = back
+                if swap_err is not None:
+                    engine_lost = f"could not swap engines for re-trace {step}: {swap_err}"
+                    n_untried = sum(1 for x in queue if x.rejected_reason is None)
+                    rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
+                                    for x in queue if x.rejected_reason is not None)
+                    degradations.record(
+                        ENGINE_LOST, used=f"a run that stopped at re-trace {step}",
+                        reason=f"{engine_lost}; {n_untried} ranked candidate(s) not tried",
+                        severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+                    break
+            else:
+                fresh, why = _recapture(rerank_path, workload=workload,
+                                        run_id=run_id, runner=runner)
             was = [x.spec.name for x in queue]
             if fresh is not None and fresh.kernels():
                 # Deliberately not gated on recoverable time. The fresh trace
@@ -1562,6 +1639,15 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             # A/B on top of the trace.
             if time.time_ns() - started_ns >= int(budget_s * 1e9):
                 break
+
+    if tracing_swaps:
+        # Which engines carried the tracer, and every swap between them. A reader
+        # comparing A/B numbers needs to know none of them was traced.
+        (run_dir / "tracing.json").write_text(json.dumps({
+            "traced": "the opening capture and each re-trace (eager)",
+            "ab_engines": "untraced",
+            "swaps": tracing_swaps,
+        }, indent=2))
 
     if reranks:
         # What the run re-decided, and on what. Without it a report says which
