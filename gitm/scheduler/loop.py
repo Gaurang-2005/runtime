@@ -1295,9 +1295,17 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     _floors_priced_for_this_run = (graph_default_why is None
                                    and getattr(pctx, "peak", None) is not None)
     _recoverable = recoverable_by_op(res) if _floors_priced_for_this_run else None
+    # Knob -> the cause observed in this run that argues for it (S-3). Scheduler
+    # causes first, the same precedence the claim's attribution uses below, so
+    # the cause a lever was ranked for is the cause its claim names.
+    _motivated: dict[str, str] = {}
+    for _cause in (*sched_causes, *coll_causes):
+        for _knob in _cause.motivates_knobs:
+            _motivated.setdefault(_knob, _cause.signal)
     ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions,
                                   ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
-                                  fingerprint=qual.fingerprint, recoverable=_recoverable)
+                                  fingerprint=qual.fingerprint, recoverable=_recoverable,
+                                  motivated=_motivated)
     (run_dir / "ranked_candidates.json").write_text(
         json.dumps(
             [
@@ -1305,6 +1313,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                     "name": c.spec.name,
                     "predicted_delta": c.predicted_delta,
                     "rejected_reason": c.rejected_reason,
+                    "motivated_by": c.motivated_by,
                 }
                 for c in ranked
             ],
@@ -1622,7 +1631,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 queue = select_interventions(
                     fresh, [x.spec for x in queue], policy, top_n=len(queue),
                     ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
-                    fingerprint=qual.fingerprint)
+                    fingerprint=qual.fingerprint, motivated=_motivated)
             now = [x.spec.name for x in queue]
             reranks.append({
                 "after": c.spec.name,

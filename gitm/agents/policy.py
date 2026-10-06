@@ -46,6 +46,10 @@ class RankedCandidate:
     #: while that holds. The demotion lifts by itself once the record stops
     #: disagreeing: it describes the evidence, not the lever.
     demoted: bool = False
+    #: The cause observed in this run that argues for this lever (a scheduler or
+    #: collective signal such as ``kv_cache_preemption``), or ``None``. Ranks a
+    #: lever the run's own evidence points at above one nothing points at (S-3).
+    motivated_by: str | None = None
 
 
 @dataclass
@@ -121,6 +125,7 @@ def select_interventions(
     gpu_sku: str | None = None,
     fingerprint: str | None = None,
     recoverable: Mapping[str, float | None] | None = None,
+    motivated: Mapping[str, str] | None = None,
 ) -> list[RankedCandidate]:
     """Rank the library for this trace, rejected candidates last.
 
@@ -137,6 +142,14 @@ def select_interventions(
     derived, for the same reason ``history`` is: ranking stays a pure function of
     what it is given. Omit it and nothing is gated on the trace, which is the
     behaviour every caller had before.
+
+    ``motivated`` maps a knob to the cause observed in this run that argues for
+    it: the ``motivates_knobs`` of the scheduler and collective causes. A lever
+    setting such a knob ranks ahead of levers no cause names (S-3). A whole-step
+    lever's predicted delta is a catalogue constant on any trace, so without
+    this the order was the catalogue's whatever the run showed. It is a
+    precedence, not a term in the score: a cause says which lever the evidence
+    points at, not by how much it would help.
     """
     use_history = policy.use_history and history is not None and gpu_sku is not None
     candidates: list[RankedCandidate] = []
@@ -176,12 +189,14 @@ def select_interventions(
             delta = measured
         else:
             delta = predict_delta(trace, spec)
+        cause = next((motivated[k] for k in spec.knob_values if k in (motivated or {})), None)
         candidates.append(RankedCandidate(
             spec=spec,
             predicted_delta=delta,
             rejected_reason=reason,
             delta_source="measured" if measured is not None else "prior",
             demoted=bool(record is not None and record.conflicted),
+            motivated_by=cause if reason is None else None,
         ))
 
     # Four terms, in this order and for these reasons:
@@ -195,12 +210,16 @@ def select_interventions(
     #    a result already in hand.
     # 3. Demoted. Among levers that might help, prefer the one whose record does
     #    not disagree with itself.
-    # 4. Magnitude, then name for a deterministic order.
+    # 4. Motivated. Prefer a lever a cause observed in this run argues for. The
+    #    catalogue's estimate only orders levers the run's evidence does not
+    #    separate.
+    # 5. Magnitude, then name for a deterministic order.
     candidates.sort(
         key=lambda c: (
             c.rejected_reason is not None,
             c.predicted_delta <= 0.0,
             c.demoted,
+            c.motivated_by is None,
             -c.predicted_delta,
             c.spec.name,
         )
