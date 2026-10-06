@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any
 
 from gitm.optimizer.harness_results import LAUNCH_ONLY_FLAGS, parse_flags, realises
-from gitm.optimizer.vllm_knobs import knob_from_server_arg, server_arg
+from gitm.optimizer.vllm_knobs import knob_from_server_arg, same_server_value, server_arg
 
 __all__ = [
     "Arm",
@@ -241,10 +241,10 @@ def plan_arms(
                     "not set, so the arm would be the baseline"))
                 continue
             argv = _without(base, flag, booleans)
-        elif current is not None and realises(
-                knob_from_server_arg(flag.lstrip("-").replace("-", "_"), current[1],
-                                     current[1])[1],
-                spec.value):
+        elif current is not None and (
+                same_server_value(arg_value, current[1])
+                or realises(knob_from_server_arg(flag.lstrip("-").replace("-", "_"),
+                                                 current[1])[1], spec.value)):
             out.append(Unreachable(
                 name, knob,
                 f"the baseline already runs {flag}={current[1]}, so the arm would "

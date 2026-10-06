@@ -395,6 +395,18 @@ def server_arg(knob: str, value: Any, current: Any = None) -> tuple[str, Any]:
     return "--" + nested[0].replace("_", "-"), json.dumps(merged, separators=(",", ":"))
 
 
+def same_server_value(a: Any, b: Any) -> bool:
+    """Whether two values of one server flag set the same thing. A JSON-valued
+    flag (``--speculative-config``) is compared as what it parses to, so the
+    same config spaced or ordered differently is not a change."""
+    if a == b:
+        return True
+    try:
+        return isinstance(a, str) and isinstance(b, str) and json.loads(a) == json.loads(b)
+    except ValueError:
+        return False
+
+
 def knob_from_server_arg(name: str, value: Any, baseline: Any = None) -> tuple[str, Any]:
     """The catalogue ``(knob, value)`` a server argument sets; the inverse of
     :func:`server_arg`. ``name`` is the flag without dashes, in snake case, and
@@ -409,8 +421,8 @@ def knob_from_server_arg(name: str, value: Any, baseline: Any = None) -> tuple[s
         if name != arg:
             continue
         got = _as_dict(value)
-        if got.get(field) is None:
-            continue
+        if got.get(field) is None or (baseline is not None and got == _as_dict(baseline)):
+            continue    # no setting, or the baseline's own: nothing was changed
         try:
             built = _nested_value(knob, got[field], baseline)
         except (TypeError, ValueError):

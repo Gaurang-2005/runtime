@@ -38,7 +38,7 @@ from typing import Any
 from gitm.optimizer.history import EXPORT_NAME
 from gitm.optimizer.report import Provenance
 from gitm.optimizer.verification_export import VerificationRecord, write_verification
-from gitm.optimizer.vllm_knobs import knob_from_server_arg
+from gitm.optimizer.vllm_knobs import knob_from_server_arg, same_server_value
 from gitm.serve.discover import vllm_argv_start, vllm_launch_argv
 
 __all__ = [
@@ -462,8 +462,11 @@ def knob_difference(
                 for _, flag, value in parse_flags(c.serve_argv, booleans=booleans)
                 if flag not in LAUNCH_ONLY_FLAGS}
 
+    # A JSON-valued flag is compared as what it parses to: the same config
+    # written differently is no change, and reading it as one credits a lever
+    # with an A/B that changed nothing.
     base, cand = flags(baseline), flags(candidate)
-    moved = {k: v for k, v in cand.items() if base.get(k) != v}
+    moved = {k: v for k, v in cand.items() if not same_server_value(base.get(k), v)}
     moved.update({k: None for k in base if k not in cand})
     return moved
 
