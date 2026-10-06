@@ -460,3 +460,86 @@ def test_a_run_killed_mid_way_keeps_the_ab_it_had_measured(tmp_path, monkeypatch
     assert len(exports) == 1, "nothing was written before the run died"
     names = [r["intervention_name"] for r in json.loads(exports[0].read_text())["results"]]
     assert names == ["a"]
+
+
+# --------------------------------------------------------------------------- #
+# K-2: a hung engine call is killed at its deadline                            #
+# --------------------------------------------------------------------------- #
+def test_a_hung_engine_call_is_killed_and_raises(monkeypatch):
+    """The first Kimi run sat in a collective deadlock until killed by hand."""
+    import threading
+    import time
+
+    from gitm import workloads
+    from gitm.optimizer.apply import EngineTimeout
+
+    killed = threading.Event()
+    monkeypatch.setattr(workloads, "_kill_engine_processes",
+                        lambda pids: (killed.set(), [4242])[1])
+
+    def hung_decode():
+        # Stands in for generate() blocked in a deadlock: it returns only when
+        # its engine dies, and then raises, as vLLM's client does.
+        killed.wait(5)
+        raise RuntimeError("EngineCore died")
+
+    t0 = time.monotonic()
+    with pytest.raises(EngineTimeout, match="ran past 0.2s"):
+        workloads._with_watchdog(hung_decode, what="decode", timeout_s=0.2, pids=lambda: {4242})
+    assert time.monotonic() - t0 < 3
+
+
+def test_a_call_that_finishes_in_time_is_left_alone(monkeypatch):
+    from gitm import workloads
+
+    monkeypatch.setattr(workloads, "_kill_engine_processes",
+                        lambda pids: pytest.fail("killed a call that finished"))
+    assert workloads._with_watchdog(lambda: 7, what="decode", timeout_s=5,
+                                    pids=lambda: {1}) == 7
+
+
+def test_timeouts_come_from_the_environment(monkeypatch):
+    from gitm import workloads
+
+    monkeypatch.setenv("GITM_DECODE_TIMEOUT_S", "0")
+    assert workloads._timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0) is None    # off
+    monkeypatch.setenv("GITM_DECODE_TIMEOUT_S", "90")
+    assert workloads._timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0) == 90.0
+    monkeypatch.delenv("GITM_DECODE_TIMEOUT_S")
+    assert workloads._timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0) == 1800.0
+
+
+def test_a_baseline_that_times_out_means_the_engine_is_lost():
+    """A killed baseline leaves nothing to measure the next candidate against."""
+    from gitm.optimizer.apply import EngineTimeout
+
+    class _HungBaseline:
+        def snapshot(self):
+            raise EngineTimeout("A/B decode ran past 1800s; its engine was killed")
+
+    res = apply_intervention(_spec(), _HungBaseline(), min_keep_delta=0.0)
+    assert res.restore_failed and not res.applied
+    assert "baseline timed out" in res.error
+
+
+def test_a_candidate_whose_decode_times_out_is_rolled_back():
+    """Serial mode: the candidate's engine was killed; the baseline is rebuilt."""
+    from gitm.optimizer.apply import EngineTimeout
+
+    restored = _Engine(100.0)
+
+    def tps(e):
+        if e is not restored and getattr(e, "_candidate", False):
+            raise EngineTimeout("A/B decode ran past 1800s; its engine was killed")
+        return e._tps
+
+    def build_candidate(_old, _values):
+        cand = _Engine(100.0)
+        cand._candidate = True
+        return cand
+
+    app = LiveEngineApplicator(_Engine(100.0), throughput_fn=tps, restart_fn=build_candidate,
+                               baseline_restart_fn=lambda _old: restored, restart_mode="serial")
+    res = apply_intervention(_spec(), app, min_keep_delta=0.0)
+    assert res.rolled_back and not res.restore_failed
+    assert "ran past" in res.error and app.engine is restored

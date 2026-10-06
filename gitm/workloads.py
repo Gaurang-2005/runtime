@@ -572,6 +572,90 @@ def _shutdown_timeout() -> float:
         return 30.0
 
 
+def _timeout_s(var: str, default: float) -> float | None:
+    """A watchdog limit from the environment, in seconds; ``None`` disables it."""
+    raw = os.environ.get(var)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        warnings.warn(f"{var}={raw!r} is not a number; using {default:g}s",
+                      RuntimeWarning, stacklevel=2)
+        return default
+    return None if value <= 0 else value
+
+
+def _kill_engine_processes(pids: set[int]) -> list[int]:
+    """Kill these engine processes and everything under them. Returns what was killed.
+
+    The tree, not only the EngineCore: at TP>1 the GPU workers are its children,
+    and a worker left behind keeps its device memory.
+    """
+    killed: list[int] = []
+    try:
+        import psutil
+    except ImportError:  # vLLM depends on psutil; this is a last resort
+        import signal
+
+        for pid in pids:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+        return killed
+    for pid in pids:
+        try:
+            root = psutil.Process(pid)
+            tree = [*root.children(recursive=True), root]
+        except psutil.Error:
+            continue
+        for proc in tree:
+            with contextlib.suppress(psutil.Error):
+                proc.kill()
+                killed.append(proc.pid)
+    return killed
+
+
+def _with_watchdog(fn: Callable[[], Any], *, what: str, timeout_s: float | None,
+                   pids: Callable[[], set[int]]) -> Any:
+    """``fn()``, killing the engine's processes if it runs past ``timeout_s`` (K-2).
+
+    Engine builds and decodes are blocking calls in this process, and a collective
+    deadlock inside them never returns: the first Kimi run on MI355X sat for 20
+    minutes until it was killed by hand, and lost the run. The watchdog kills the
+    engine's processes at the deadline; vLLM then raises in the blocked call
+    (its client notices the engine died), and that surfaces here as
+    :class:`~gitm.optimizer.apply.EngineTimeout`, which the apply path treats as
+    a failed candidate, or as a lost engine for a baseline.
+    """
+    from gitm.optimizer.apply import EngineTimeout
+
+    if timeout_s is None:
+        return fn()
+    import threading
+
+    done = threading.Event()
+    fired: list[int] = []
+
+    def _watch() -> None:
+        if not done.wait(timeout_s):
+            fired.extend(_kill_engine_processes(pids()) or [-1])
+
+    watcher = threading.Thread(target=_watch, name=f"gitm-watchdog:{what}", daemon=True)
+    watcher.start()
+    try:
+        result = fn()
+    except Exception as exc:
+        if fired:
+            raise EngineTimeout(f"{what} ran past {timeout_s:g}s; its engine was killed") from exc
+        raise
+    finally:
+        done.set()
+    if fired:
+        raise EngineTimeout(f"{what} ran past {timeout_s:g}s; its engine was killed")
+    return result
+
+
 def engine_worker_pids() -> set[int]:
     """PIDs of vLLM engine-core processes that are children of this one.
 
@@ -667,6 +751,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                               -> vLLM's "auto". Lets a serial A/B build each leg
                               directly in its dtype, one engine per process, so
                               each can use the full GITM_VLLM_GPU_MEM budget.
+        GITM_BUILD_TIMEOUT_S  seconds an engine build may take before the watchdog
+                              kills it and the candidate fails (default 3600; 0 off)
+        GITM_DECODE_TIMEOUT_S seconds a decode may take before the watchdog kills
+                              the engine (default 1800; 0 off)
         GITM_VLLM_SYNTHETIC   "1" -> CPU-only decode stand-in instead of vLLM
                               (exercises the wire/registry path with no GPU or
                               vLLM; produces no GPU kernels)
@@ -896,7 +984,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         # a candidate's teardown from taking the baseline's workers with it.
         before = engine_worker_pids()
         with contextlib.nullcontext() if traced else injection.untraced_env():
-            engine = LLM(model=model, **kwargs)
+            engine = _with_watchdog(
+                lambda: LLM(model=model, **kwargs), what="engine build",
+                timeout_s=_timeout_s("GITM_BUILD_TIMEOUT_S", 3600.0),
+                pids=lambda: engine_worker_pids() - before)
         engine.gitm_worker_pids = engine_worker_pids() - before
         engine.gitm_llm_kwargs = dict(kwargs)
         engine.gitm_traced = traced and tracing
@@ -915,7 +1006,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         active = engine_ref.get("engine")
         if active is None:
             raise RuntimeError("vLLM engine is not active")
-        outputs = active.generate(prompts, params)
+        outputs = _with_watchdog(
+            lambda: active.generate(prompts, params), what="decode",
+            timeout_s=_timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0),
+            pids=lambda: set(getattr(active, "gitm_worker_pids", ()) or ()))
         produced = sum(len(o.outputs[0].token_ids) for o in outputs)
         sync_device()
         # Per-request lifecycle alongside the token count: the loop turns these
@@ -938,7 +1032,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         original runner, which cannot measure a restarted engine.)
         """
         t0 = time.perf_counter()
-        outs = eng.generate(prompts, params)
+        outs = _with_watchdog(
+            lambda: eng.generate(prompts, params), what="A/B decode",
+            timeout_s=_timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0),
+            pids=lambda: set(getattr(eng, "gitm_worker_pids", ()) or ()))
         toks = sum(len(o.outputs[0].token_ids) for o in outs)
         sync_device()
         return toks / max(time.perf_counter() - t0, 1e-9)
