@@ -1039,3 +1039,19 @@ def test_stochastic_candidates_route_through_gate_and_rollback() -> None:
     )
     assert results and all(r.applicable and not r.rolled_back for r in results)
     assert all(s.safety.tier == "moderate" for s in (r.spec for r in results))
+
+
+def test_settings_that_cannot_move_decode_are_not_searched():
+    """P2-2 / L-21. Each was proposed on real runs, cost an engine rebuild, and
+    either failed to build or came back as a noise-level 'win'."""
+    from gitm.agents.autoresearch import _is_tunable
+
+    for knob in ("offload_backend", "offload_num_in_group", "offload_prefetch_step",
+                 "mm_processor_cache_gb", "mm_shm_cache_max_object_size_mb",
+                 "safetensors_prefetch_block_size", "kv_cache_metrics",
+                 "kv_cache_metrics_sample"):
+        assert not _is_tunable(knob), knob
+    # Real decode knobs are untouched.
+    for knob in ("max_num_seqs", "max_num_batched_tokens", "block_size",
+                 "kv_cache_dtype", "gpu_memory_utilization", "enable_chunked_prefill"):
+        assert _is_tunable(knob), knob

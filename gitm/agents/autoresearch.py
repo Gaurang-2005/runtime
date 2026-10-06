@@ -552,10 +552,31 @@ _NON_TUNABLE_HINTS = (
     "kv_sharing",
 )
 
+#: Field-name prefixes for settings that cannot move decode throughput in the
+#: workload this searches. Matched as prefixes, not substrings:
+#: ``cpu_offload_gb`` is a real standalone knob and must survive ``offload_``.
+_NOT_DECODE_PREFIXES = (
+    # Proposed anyway because the knob surface is every EngineArgs field. Each
+    # costs an engine rebuild, and on real runs they made up most of the "wins"
+    # that were noise (P2-2):
+    #   offload_*        only work as a joint configuration; proposed alone they
+    #                    fail to build ("offload_num_in_group (1) must be <=
+    #                    offload_group_size (0)", L-21) or do nothing.
+    #   mm_*             multimodal processor caches; the decode workload is text.
+    #   safetensors_*    how weights load, not how the model runs.
+    #   kv_cache_metrics observability sampling, not performance.
+    "offload_",
+    "mm_",
+    "safetensors_",
+    "kv_cache_metrics",
+)
+
 
 def _is_tunable(field_name: str) -> bool:
     """False for EngineArgs fields that aren't runtime performance knobs."""
     lname = field_name.lower()
+    if lname.startswith(_NOT_DECODE_PREFIXES):
+        return False
     return not any(h in lname for h in _NON_TUNABLE_HINTS)
 
 
