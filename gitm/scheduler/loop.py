@@ -1418,7 +1418,14 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             if result.measured_delta is not None
             else None
         )
-        if result.rolled_back:
+        # A candidate that failed before anything was measured (it did not build,
+        # or its apply raised) never ran. It is a rejection with its reason, not
+        # a claim with a measured delta of "—" and not a rollback (L-9). The
+        # report's own rule is "incomplete chain = no claim".
+        did_not_run = result.measured_delta is None and result.error is not None
+        if did_not_run:
+            rejected.append(f"{c.spec.name} (did not run: {result.error})")
+        elif result.rolled_back:
             rolled_back.append(c.spec.name)
         if ab is not None:
             candidate_cfg = {**baseline_cfg, **(c.spec.knobs or {c.spec.knob: c.spec.value})}
@@ -1447,23 +1454,24 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         if motivating is not None:
             channel, cause = motivating
             causal_evidence += f"; {channel}[{cause.signal}]: {cause.note}"
-        claims.append(
-            Claim(
-                summary=c.spec.summary,
-                residual_invariant="kernel_time",
-                residual_value=kt_residual,
-                causal_evidence=causal_evidence,
-                intervention_name=c.spec.name,
-                predicted_delta=c.predicted_delta,
-                # Display the TRUE measured delta (speedup-1); the gate uses the noise-adjusted
-                # return, so a within-noise gain reads as rolled back
-                # with its real (small) number, not a distorted one.
-                measured_delta=((ab.speedup - 1.0) if ab is not None else result.measured_delta),
-                rolled_back=result.rolled_back,
-                restore_failed=result.restore_failed,
-                unreliable_ab=unreliable_ab(measured_under) if ab is not None else [],
+        if not did_not_run:
+            claims.append(
+                Claim(
+                    summary=c.spec.summary,
+                    residual_invariant="kernel_time",
+                    residual_value=kt_residual,
+                    causal_evidence=causal_evidence,
+                    intervention_name=c.spec.name,
+                    predicted_delta=c.predicted_delta,
+                    # Display the TRUE measured delta (speedup-1); the gate uses the noise-adjusted
+                    # return, so a within-noise gain reads as rolled back
+                    # with its real (small) number, not a distorted one.
+                    measured_delta=((ab.speedup - 1.0) if ab is not None else result.measured_delta),
+                    rolled_back=result.rolled_back,
+                    restore_failed=result.restore_failed,
+                    unreliable_ab=unreliable_ab(measured_under) if ab is not None else [],
+                )
             )
-        )
         if result.restore_failed:
             engine_lost = result.error or f"restore failed after {c.spec.name}"
             n_untried = sum(1 for x in queue if x.rejected_reason is None)
@@ -1623,6 +1631,11 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         if not r.applicable:
             rejected.append(f"{r.spec.name} ({r.rejected_reason})")
             continue
+        if r.measured_delta is None and r.apply_error:
+            # Never ran (did not build, or its apply raised): a rejection, not a
+            # claim with no measurement (L-9).
+            rejected.append(f"{r.spec.name} (did not run: {r.apply_error})")
+            continue
         if r.rolled_back:
             rolled_back.append(r.spec.name)
         ar_ab = r.ab_result
@@ -1739,6 +1752,14 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         "commit": qual.commit,
         "floor": qual.floor,
         "n_claims": len(claims),
+        # What a reader needs before trusting "status: ok" (P2-5): how many A/Bs
+        # produced a measurement at all, and how many of those were kept. "ok"
+        # still means the run completed; a live run that measured nothing makes
+        # `gitm run` exit non-zero.
+        "live": cfg.engine is not None,
+        "n_measured": sum(1 for c in claims if c.measured_delta is not None),
+        "n_kept": sum(1 for c in claims if c.measured_delta is not None
+                      and not c.rolled_back and not c.restore_failed),
         "n_rolled_back": len(rolled_back),
         "n_rejected": len(rejected),
         "bottleneck_class": ar_run.bottleneck_class,

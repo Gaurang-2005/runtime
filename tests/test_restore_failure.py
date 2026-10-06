@@ -345,7 +345,8 @@ def test_phase4_still_records_what_the_gate_rejected(tmp_path, monkeypatch):
     out = loop.run_loop(loop.LoopConfig(budget="30s", scratch=str(tmp_path),
                                         workload_runner=_Runner()))
     assert out["summary"]["n_untried"] == 1   # c
-    assert out["summary"]["n_rejected"] == 2  # b, d
+    # b and d (the gate), and a, which never ran: its apply and restore both failed.
+    assert out["summary"]["n_rejected"] == 3
 
 
 def test_autoresearch_stops_at_the_budget(monkeypatch):
@@ -379,3 +380,42 @@ def test_autoresearch_stops_at_the_budget(monkeypatch):
     assert applied == ["knob_0", "knob_1", "knob_2"]   # the third starts at t=20 < 25
     assert run.stopped_by == "budget" and run.n_untried == 2
     assert [r.spec.name for r in seen] == applied       # each result reported as it landed
+
+
+def test_a_candidate_that_never_ran_is_rejected_not_claimed(tmp_path, monkeypatch):
+    """L-9. A build that failed got a Claims row with a measured delta of '—'."""
+    from gitm.agents.policy import RankedCandidate
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=_spec("a", 1), predicted_delta=0.05)])
+    monkeypatch.setattr(loop, "apply_intervention", lambda *a, **kw: ApplyResult(
+        False, rolled_back=True, measured_delta=None,
+        error="apply failed, restored: candidate failed to build"))
+
+    out = loop.run_loop(loop.LoopConfig(budget="30s", scratch=str(tmp_path),
+                                        workload_runner=_Runner()))
+    report = (Path(out["run_dir"]) / "report.md").read_text()
+    s = out["summary"]
+    assert s["n_measured"] == 0 and s["n_rolled_back"] == 0
+    assert "did not run: apply failed" in report
+    assert "| `a` |" not in report          # no Claims-table row for it
+
+
+def test_the_headline_does_not_sum_independent_ab_deltas():
+    """L-10. '13 verified claims, aggregate +324.6%' added up deltas from
+    separate A/Bs that never ran together."""
+    from gitm.optimizer.report import Claim, _default_summary
+
+    def claim(name, d):
+        return Claim(summary="s", residual_invariant="kernel_time", residual_value=0.0,
+                     causal_evidence="e", intervention_name=name,
+                     predicted_delta=0.05, measured_delta=d)
+
+    text = _default_summary([claim("a", 0.03), claim("b", 0.10), claim("c", 0.02)])
+    assert "+10.0% (b)" in text and "aggregate" not in text and "+15.0%" not in text
