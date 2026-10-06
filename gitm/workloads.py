@@ -659,13 +659,19 @@ def _with_watchdog(fn: Callable[[], Any], *, what: str, timeout_s: float | None,
     main = threading.current_thread() is threading.main_thread()
     previous = signal.signal(signal.SIGUSR1, _interrupt) if main else None
     main_id = threading.get_ident()
+    # Held while the signal is sent and while the call is marked finished, so the
+    # signal can never arrive after the handler is put back: under the default
+    # handler SIGUSR1 terminates the process, and the run with it.
+    handler_lock = threading.Lock()
 
     def _watch() -> None:
         if done.wait(timeout_s):
             return
         fired.extend(_kill_engine_processes(pids()) or [-1])
         if main and not done.wait(_WATCHDOG_GRACE_S):
-            signal.pthread_kill(main_id, signal.SIGUSR1)
+            with handler_lock:
+                if not done.is_set():
+                    signal.pthread_kill(main_id, signal.SIGUSR1)
 
     watcher = threading.Thread(target=_watch, name=f"gitm-watchdog:{what}", daemon=True)
     watcher.start()
@@ -678,7 +684,8 @@ def _with_watchdog(fn: Callable[[], Any], *, what: str, timeout_s: float | None,
             raise EngineTimeout(why) from exc
         raise
     finally:
-        done.set()
+        with handler_lock:
+            done.set()
         if main:
             signal.signal(signal.SIGUSR1, signal.SIG_DFL if previous is None else previous)
     if fired:

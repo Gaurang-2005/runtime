@@ -520,11 +520,16 @@ def test_nested_knobs_reach_llm_as_the_argument_vllm_takes():
     flag, value = server_arg("num_speculative_tokens", 5)
     assert flag == "--speculative-config"
     assert knob_from_server_arg("speculative_config", value) == ("num_speculative_tokens", 5)
-    # The lever is the token count, whatever method carries it: an arm built on
-    # an eagle baseline is eagle with the lever's count, and reads back as it.
+    # Read back as the lever only when the token count is all that changed from
+    # the baseline. Against no baseline, that is the n-gram config gitm emits.
     other = '{"method": "eagle", "model": "x", "num_speculative_tokens": 5}'
-    assert knob_from_server_arg("speculative_config", other) == ("num_speculative_tokens", 5)
-    assert knob_from_server_arg("speculative_config", '{"method": "eagle"}')[0] == \
+    assert knob_from_server_arg("speculative_config", other)[0] == "speculative_config"
+    eagle_base = '{"method": "eagle", "model": "x", "num_speculative_tokens": 2}'
+    assert knob_from_server_arg("speculative_config", other, eagle_base) == \
+        ("num_speculative_tokens", 5)
+    # A changed method is not the token-count lever, even at the lever's count.
+    ngram_base = '{"method": "ngram", "num_speculative_tokens": 5}'
+    assert knob_from_server_arg("speculative_config", other, ngram_base)[0] == \
         "speculative_config"
     assert knob_from_server_arg("speculative_config", "not json")[0] == "speculative_config"
 

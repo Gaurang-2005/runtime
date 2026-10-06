@@ -242,7 +242,8 @@ def plan_arms(
                 continue
             argv = _without(base, flag, booleans)
         elif current is not None and realises(
-                knob_from_server_arg(flag.lstrip("-").replace("-", "_"), current[1])[1],
+                knob_from_server_arg(flag.lstrip("-").replace("-", "_"), current[1],
+                                     current[1])[1],
                 spec.value):
             out.append(Unreachable(
                 name, knob,

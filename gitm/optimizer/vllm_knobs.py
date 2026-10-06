@@ -395,14 +395,26 @@ def server_arg(knob: str, value: Any, current: Any = None) -> tuple[str, Any]:
     return "--" + nested[0].replace("_", "-"), json.dumps(merged, separators=(",", ":"))
 
 
-def knob_from_server_arg(name: str, value: Any) -> tuple[str, Any]:
+def knob_from_server_arg(name: str, value: Any, baseline: Any = None) -> tuple[str, Any]:
     """The catalogue ``(knob, value)`` a server argument sets; the inverse of
-    :func:`server_arg`. ``name`` is the flag without dashes, in snake case.
-    Anything that is not a nested argument it can read comes back unchanged."""
+    :func:`server_arg`. ``name`` is the flag without dashes, in snake case, and
+    ``baseline`` is what the baseline passed for the same flag.
+
+    A nested argument is read as the knob only when it is exactly what
+    :func:`server_arg` builds from ``baseline``: the baseline's config with the
+    knob's field changed. A config that also changed the method or anything else
+    is not this lever, and crediting the lever with it would file a method change
+    as evidence about a token count. Anything else comes back unchanged."""
     for knob, (arg, field, _cast, _defaults) in _NESTED_KNOBS.items():
         if name != arg:
             continue
         got = _as_dict(value)
-        if got.get(field) is not None:
+        if got.get(field) is None:
+            continue
+        try:
+            built = _nested_value(knob, got[field], baseline)
+        except (TypeError, ValueError):
+            continue
+        if got == built:
             return knob, got[field]
     return name, value
