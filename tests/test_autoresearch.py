@@ -407,7 +407,7 @@ def test_engineargs_proposer_scopes_specs_to_target_op() -> None:
     assert all(s.applies_to_kernels == ["paged_attention"] for s in specs)
 
 
-def test_engineargs_offline_fallback_runs_without_vllm() -> None:
+def test_engineargs_offline_fallback_runs_without_vllm(without_vllm) -> None:
     """vLLM isn't importable in CI; the frozen fallback catalog still yields
     candidates for compute_bound, and every candidate stays outside the
     curated library. memory_bound's fallback knobs (cpu_offload_gb,
@@ -615,7 +615,7 @@ def test_engineargs_proposer_is_a_vllm_bound_generative_proposer() -> None:
     assert specs and all(s.applicability.workloads == ["vllm-decode"] for s in specs)
 
 
-def test_vllm_knob_source_yields_offline_fallback_without_vllm() -> None:
+def test_vllm_knob_source_yields_offline_fallback_without_vllm(without_vllm) -> None:
     # vLLM isn't importable in CI → the source yields the frozen fallback catalog.
     knobs = VLLMKnobSource().knobs()
     assert knobs and all(isinstance(k, Knob) for k in knobs)
@@ -758,7 +758,7 @@ def test_visible_gpu_count_is_a_positive_int() -> None:
     assert isinstance(n, int) and n >= 1
 
 
-def test_vllm_knob_source_gpu_count_override_is_accepted_offline() -> None:
+def test_vllm_knob_source_gpu_count_override_is_accepted_offline(without_vllm) -> None:
     # vLLM isn't importable in CI, so the offline fallback catalog is returned
     # regardless of gpu_count — this just proves the parameter doesn't crash
     # the offline path (the fallback catalog has no multi-GPU knobs to filter).

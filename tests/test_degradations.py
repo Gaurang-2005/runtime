@@ -559,7 +559,7 @@ def test_unscoped_search_is_recorded_but_target_is_kept():
 # ── end to end ───────────────────────────────────────────────────────────────
 
 
-def test_every_run_writes_degradations_and_summarises_them(tmp_path: Path):
+def test_every_run_writes_degradations_and_summarises_them(tmp_path: Path, without_vllm):
     from gitm import optimize
 
     with _quiet():
