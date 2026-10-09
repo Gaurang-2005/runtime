@@ -149,7 +149,8 @@ def targets_from_recoverable(
     * ``also_named_by`` — levers that name the op but work some other way, e.g.
       through cache capacity. Touching the op is not a claim on its time.
 
-    ``uncovered`` lists ops with recoverable time that no lever names at all: time
+    ``uncovered`` lists every op with recoverable time that no lever names, past
+    the ``top`` cutoff as well: time
     the catalogue has nothing aimed at. Whole-step levers still apply to them,
     which is why it says "aimed at" and not "can affect".
 
@@ -157,8 +158,9 @@ def targets_from_recoverable(
     its floor, and nothing says by how much.
     """
     library = list(library)
-    rows = sorted(((op, gap) for op, gap in recoverable.items() if gap),
-                  key=lambda kv: (-kv[1], kv[0]))[:top]
+    losing = sorted(((op, gap) for op, gap in recoverable.items() if gap),
+                    key=lambda kv: (-kv[1], kv[0]))
+    rows = losing[:top]
     out = []
     for op, gap in rows:
         naming = levers_naming(op, library)
@@ -173,7 +175,9 @@ def targets_from_recoverable(
         "basis": "per-kernel residuals against this model's graph",
         "device_s": device_s,
         "regions": out,
-        "uncovered": [r["op"] for r in out if not r["levers"] and not r["also_named_by"]],
+        # Over every op losing time, not only the ``top`` listed above: an op past
+        # the cutoff with nothing aimed at it is still a gap in the catalogue.
+        "uncovered": [op for op, _ in losing if not levers_naming(op, library)],
         "unjudgeable": sorted(op for op, gap in recoverable.items() if gap is None),
         "whole_step_levers": sorted(s.name for s in library if s.whole_step),
     }

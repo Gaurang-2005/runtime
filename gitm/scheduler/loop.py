@@ -754,9 +754,31 @@ def _motivation(sched_causes: Any, coll_causes: Any) -> dict[str, str]:
     return out
 
 
+def _floors_hold(priced: Any, observed: Any, tolerance: float = 0.10) -> str | None:
+    """Why the opening graph's floors no longer describe a re-trace, or ``None``.
+
+    The floors were priced at the batch the opening capture's scheduler saw.
+    A kept lever can move that batch, and not only a whole-step one: more KV
+    cache memory admits more sequences. A re-trace's gaps measured against
+    floors priced for another batch are not evidence about the running
+    workload, so gating or ordering on them could reject a lever on a floor that
+    was never its own. The batch both sides were sampled at is the thing that
+    knows, so this asks it rather than guessing from which lever was kept. Both
+    come from :func:`_batch_config_from_stats`, the same derivation.
+    """
+    if priced is None:
+        return "the floors were priced at the default batch, not an observed one"
+    if observed is None:
+        return "the re-trace's scheduler gave no batch to check the floors against"
+    p, o = priced.batch, observed.batch
+    if abs(o - p) > tolerance * p:
+        return f"the batch moved from {p} to {o}, and the floors were priced at {p}"
+    return None
+
+
 def _recapture(
     path, *, workload: str, run_id: str, runner, engine: Any = None
-) -> tuple[Any, str | None, dict[str, str]]:
+) -> tuple[Any, str | None, dict[str, str], Any]:
     """Trace the workload again, as it stands after what has been applied.
 
     The deviation profile moves as candidates land: a region the last one fixed
@@ -774,8 +796,10 @@ def _recapture(
     causes the workload shows now rather than the ones it showed at the start:
     a kept lever can relieve the pressure that motivated the next one.
 
-    Returns ``(trace, None, motivated)``, or ``(None, reason, {})`` when it could
-    not be taken.
+    The batch it ran at comes from the same window, for :func:`_floors_hold`.
+
+    Returns ``(trace, None, motivated, batch)``, or ``(None, reason, {}, None)``
+    when it could not be taken.
     A run that has already paid for its trace and its A/Bs must not be lost to a
     failed re-measurement, so the caller keeps the order it had — but the reason
     is carried out rather than swallowed. The workload failing during the extra
@@ -791,13 +815,14 @@ def _recapture(
                 try:
                     runner()
                 except Exception as exc:
-                    return None, f"workload run failed: {exc}", {}
+                    return None, f"workload run failed: {exc}", {}, None
                 sync_device()
-        motivated = _motivation(scheduler_causes(stats.summary()),
+        summary = stats.summary()
+        motivated = _motivation(scheduler_causes(summary),
                                 collective_causes(worst_device_comm(trace)))
-        return trace, None, motivated
+        return trace, None, motivated, _batch_config_from_stats(summary)[0]
     except Exception as exc:
-        return None, f"capture failed: {exc}", {}
+        return None, f"capture failed: {exc}", {}, None
 
 
 def run_loop(cfg: LoopConfig) -> dict[str, Any]:
@@ -1537,10 +1562,6 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # to writing up what it has.
     engine_lost: str | None = early_engine_lost
     n_untried = 0
-    # The first whole-step lever kept, if any. It can change the batch shape the
-    # floors were priced at, and from then on a re-trace's gaps measured against
-    # them are not evidence about the running workload.
-    whole_step_kept: str | None = None
 
     def _stop_at_budget() -> int:
         """The queue left behind when the budget stops Phase 4, accounted for.
@@ -1593,9 +1614,6 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             rejected.append(f"{c.spec.name} (did not run: {result.error})")
         elif result.rolled_back:
             rolled_back.append(c.spec.name)
-        elif (c.spec.whole_step and result.measured_delta is not None
-              and not result.restore_failed and whole_step_kept is None):
-            whole_step_kept = c.spec.name
         if ab is not None:
             # As the restart built it: a nested knob sits inside its argument.
             candidate_cfg = {**baseline_cfg, **engine_kwargs(c.spec.knob_values, baseline_cfg)}
@@ -1678,10 +1696,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 traced_engine, swap_err = _swap_engine(eng_now, traced_fn)
                 tracing_swaps.append({"when": f"re-trace {step}", "to": "traced",
                                       "error": swap_err})
-                fresh, why, motivated_now = None, swap_err, {}
+                fresh, why, motivated_now, batch_now = None, swap_err, {}, None
                 if traced_engine is not None:
                     applicator.engine = traced_engine
-                    fresh, why, motivated_now = _recapture(
+                    fresh, why, motivated_now, batch_now = _recapture(
                         rerank_path, workload=workload, run_id=run_id, runner=runner,
                         engine=traced_engine)
                     back, swap_err = _swap_engine(
@@ -1701,7 +1719,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                         severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
                     break
             else:
-                fresh, why, motivated_now = _recapture(
+                fresh, why, motivated_now, batch_now = _recapture(
                     rerank_path, workload=workload, run_id=run_id, runner=runner,
                     engine=eng_now)
             was = [x.spec.name for x in queue]
@@ -1709,20 +1727,17 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             not_targeted: str | None = None
             if fresh is not None and fresh.kernels():
                 # Gated and ordered on the fresh trace's gaps, measured against
-                # ``graph`` — which was priced for the engine as it opened. That
-                # holds until a whole-step lever is kept: it can change the batch
-                # shape the floors assume, so an op could read as at (or over) a
-                # floor that no longer describes the running workload, and
-                # re-pricing needs the engine re-sampled, which this path does not
-                # do. From then on the re-rank neither gates nor orders on time
-                # above floor; it says so. An op-scoped lever kept before then
-                # changes its kernels, not the floors, so the gaps stay sound.
-                # Coverage and causes are recomputed per trace either way.
+                # ``graph`` — which was priced at the batch the run opened at.
+                # Only while the re-trace still runs at that batch: a kept lever
+                # can move it, and then an op could read as at (or over) a floor
+                # that no longer describes the running workload. Re-pricing needs
+                # a new graph, which this path does not build, so it neither gates
+                # nor orders on time above floor then, and says why. Coverage and
+                # causes are recomputed per trace either way.
                 if not _floors_priced_for_this_run:
                     not_targeted = "the floors were not priced for this run"
-                elif whole_step_kept is not None:
-                    not_targeted = (f"{whole_step_kept} was kept, which can change the "
-                                    "batch shape the floors were priced at")
+                elif (moved := _floors_hold(_batch, batch_now)) is not None:
+                    not_targeted = moved
                 else:
                     try:
                         fresh_recoverable = recoverable_by_op(residuals(fresh, graph))
@@ -1745,6 +1760,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 "changed": was != now,
                 "causes": sorted(set(_motivated.values())),
                 "targeted": fresh_recoverable is not None,
+                "batch_priced": getattr(_batch, "batch", None),
+                "batch_observed": getattr(batch_now, "batch", None),
                 "not_targeted_because": not_targeted,
             })
             # The re-capture runs the workload, so it spends budget. Checked

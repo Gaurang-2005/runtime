@@ -135,3 +135,26 @@ def test_a_run_whose_floors_were_not_priced_says_so(tmp_path, monkeypatch):
     for step in (s for s in steps if s["recaptured"]):
         assert step["targeted"] is False
         assert "not priced" in step["not_targeted_because"]
+
+
+def test_a_retrace_is_targeted_only_while_it_runs_at_the_priced_batch():
+    """The floors were priced at the opening batch. Any kept lever can move it,
+    not only a whole-step one: more KV cache admits more sequences. So the
+    re-rank asks the batch the re-trace actually ran at."""
+    from gitm.planner.roofline import BatchConfig
+    from gitm.scheduler.loop import _floors_hold
+
+    priced = BatchConfig(batch=251)
+    assert _floors_hold(priced, BatchConfig(batch=245)) is None          # within 10%
+    moved = _floors_hold(priced, BatchConfig(batch=512))
+    assert moved is not None and "251 to 512" in moved
+    assert "default batch" in _floors_hold(None, BatchConfig(batch=251))
+    assert "no batch" in _floors_hold(priced, None)
+
+
+def test_uncovered_lists_every_op_losing_time_not_only_the_top_ones():
+    lib = [_spec("fix_gemm", ["gemm"], kernel_time=True)]
+    doc = targets_from_recoverable({"gemm": 9e-3, "rmsnorm": 1e-3, "rope": 5e-4},
+                                   lib, device_s=0.1, top=1)
+    assert [r["op"] for r in doc["regions"]] == ["gemm"]
+    assert doc["uncovered"] == ["rmsnorm", "rope"]      # past the cutoff, still listed
