@@ -158,3 +158,19 @@ def test_uncovered_lists_every_op_losing_time_not_only_the_top_ones():
                                    lib, device_s=0.1, top=1)
     assert [r["op"] for r in doc["regions"]] == ["gemm"]
     assert doc["uncovered"] == ["rmsnorm", "rope"]      # past the cutoff, still listed
+
+
+def test_a_retrace_is_not_targeted_once_the_engine_is_not_the_priced_one():
+    """Pricing reads the model, the GPU and the batch, never engine settings,
+    so a kept TP or KV-dtype change leaves the floors describing another engine
+    even at the same batch. The engine's own settings are compared."""
+    from gitm.planner.roofline import BatchConfig
+    from gitm.scheduler.loop import _floors_hold
+
+    b = BatchConfig(batch=251)
+    opening = {"tensor_parallel_size": 8, "enforce_eager": True}
+    assert _floors_hold(b, b, opening, dict(opening)) is None
+    moved = _floors_hold(b, b, opening, {**opening, "tensor_parallel_size": 4})
+    assert moved is not None and "tensor_parallel_size" in moved
+    added = _floors_hold(b, b, opening, {**opening, "kv_cache_dtype": "fp8"})
+    assert added is not None and "kv_cache_dtype" in added

@@ -754,18 +754,32 @@ def _motivation(sched_causes: Any, coll_causes: Any) -> dict[str, str]:
     return out
 
 
-def _floors_hold(priced: Any, observed: Any, tolerance: float = 0.10) -> str | None:
+def _floors_hold(priced: Any, observed: Any, opening_config: Any = None,
+                 running_config: Any = None, tolerance: float = 0.10) -> str | None:
     """Why the opening graph's floors no longer describe a re-trace, or ``None``.
 
-    The floors were priced at the batch the opening capture's scheduler saw.
-    A kept lever can move that batch, and not only a whole-step one: more KV
-    cache memory admits more sequences. A re-trace's gaps measured against
-    floors priced for another batch are not evidence about the running
-    workload, so gating or ordering on them could reject a lever on a floor that
-    was never its own. The batch both sides were sampled at is the thing that
-    knows, so this asks it rather than guessing from which lever was kept. Both
-    come from :func:`_batch_config_from_stats`, the same derivation.
+    The floors were priced for the opening engine at the batch its scheduler
+    saw. Two things can make them stop describing a re-trace, and each is
+    asked of what knows it rather than guessed from which lever was kept:
+
+    * **The engine.** The graph is priced from the model config, the GPU and
+      the batch only — never from engine settings such as tensor parallelism,
+      KV-cache dtype or quantization. Once a kept lever changes any of those,
+      the running engine is not the one the floors stand for, and re-pricing
+      would not help because pricing does not read them. The engine's own
+      ``gitm_llm_kwargs`` are compared, opening against running.
+    * **The batch.** Load moves it even with the settings unchanged. Both sides
+      come from :func:`_batch_config_from_stats`, the same derivation.
+
+    Gating or ordering on gaps measured against floors for another engine or
+    batch could reject a lever on a floor that was never its own.
     """
+    if opening_config is not None and running_config is not None:
+        changed = sorted(k for k in set(opening_config) | set(running_config)
+                         if opening_config.get(k) != running_config.get(k))
+        if changed:
+            return (f"the engine changed since the floors were priced "
+                    f"({', '.join(changed)})")
     if priced is None:
         return "the floors were priced at the default batch, not an observed one"
     if observed is None:
@@ -1200,6 +1214,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # rather than defaulting.
     _batch, _batch_source = _batch_config_from_stats(sched_summary)
     graph, family, graph_default_why = _execution_graph_basis(cfg.engine, _hw, _batch)
+    # The engine the floors are priced for, as it describes itself. A re-rank
+    # compares the running engine with this (see _floors_hold).
+    _priced_config = dict(getattr(cfg.engine, "gitm_llm_kwargs", None) or {})
     _record_graph_basis(degradations, pctx=pctx, batch=_batch, batch_source=_batch_source,
                         sched=sched_summary, graph_default_why=graph_default_why)
     is_moe = family != "dense"
@@ -1736,7 +1753,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 # causes are recomputed per trace either way.
                 if not _floors_priced_for_this_run:
                     not_targeted = "the floors were not priced for this run"
-                elif (moved := _floors_hold(_batch, batch_now)) is not None:
+                elif (moved := _floors_hold(
+                        _batch, batch_now, _priced_config,
+                        dict(getattr(getattr(applicator, "engine", None),
+                                     "gitm_llm_kwargs", None) or {}))) is not None:
                     not_targeted = moved
                 else:
                     try:
