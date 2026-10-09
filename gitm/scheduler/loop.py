@@ -29,6 +29,7 @@ from gitm.agents.autoresearch import (
     classify_bottleneck,
 )
 from gitm.agents.policy import Policy, select_interventions
+from gitm.agents.targeting import targets_from_recoverable
 from gitm.kernels.library import load_library, parse_skips, skipped_by
 from gitm.optimizer.apply import (
     Applicator,
@@ -1360,6 +1361,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                     "predicted_delta": c.predicted_delta,
                     "rejected_reason": c.rejected_reason,
                     "motivated_by": c.motivated_by,
+                    "targets": [{"op": op, "recoverable_s": gap} for op, gap in c.targets],
                 }
                 for c in ranked
             ],
@@ -1385,6 +1387,18 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             indent=2,
         )
     )
+    # Where the time is, and what the catalogue aims at it — from the same map the
+    # ranking gated and ordered on. The ops nothing names are the finding a run
+    # cannot otherwise report: time with no lever aimed at it.
+    _device_s = sum(max(0, k.end_ns - k.start_ns) for k in trace.kernels()) / 1e9
+    (run_dir / "targets.json").write_text(json.dumps(
+        targets_from_recoverable(_recoverable, library, device_s=_device_s)
+        if _recoverable is not None else
+        {"basis": None,
+         "not_targeted_because": "the floors were not priced for this run, so "
+                                 "candidates keep the catalogue's order",
+         "regions": [], "uncovered": []},
+        indent=2))
 
     # Phase 4 — apply with rollback gates.
     # With a live engine attached, each candidate runs the rollback-gated decode-
@@ -1523,6 +1537,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # to writing up what it has.
     engine_lost: str | None = early_engine_lost
     n_untried = 0
+    # The first whole-step lever kept, if any. It can change the batch shape the
+    # floors were priced at, and from then on a re-trace's gaps measured against
+    # them are not evidence about the running workload.
+    whole_step_kept: str | None = None
 
     def _stop_at_budget() -> int:
         """The queue left behind when the budget stops Phase 4, accounted for.
@@ -1575,6 +1593,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             rejected.append(f"{c.spec.name} (did not run: {result.error})")
         elif result.rolled_back:
             rolled_back.append(c.spec.name)
+        elif (c.spec.whole_step and result.measured_delta is not None
+              and not result.restore_failed and whole_step_kept is None):
+            whole_step_kept = c.spec.name
         if ab is not None:
             # As the restart built it: a nested knob sits inside its argument.
             candidate_cfg = {**baseline_cfg, **engine_kwargs(c.spec.knob_values, baseline_cfg)}
@@ -1684,25 +1705,35 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                     rerank_path, workload=workload, run_id=run_id, runner=runner,
                     engine=eng_now)
             was = [x.spec.name for x in queue]
+            fresh_recoverable: dict[str, float | None] | None = None
+            not_targeted: str | None = None
             if fresh is not None and fresh.kernels():
-                # Deliberately not gated on recoverable time. The fresh trace
-                # would have to be compared against ``graph``, which was priced
-                # for the engine as it opened — and by this point a kept
-                # whole-step candidate may have changed the batch shape the
-                # floors assume, so an op could read as at a floor that no
-                # longer describes the running workload. Re-pricing the graph
-                # needs the engine re-sampled, which this path does not do.
-                #
-                # Little is lost: the queue was already filtered at selection,
-                # so re-gating could only add rejections, and those are exactly
-                # the ones resting on the stale floors. Coverage is still
-                # recomputed per trace, which is what re-ranking is for, and so
-                # are the causes: the re-trace sampled the scheduler too.
+                # Gated and ordered on the fresh trace's gaps, measured against
+                # ``graph`` — which was priced for the engine as it opened. That
+                # holds until a whole-step lever is kept: it can change the batch
+                # shape the floors assume, so an op could read as at (or over) a
+                # floor that no longer describes the running workload, and
+                # re-pricing needs the engine re-sampled, which this path does not
+                # do. From then on the re-rank neither gates nor orders on time
+                # above floor; it says so. An op-scoped lever kept before then
+                # changes its kernels, not the floors, so the gaps stay sound.
+                # Coverage and causes are recomputed per trace either way.
+                if not _floors_priced_for_this_run:
+                    not_targeted = "the floors were not priced for this run"
+                elif whole_step_kept is not None:
+                    not_targeted = (f"{whole_step_kept} was kept, which can change the "
+                                    "batch shape the floors were priced at")
+                else:
+                    try:
+                        fresh_recoverable = recoverable_by_op(residuals(fresh, graph))
+                    except Exception as exc:
+                        not_targeted = f"residuals on the re-trace failed: {exc}"
                 _motivated = motivated_now
                 queue = select_interventions(
                     fresh, [x.spec for x in queue], policy, top_n=len(queue),
                     ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
-                    fingerprint=qual.fingerprint, motivated=_motivated)
+                    fingerprint=qual.fingerprint, recoverable=fresh_recoverable,
+                    motivated=_motivated)
             now = [x.spec.name for x in queue]
             reranks.append({
                 "after": c.spec.name,
@@ -1713,6 +1744,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 "order_after": now,
                 "changed": was != now,
                 "causes": sorted(set(_motivated.values())),
+                "targeted": fresh_recoverable is not None,
+                "not_targeted_because": not_targeted,
             })
             # The re-capture runs the workload, so it spends budget. Checked
             # again here because the check above ran before that spend: a
