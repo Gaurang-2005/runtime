@@ -48,6 +48,7 @@ from gitm.optimizer.degradation import (
     AFFECTS_RESIDUALS,
     APPROXIMATE,
     AR_SKIPPED,
+    BUDGET_SPENT,
     ENGINE_LOST,
     GRAPH_BATCH,
     GRAPH_HARDWARE,
@@ -1522,6 +1523,25 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # to writing up what it has.
     engine_lost: str | None = early_engine_lost
     n_untried = 0
+
+    def _stop_at_budget() -> int:
+        """The queue left behind when the budget stops Phase 4, accounted for.
+
+        Without this the loop just broke out: the summary said nothing was left
+        untried while candidates were still queued (the first Kimi run that
+        finished stopped at its 2 h budget after two A/Bs and reported 0), and
+        candidates the gate had already rejected vanished from the report.
+        """
+        rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
+                        for x in queue if x.rejected_reason is not None)
+        left = sum(1 for x in queue if x.rejected_reason is None)
+        if left:
+            degradations.record(
+                BUDGET_SPENT, used="a Phase 4 that stopped at the budget",
+                reason=f"budget {cfg.budget} spent; {left} ranked candidate(s) not tried",
+                severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
+        return left
+
     while queue:
         c = queue.pop(0)
         if c.rejected_reason is not None:
@@ -1619,6 +1639,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
             break
         if time.time_ns() - started_ns >= int(budget_s * 1e9):
+            n_untried = _stop_at_budget()
             break
 
         if cfg.rerank == "recapture" and queue:
@@ -1698,6 +1719,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             # candidate cycle started on its strength could overrun by a whole
             # A/B on top of the trace.
             if time.time_ns() - started_ns >= int(budget_s * 1e9):
+                n_untried = _stop_at_budget()
                 break
 
     if tracing_swaps:

@@ -423,6 +423,40 @@ def test_a_candidate_that_never_ran_is_rejected_not_claimed(tmp_path, monkeypatc
     assert "| `a` |" not in report          # no Claims-table row for it
 
 
+def test_a_run_stopped_by_its_budget_counts_what_it_never_tried(tmp_path, monkeypatch):
+    """The first Kimi run to finish stopped at its 2 h budget after two A/Bs and
+    reported n_untried 0 with candidates still queued."""
+    from gitm.agents.policy import RankedCandidate
+    from gitm.optimizer.degradation import BUDGET_SPENT
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    clock = {"now": 0}
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop.time, "time_ns", lambda: clock["now"])
+    monkeypatch.setattr(loop, "select_interventions", lambda *a, **kw: [
+        RankedCandidate(spec=_spec("a", 1), predicted_delta=0.05),
+        RankedCandidate(spec=_spec("b", 1), predicted_delta=0.05),
+        RankedCandidate(spec=_spec("c", 1), predicted_delta=0.05),
+        RankedCandidate(spec=_spec("d", 1), predicted_delta=0.0, rejected_reason="gate")])
+
+    def apply_spends_the_budget(spec, applicator, **kw):
+        clock["now"] += 60 * 10**9          # each A/B costs a minute of a 30 s budget
+        return ApplyResult(True, rolled_back=True, measured_delta=-0.01)
+
+    monkeypatch.setattr(loop, "apply_intervention", apply_spends_the_budget)
+    out = loop.run_loop(loop.LoopConfig(budget="30s", scratch=str(tmp_path),
+                                        workload_runner=_Runner()))
+    s = out["summary"]
+    assert s["n_untried"] == 2                       # b and c were queued, never tried
+    assert BUDGET_SPENT in s["degradations"]["approximate"]
+    report = (Path(out["run_dir"]) / "report.md").read_text()
+    assert "d (gate)" in report                      # the gate's rejection is still reported
+
+
 def test_the_headline_does_not_sum_independent_ab_deltas():
     """L-10. '13 verified claims, aggregate +324.6%' added up deltas from
     separate A/Bs that never ran together."""
