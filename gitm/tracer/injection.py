@@ -567,6 +567,11 @@ def nvtx_env(env=None):
     previous values are back when the block exits, so an engine built after it
     without tracing does not carry them.
 
+    NVTX is pointed at the collector this process already injects
+    (``CUDA_INJECTION64_PATH``), not at :func:`lib_path`: an operator may have
+    injected a copy installed elsewhere, and NVTX must reach the collector that
+    is actually recording, which forwards to the libcupti it is bound to.
+
     A no-op when no collector is injected (no ``GITM_TRACE_OUT``).
     """
     env = os.environ if env is None else env
@@ -575,6 +580,8 @@ def nvtx_env(env=None):
         yield
         return
     traced = run_env(out, nvtx=True)
+    if ENV_NVTX_INJECT in traced and env.get(ENV_LIB):
+        traced[ENV_NVTX_INJECT] = env[ENV_LIB]
     keys = [k for k in (ENV_NVTX, ENV_NVTX_INJECT, "LD_PRELOAD") if k in traced]
     saved = {k: env.get(k) for k in keys}
     env.update({k: traced[k] for k in keys})

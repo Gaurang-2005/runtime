@@ -173,6 +173,20 @@ def test_nvtx_env_adds_what_run_env_adds_for_nvtx_and_puts_it_back(tmp_path, mon
     assert injection.ENV_NVTX_INJECT not in os.environ
 
 
+def test_nvtx_goes_to_the_collector_that_is_injected(tmp_path, monkeypatch):
+    """Review finding: a collector installed outside the package is accepted as
+    the injected one, so NVTX has to reach that copy, not the package's."""
+    monkeypatch.setenv(injection.ENV_LIB, "/opt/gitm/libgitm_inject.so")
+    monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "t.jsonl"))
+    monkeypatch.delenv(injection.ENV_NVTX_INJECT, raising=False)
+    monkeypatch.setattr(injection, "active_vendor", lambda: "nvidia")
+    monkeypatch.setattr(injection, "detect_vendor", lambda: "nvidia")
+    monkeypatch.setattr(injection, "lib_path", lambda: Path("/pkg/libgitm_inject.so"))
+
+    with injection.nvtx_env():
+        assert os.environ[injection.ENV_NVTX_INJECT] == "/opt/gitm/libgitm_inject.so"
+
+
 def test_nvtx_env_does_nothing_without_a_collector(monkeypatch):
     monkeypatch.delenv(injection.ENV_OUT, raising=False)
     monkeypatch.delenv(injection.ENV_NVTX, raising=False)
