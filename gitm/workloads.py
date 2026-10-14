@@ -811,6 +811,11 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                               platform's CUPTI doesn't attribute; also skips
                               torch.compile + graph capture, so engine builds
                               (and restart-A/B candidates) are much faster.
+        GITM_VLLM_NVTX        "0" -> traced engines skip vLLM's layerwise NVTX
+                              ranges (default on). Without them a kernel is
+                              identified by its name alone, and library GEMMs
+                              and MLA attention map to no op. A/B engines never
+                              carry the ranges.
 
         GITM_VLLM_MAX_MODEL_LEN / GITM_VLLM_TP / GITM_VLLM_ENABLE_EP /
         GITM_VLLM_TRUST_REMOTE_CODE / GITM_VLLM_EXTRA_JSON
@@ -1045,9 +1050,19 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         # their workers share a name, so ownership is the only thing that keeps
         # a candidate's teardown from taking the baseline's workers with it.
         before = engine_worker_pids()
-        with contextlib.nullcontext() if traced else injection.untraced_env():
+        # A traced engine also names the layer and op each kernel ran in. By
+        # kernel name alone, cuBLAS/hipBLASLt GEMMs and MLA attention map to no
+        # op: the first Kimi K2.5 run left 7.4M of 10.4M launches unmodelled and
+        # priced 1.2 s of 747 s as recoverable, so nothing could be targeted.
+        # Traced engines are eager (the opening one by GITM_VLLM_ENFORCE_EAGER),
+        # where vLLM's layerwise ranges fire around every launch. Never on an
+        # A/B engine: the ranges cost host time on every module call.
+        nvtx = traced and tracing and os.environ.get("GITM_VLLM_NVTX", "1") != "0"
+        build_kwargs = {**kwargs, "enable_layerwise_nvtx_tracing": True} if nvtx else kwargs
+        with (injection.nvtx_env() if nvtx else contextlib.nullcontext() if traced
+              else injection.untraced_env()):
             engine = _with_watchdog(
-                lambda: LLM(model=model, **kwargs), what="engine build",
+                lambda: LLM(model=model, **build_kwargs), what="engine build",
                 timeout_s=_timeout_s("GITM_BUILD_TIMEOUT_S", 3600.0),
                 pids=lambda: engine_worker_pids() - before)
         engine.gitm_worker_pids = engine_worker_pids() - before

@@ -568,6 +568,38 @@ def clock_now() -> int | None:
 
 
 @contextlib.contextmanager
+def nvtx_env(env=None):
+    """Run a block with NVTX range collection turned on for the injected tracer.
+
+    For starting a traced engine whose kernels should carry the layer and op
+    they ran in. The variables are exactly the ones :func:`run_env` adds for
+    ``nvtx=True`` — ``gitm capture serve --nvtx`` reads the same function — so
+    the two paths cannot drift apart. Workers inherit them when they start; the
+    previous values are back when the block exits, so an engine built after it
+    without tracing does not carry them.
+
+    A no-op when no collector is injected (no ``GITM_TRACE_OUT``).
+    """
+    env = os.environ if env is None else env
+    out = env.get(ENV_OUT)
+    if not out or active_vendor() is None:
+        yield
+        return
+    traced = run_env(out, nvtx=True)
+    keys = [k for k in (ENV_NVTX, ENV_NVTX_INJECT, "LD_PRELOAD") if k in traced]
+    saved = {k: env.get(k) for k in keys}
+    env.update({k: traced[k] for k in keys})
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = v
+
+
+@contextlib.contextmanager
 def untraced_env(env=None):
     """Run a block with this collector's injection removed from the environment.
 

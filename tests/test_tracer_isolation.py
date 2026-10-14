@@ -151,3 +151,83 @@ def test_a_retrace_runs_on_a_traced_engine_and_swaps_back(tmp_path, monkeypatch)
     backs = [w for w in swaps if w["when"].startswith("after re-trace")]
     assert retraces and len(retraces) == len(backs)
     assert all(w["to"] == "traced" for w in retraces) and all(w["to"] == "untraced" for w in backs)
+
+
+# --------------------------------------------------------------------------- #
+# layer and op identity on traced engines                                      #
+# --------------------------------------------------------------------------- #
+def test_nvtx_env_adds_what_run_env_adds_for_nvtx_and_puts_it_back(tmp_path, monkeypatch):
+    monkeypatch.setenv(injection.ENV_LIB, "/x/libgitm_inject.so")
+    monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "t.jsonl"))
+    monkeypatch.delenv(injection.ENV_NVTX, raising=False)
+    monkeypatch.delenv(injection.ENV_NVTX_INJECT, raising=False)
+    monkeypatch.setattr(injection, "active_vendor", lambda: "nvidia")
+    monkeypatch.setattr(injection, "detect_vendor", lambda: "nvidia")
+    monkeypatch.setattr(injection, "libcupti_path", lambda: Path("/x/libcupti.so"))
+
+    with injection.nvtx_env():
+        assert os.environ[injection.ENV_NVTX] == "1"
+        assert os.environ[injection.ENV_NVTX_INJECT] == "/x/libcupti.so"
+    assert injection.ENV_NVTX not in os.environ
+    assert injection.ENV_NVTX_INJECT not in os.environ
+
+
+def test_nvtx_env_does_nothing_without_a_collector(monkeypatch):
+    monkeypatch.delenv(injection.ENV_OUT, raising=False)
+    monkeypatch.delenv(injection.ENV_NVTX, raising=False)
+    with injection.nvtx_env():
+        assert injection.ENV_NVTX not in os.environ
+
+
+def _engines_with_nvtx(tmp_path, monkeypatch):
+    """Build the opening engine, an A/B pair and a re-trace through the factory,
+    recording what each was started with."""
+    from gitm.scheduler.loop import LoopConfig
+    from gitm.workloads import get_factory
+
+    seen: list = []
+    _fake_vllm(monkeypatch, [])
+    real_llm = sys.modules["vllm"].LLM
+
+    class _LLM(real_llm):
+        def __init__(self, model, **kwargs):
+            seen.append((kwargs.get("enable_layerwise_nvtx_tracing", False),
+                         os.environ.get(injection.ENV_NVTX)))
+            super().__init__(model, **kwargs)
+
+    sys.modules["vllm"].LLM = _LLM
+    monkeypatch.setenv(injection.ENV_LIB, "/x/libgitm_inject.so")
+    monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "t.jsonl"))
+    monkeypatch.delenv(injection.ENV_NVTX, raising=False)
+    monkeypatch.setattr(injection, "libcupti_path", lambda: Path("/x/libcupti.so"))
+    for var, val in (("GITM_VLLM_PROMPTS", "2"), ("GITM_VLLM_MAX_TOKENS", "3")):
+        monkeypatch.setenv(var, val)
+    monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)
+
+    engine = get_factory("vllm-decode")(LoopConfig(workload="vllm-decode")).engine
+    candidate = engine.gitm_restart_fn(engine, {"max_num_seqs": 64})
+    baseline = engine.gitm_baseline_restart_fn(engine)
+    retrace = baseline.gitm_traced_rebuild_fn(baseline)
+    return seen, (engine, candidate, baseline, retrace)
+
+
+def test_traced_engines_name_each_kernels_layer_and_ab_engines_do_not(tmp_path, monkeypatch):
+    """The first Kimi K2.5 run identified kernels by name alone: 7.4M of 10.4M
+    launches (every GEMM and the MLA attention) mapped to no op, and the run
+    could target nothing."""
+    monkeypatch.setenv("GITM_VLLM_NVTX", "1")
+    seen, engines = _engines_with_nvtx(tmp_path, monkeypatch)
+    opening, candidate, baseline, retrace = seen
+    assert opening == (True, "1") and retrace == (True, "1")
+    assert candidate == (False, None) and baseline == (False, None)
+    # Not part of the configuration: an engine rebuilt from a traced one does
+    # not inherit the ranges.
+    for e in engines:
+        assert "enable_layerwise_nvtx_tracing" not in e.gitm_llm_kwargs
+    assert injection.ENV_NVTX not in os.environ
+
+
+def test_layer_identity_can_be_turned_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITM_VLLM_NVTX", "0")
+    seen, _ = _engines_with_nvtx(tmp_path, monkeypatch)
+    assert all(row == (False, None) for row in seen)
