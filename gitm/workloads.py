@@ -625,6 +625,21 @@ def _kill_engine_processes(pids: set[int]) -> list[int]:
 _WATCHDOG_GRACE_S = 60.0
 
 
+@contextlib.contextmanager
+def _env_set(values: dict[str, str]):
+    """Set ``values`` in the environment for the block, then put back what was there."""
+    saved = {k: os.environ.get(k) for k in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def _with_watchdog(fn: Callable[[], Any], *, what: str, timeout_s: float | None,
                    pids: Callable[[], set[int]]) -> Any:
     """``fn()``, killing the engine's processes if it runs past ``timeout_s`` (K-2).
@@ -814,8 +829,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         GITM_VLLM_NVTX        "0" -> traced engines skip vLLM's layerwise NVTX
                               ranges (default on). Without them a kernel is
                               identified by its name alone, and library GEMMs
-                              and MLA attention map to no op. A/B engines never
-                              carry the ranges.
+                              and MLA attention map to no op. Traced engines run
+                              vLLM's V1 model runner for it (V2 ignores the flag)
+                              unless VLLM_USE_V2_MODEL_RUNNER is set. A/B engines
+                              never carry the ranges.
 
         GITM_VLLM_MAX_MODEL_LEN / GITM_VLLM_TP / GITM_VLLM_ENABLE_EP /
         GITM_VLLM_TRUST_REMOTE_CODE / GITM_VLLM_EXTRA_JSON
@@ -1057,10 +1074,19 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         # Traced engines are eager (the opening one by GITM_VLLM_ENFORCE_EAGER),
         # where vLLM's layerwise ranges fire around every launch. Never on an
         # A/B engine: the ranges cost host time on every module call.
+        #
+        # vLLM 0.30 registers those ranges only in its V1 model runner. The V2
+        # runner, its default for Qwen2 and Kimi's DeepSeek-V3 alike, accepts
+        # the flag and ignores it: a laptop run with it on recorded CUB's ranges
+        # and none of the model's. So a traced engine runs V1 unless the operator
+        # chose a runner. It only explains where time goes; keep or rollback is
+        # decided on untraced engines, which keep vLLM's default.
         nvtx = traced and tracing and os.environ.get("GITM_VLLM_NVTX", "1") != "0"
         build_kwargs = {**kwargs, "enable_layerwise_nvtx_tracing": True} if nvtx else kwargs
+        runner = ({"VLLM_USE_V2_MODEL_RUNNER": "0"}
+                  if nvtx and "VLLM_USE_V2_MODEL_RUNNER" not in os.environ else {})
         with (injection.nvtx_env() if nvtx else contextlib.nullcontext() if traced
-              else injection.untraced_env()):
+              else injection.untraced_env()), _env_set(runner):
             engine = _with_watchdog(
                 lambda: LLM(model=model, **build_kwargs), what="engine build",
                 timeout_s=_timeout_s("GITM_BUILD_TIMEOUT_S", 3600.0),

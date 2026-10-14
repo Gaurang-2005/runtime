@@ -193,7 +193,8 @@ def _engines_with_nvtx(tmp_path, monkeypatch):
     class _LLM(real_llm):
         def __init__(self, model, **kwargs):
             seen.append((kwargs.get("enable_layerwise_nvtx_tracing", False),
-                         os.environ.get(injection.ENV_NVTX)))
+                         os.environ.get(injection.ENV_NVTX),
+                         os.environ.get("VLLM_USE_V2_MODEL_RUNNER")))
             super().__init__(model, **kwargs)
 
     sys.modules["vllm"].LLM = _LLM
@@ -216,10 +217,13 @@ def test_traced_engines_name_each_kernels_layer_and_ab_engines_do_not(tmp_path, 
     launches (every GEMM and the MLA attention) mapped to no op, and the run
     could target nothing."""
     monkeypatch.setenv("GITM_VLLM_NVTX", "1")
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
     seen, engines = _engines_with_nvtx(tmp_path, monkeypatch)
     opening, candidate, baseline, retrace = seen
-    assert opening == (True, "1") and retrace == (True, "1")
-    assert candidate == (False, None) and baseline == (False, None)
+    # vLLM's V2 runner ignores the flag, so traced engines run V1.
+    assert opening == (True, "1", "0") and retrace == (True, "1", "0")
+    assert candidate == (False, None, None) and baseline == (False, None, None)
+    assert "VLLM_USE_V2_MODEL_RUNNER" not in os.environ
     # Not part of the configuration: an engine rebuilt from a traced one does
     # not inherit the ranges.
     for e in engines:
@@ -229,5 +233,13 @@ def test_traced_engines_name_each_kernels_layer_and_ab_engines_do_not(tmp_path, 
 
 def test_layer_identity_can_be_turned_off(tmp_path, monkeypatch):
     monkeypatch.setenv("GITM_VLLM_NVTX", "0")
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
     seen, _ = _engines_with_nvtx(tmp_path, monkeypatch)
-    assert all(row == (False, None) for row in seen)
+    assert all(row == (False, None, None) for row in seen)
+
+
+def test_an_operators_runner_choice_is_kept(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITM_VLLM_NVTX", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    seen, _ = _engines_with_nvtx(tmp_path, monkeypatch)
+    assert all(row[2] == "1" for row in seen)
