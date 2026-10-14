@@ -163,11 +163,12 @@ def test_nvtx_env_adds_what_run_env_adds_for_nvtx_and_puts_it_back(tmp_path, mon
     monkeypatch.delenv(injection.ENV_NVTX_INJECT, raising=False)
     monkeypatch.setattr(injection, "active_vendor", lambda: "nvidia")
     monkeypatch.setattr(injection, "detect_vendor", lambda: "nvidia")
-    monkeypatch.setattr(injection, "libcupti_path", lambda: Path("/x/libcupti.so"))
+    monkeypatch.setattr(injection, "lib_path", lambda: Path("/x/libgitm_inject.so"))
 
     with injection.nvtx_env():
         assert os.environ[injection.ENV_NVTX] == "1"
-        assert os.environ[injection.ENV_NVTX_INJECT] == "/x/libcupti.so"
+        # The collector, which forwards to the libcupti it is bound to.
+        assert os.environ[injection.ENV_NVTX_INJECT] == "/x/libgitm_inject.so"
     assert injection.ENV_NVTX not in os.environ
     assert injection.ENV_NVTX_INJECT not in os.environ
 
@@ -199,7 +200,6 @@ def _engines_with_nvtx(tmp_path, monkeypatch):
     monkeypatch.setenv(injection.ENV_LIB, "/x/libgitm_inject.so")
     monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "t.jsonl"))
     monkeypatch.delenv(injection.ENV_NVTX, raising=False)
-    monkeypatch.setattr(injection, "libcupti_path", lambda: Path("/x/libcupti.so"))
     for var, val in (("GITM_VLLM_PROMPTS", "2"), ("GITM_VLLM_MAX_TOKENS", "3")):
         monkeypatch.setenv(var, val)
     monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)

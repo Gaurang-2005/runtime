@@ -133,20 +133,6 @@ def active() -> bool:
     return active_vendor() is not None
 
 
-def libcupti_path() -> Path | None:
-    """The libcupti the shim was linked against, or ``None`` if none was found.
-
-    Reuses the build's own resolution so the library NVTX is pointed at is the
-    same one CUPTI is collecting through. Two different libcupti majors in one
-    process is not a configuration that works.
-    """
-    from gitm.tracer._cupti.build import _cuda_home, _pick_libcupti
-
-    d, major = _pick_libcupti(_cuda_home())
-    if d is None or major is None:
-        return None
-    so = d / f"libcupti.so.{major}"
-    return so if so.exists() else None
 
 
 def detect_vendor() -> str:
@@ -184,7 +170,9 @@ def run_env(
     ``NVTX_INJECTION64_PATH`` to decide which tool receives push/pop. Enabling
     ``CUPTI_ACTIVITY_KIND_MARKER`` gives CUPTI somewhere to put ranges but does
     not make NVTX hand them over — verified on a B200, where markers stayed at
-    zero until this was set.
+    zero until this was set. It names the collector itself, which forwards to
+    the libcupti it is bound to: naming a libcupti by path missed whenever torch
+    had already loaded its own copy, and NVTX fed an idle second CUPTI.
 
     On AMD the collection side needs no third variable — rocTX push/pop is
     delivered to the SAME injected tool by rocprofiler-sdk's marker tracing
@@ -213,9 +201,10 @@ def run_env(
     env = {ENV_LIB: str(lib_path()), ENV_OUT: out}
     if nvtx:
         env[ENV_NVTX] = "1"
-        cupti = libcupti_path()
-        if cupti is not None:
-            env[ENV_NVTX_INJECT] = str(cupti)
+        # The collector, not a libcupti: it forwards NVTX to the libcupti it is
+        # actually bound to (InitializeInjectionNvtx2 in cupti_inject.c). A path
+        # to one only matched by luck — torch loads its own copy first.
+        env[ENV_NVTX_INJECT] = str(lib_path())
     return env
 
 
