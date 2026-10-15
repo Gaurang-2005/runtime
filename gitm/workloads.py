@@ -820,13 +820,12 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         GITM_VLLM_SYNTHETIC   "1" -> CPU-only decode stand-in instead of vLLM
                               (exercises the wire/registry path with no GPU or
                               vLLM; produces no GPU kernels)
-        GITM_VLLM_ENFORCE_EAGER "1" -> the A/B baseline is eager too (no CUDA
-                              graphs, no torch.compile). Traced engines (the
-                              opening capture and every re-trace) are always
-                              eager, so this is not needed for a trace: without
-                              it the baseline is stock vLLM and a keep beats the
-                              engine people run. Set it only to make builds
-                              faster (no compile or graph capture).
+        GITM_VLLM_ENFORCE_EAGER "1" -> build with enforce_eager (no CUDA graphs).
+                              Set it when the CUPTI tracer records no kernels
+                              because decode runs via CUDA-graph replay that the
+                              platform's CUPTI doesn't attribute; also skips
+                              torch.compile + graph capture, so engine builds
+                              (and restart-A/B candidates) are much faster.
         GITM_VLLM_NVTX        "0" -> traced engines skip vLLM's layerwise NVTX
                               ranges (default on for NVIDIA, off for AMD, where
                               the opening decode hung with them on; "1" opts in). Without them a kernel is
@@ -1112,19 +1111,7 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             setattr(engine, name, fn)
         return engine
 
-    # The opening capture is traced, so it runs eager whatever the baseline is,
-    # exactly as a re-trace does (_traced_rebuild): graph replay hides decode
-    # kernels from the tracer, and vLLM's layer ranges fire only in eager mode.
-    # Its recorded configuration stays the baseline's, so the untraced engine
-    # the loop swaps in before the first A/B is stock vLLM (graphs, compile)
-    # unless GITM_VLLM_ENFORCE_EAGER asks otherwise. Every keep then has to beat
-    # the engine people actually run. Forcing eager on the baseline itself made
-    # the loop "find" graph replay against an eager engine it had built.
-    if tracing:
-        llm = _build_engine({**_base_kwargs, "enforce_eager": True}, traced=True)
-        llm.gitm_llm_kwargs = dict(_base_kwargs)
-    else:
-        llm = _build_engine(dict(_base_kwargs), traced=True)
+    llm = _build_engine(dict(_base_kwargs), traced=True)
     _activate_engine(llm)
     prompts = [f"Benchmark decode prompt {i}." for i in range(n_prompts)]
     params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
