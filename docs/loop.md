@@ -207,6 +207,8 @@ Only one engine is ever on the GPU. Parallel mode, where both are resident, is u
    - the minimum effect is `GITM_MIN_EFFECT`, 1% by default;
    - until the first A/A sample exists, the threshold is 2%.
 4. **Autoresearch candidates always get at least 2 rounds:** it tries many guesses, so a lucky single A/B is likelier there.
+**Rebuild or re-measure?** Two builds of the same configuration don't decode at exactly the same speed (memory layout, auto-tuned kernels, graph capture). `--validation` rebuilds between rounds, so a lucky or unlucky build can't carry a decision: the stronger test, one build per extra round. `--reps` decodes several times on the engine already up: no build cost, and steadier against run-to-run noise, but it repeats whatever luck that build had. Use `--validation` for results, and `--reps` (with `--validation 1`) for quick exploration where builds are expensive. Both are recorded in the summary and `noise_floor.json`.
+
 5. **The run ends with one end-to-end A/B.** Each keep was judged against whatever was running then, so kept gains were never measured together, and their sum is not a result. After the last candidate, the original configuration is rebuilt and the final one is tried against it as a single candidate, with the same rounds and threshold. That number goes in the summary (`final_check`), the report and `final_check.json`. It runs only when something was kept and the budget allows; `GITM_FINAL_CHECK=0` turns it off.
 
 On an RTX 4050 (Qwen2.5-0.5B, 256 × 512), identical builds differ by about 0.45%, so the threshold is about 1%. The previous rule, "keep if ≥ 0", kept 8 of 15 changes that did nothing.
@@ -276,7 +278,8 @@ Useful switches:
 |---|---|
 | `--no-history` / `--use-history` | Skip the question in Phase 0 |
 | `--skip-lever PATTERN` | Exclude levers by name or setting (also `GITM_SKIP_LEVERS`) |
-| `--validation N` | Noise calibration pairs and paired rounds per candidate (default 2, also `GITM_VALIDATION`) |
+| `--validation N` | Noise calibration pairs and paired rounds per candidate, rebuilding the engines between rounds (default 2, also `GITM_VALIDATION`) |
+| `--reps N` | Decodes per engine in each measurement, averaged, with no rebuild (default 1, also `GITM_AB_REPS`) |
 | `GITM_MIN_EFFECT` | Smallest mean gain worth keeping (default 0.01) |
 | `GITM_AB_REPS=N` | Decodes per side of each A/B (default 1) |
 | `GITM_RESTART_MODE` | Force `serial` or `parallel`; serial is the default |

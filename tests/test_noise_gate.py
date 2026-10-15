@@ -714,3 +714,56 @@ def test_linear_layers_are_read_from_the_models_own_config(monkeypatch):
     assert engine_with(by_field) is True
     monkeypatch.setattr(loop, "_hf_config_from_engine", lambda e: None)
     assert loop._declares_linear_layers(object()) is None
+
+
+def test_reps_reach_the_measurement_and_are_recorded(tmp_path, monkeypatch):
+    """--reps decodes each engine several times with no rebuild; --validation
+    rebuilds between rounds. Both are recorded beside the result."""
+    import json
+    import sys
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+    from .test_vllm_knobs_and_restart import _FullEngine
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100,
+                               end_ns=i * 100 + 80) for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setitem(sys.modules, "vllm", None)
+    seen: list[int] = []
+    real_init = LiveEngineApplicator.__init__
+
+    def spy(self, *a, **kw):
+        seen.append(kw.get("reps"))
+        real_init(self, *a, **kw)
+
+    monkeypatch.setattr(LiveEngineApplicator, "__init__", spy)
+    monkeypatch.setenv("GITM_AB_REPS", "5")                      # the flag wins over it
+    out = run_loop(LoopConfig(engine=_FullEngine(), workload="vllm-decode", budget="24h",
+                              scratch=str(tmp_path), top_n_interventions=2, reps=3))
+    assert seen == [3]
+    assert out["summary"]["reps"] == 3
+    doc = json.loads((Path(out["run_dir"]) / "noise_floor.json").read_text())
+    assert doc["reps"] == 3
+
+
+def test_validation_and_reps_below_one_are_refused_with_a_reason(capsys):
+    """--validation 0 used to be quietly treated as 1, so someone asking for no
+    rebuilds got one round without being told."""
+    from gitm.cli import _parser
+
+    for args, needle in ((["--validation", "0"], "--reps"), (["--reps", "0"], "at least 1")):
+        with pytest.raises(SystemExit):
+            _parser().parse_args(["run", "--workload", "vllm-decode", *args])
+        assert needle in capsys.readouterr().err
+    ns = _parser().parse_args(["run", "--workload", "vllm-decode", "--validation", "1", "--reps", "3"])
+    assert (ns.validation, ns.reps) == (1, 3)

@@ -491,6 +491,11 @@ class LoopConfig:
     #: over this many paired A/B rounds. ``None`` reads ``GITM_VALIDATION``,
     #: else 2. Autoresearch candidates always get at least 2.
     validation: int | None = None
+    #: Decodes per engine in each A/B measurement, averaged, with no rebuild.
+    #: Where ``validation`` rebuilds between rounds (catching build-to-build
+    #: luck), this steadies run-to-run noise on the engine already up, at no
+    #: build cost. ``None`` reads ``GITM_AB_REPS``, else 1.
+    reps: int | None = None
     # Optional explicit driver for the embedded/engine path. When unset, the
     # loop looks up ``workload`` in the workload registry (gitm.workloads).
     workload_runner: WorkloadRunner | None = None
@@ -1734,6 +1739,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     _validation = max(1, int(cfg.validation if cfg.validation is not None
                              else os.environ.get("GITM_VALIDATION", "2")))
     _min_effect = float(os.environ.get("GITM_MIN_EFFECT", "0.01"))
+    _reps = max(1, int(cfg.reps if cfg.reps is not None
+                       else os.environ.get("GITM_AB_REPS", "1")))
     noise_calibration: list[float] = []
     calibration_lost: str | None = None
     if cfg.engine is not None:
@@ -1749,7 +1756,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             restart_fn=live_restart_fn,
             baseline_restart_fn=getattr(cfg.engine, "gitm_baseline_restart_fn", None),
             restart_mode=_restart_mode,
-            reps=int(os.environ.get("GITM_AB_REPS", "1")),
+            reps=_reps,
             # Compatibility escape hatch for custom scheduling-classified knobs
             # that should still be measured through engine rebuild.
             force_restart=os.environ.get("GITM_KNOBS_VIA_RESTART") == "1",
@@ -2441,6 +2448,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         _noise = applicator.noise
         (run_dir / "noise_floor.json").write_text(json.dumps({
             "validation": _validation,
+            "reps": _reps,
             "min_effect": _min_effect,
             "threshold_without_floor": _THRESHOLD_WITHOUT_FLOOR,
             "calibration_samples": noise_calibration,
@@ -2489,6 +2497,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         "n_untried": n_untried,
         # How hard candidates were tested, and the noise they had to beat.
         "validation": _validation,
+        "reps": _reps,
         "noise_floor": (applicator.noise.floor
                         if isinstance(applicator, LiveEngineApplicator) else None),
         # Where the run started against where it ended, as one A/B.
