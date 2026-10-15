@@ -179,7 +179,15 @@ def _final_check(applicator: LiveEngineApplicator, original: dict[str, Any]) -> 
     import types
 
     LiveEngineApplicator._shutdown(engine)
-    applicator.rebase(rebuild(types.SimpleNamespace(gitm_llm_kwargs=dict(original))))
+    try:
+        original_engine = rebuild(types.SimpleNamespace(gitm_llm_kwargs=dict(original)))
+    except Exception as exc:  # noqa: BLE001 - reported as the engine being lost
+        # The final engine is already released, so there is none left.
+        applicator.engine = None
+        return {"changed": changed,
+                "engine_lost": f"could not rebuild the original configuration: "
+                               f"{type(exc).__name__}: {exc}"}
+    applicator.rebase(original_engine)
     label = ",".join(f"{k}={v}" for k, v in sorted(changed.items()))
     spec = InterventionSpec(
         name="final_check", summary="the final configuration against the original one",
@@ -188,6 +196,9 @@ def _final_check(applicator: LiveEngineApplicator, original: dict[str, Any]) -> 
     result = apply_intervention(spec, applicator, min_keep_delta=0.0)
     ab = applicator.last_result
     out: dict[str, Any] = {"changed": changed, "error": result.error}
+    if result.restore_failed:
+        # apply_intervention reports a lost engine as a flag, not an exception.
+        out["engine_lost"] = result.error or "restore failed during the final check"
     if ab is not None and result.measured_delta is not None:
         # measure() returns the margin over the bar; the change itself is that
         # margin plus the bar, the mean of the rounds' ratios.
@@ -2169,7 +2180,15 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             try:
                 final_check = _final_check(applicator, original_config)
             except RestoreFailed as exc:
-                final_check = {"skipped": f"could not rebuild a configuration: {exc}"}
+                final_check = {"engine_lost": f"could not rebuild a configuration: {exc}"}
+            if final_check.get("engine_lost"):
+                # Every candidate before it was measured against a sound
+                # baseline: approximate, so they stay in history, and the run
+                # still writes its report but no longer reads as a clean finish.
+                engine_lost = f"in the final check: {final_check['engine_lost']}"
+                degradations.record(
+                    ENGINE_LOST, used="a run that lost its engine in the final check",
+                    reason=engine_lost, severity=APPROXIMATE, affects=(AFFECTS_CLAIMS,))
         (run_dir / "final_check.json").write_text(json.dumps(final_check, indent=2,
                                                               default=str))
 

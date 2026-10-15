@@ -607,3 +607,35 @@ def test_no_final_check_when_nothing_was_kept():
     make_app, built = _config_engines(lambda kw: 1000.0)
     out = _final_check(make_app({"block_size": 16}), {"block_size": 16})
     assert "skipped" in out and len(built) == 1                     # nothing rebuilt
+
+
+def test_a_final_check_that_cannot_rebuild_reports_a_lost_engine(monkeypatch):
+    """Review finding: a rebuild that raised aborted the run before its report."""
+    from gitm.scheduler.loop import _final_check
+
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(lambda e: None))
+    make_app, _ = _config_engines(lambda kw: 1000.0)
+    app = make_app({"block_size": 32})
+
+    def broken(_old):
+        raise TimeoutError("engine build ran past 3600s")
+
+    app.engine.gitm_untraced_rebuild_fn = broken
+    out = _final_check(app, {"block_size": 16})
+    assert "TimeoutError" in out["engine_lost"] and app.engine is None
+
+
+def test_a_final_check_that_loses_its_baseline_reports_a_lost_engine(monkeypatch):
+    """Review finding: apply_intervention reports a lost engine as a flag, and
+    the final check dropped it, so the run could finish looking clean."""
+    from gitm.optimizer.apply import ApplyResult
+    from gitm.scheduler import loop as loop_mod
+    from gitm.scheduler.loop import _final_check
+
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(lambda e: None))
+    monkeypatch.setattr(loop_mod, "apply_intervention", lambda *a, **kw: ApplyResult(
+        True, rolled_back=False, measured_delta=None,
+        error="restore failed: baseline decode timed out", restore_failed=True))
+    make_app, _ = _config_engines(lambda kw: 1000.0)
+    out = _final_check(make_app({"block_size": 32}), {"block_size": 16})
+    assert "baseline decode timed out" in out["engine_lost"]
