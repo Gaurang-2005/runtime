@@ -155,6 +155,32 @@ def _next_cycle_overruns(elapsed_s: float, budget_s: float,
     return None
 
 
+#: EngineArgs fragments that configure linear-attention or state-space layers
+#: (Mamba, gated DeltaNet, Kimi delta attention, short convolutions). They exist
+#: only in hybrid models; on any other model they build an identical engine.
+_LINEAR_ATTENTION_KNOBS = ("mamba", "gdn_", "kda_", "linear_attn", "short_conv")
+
+
+def _not_for_this_model(spec: Any, family: str, graph_default_why: str | None) -> str | None:
+    """Why ``spec`` configures layers this model does not have, or ``None``.
+
+    Autoresearch proposes from every EngineArgs field. On Qwen2.5-0.5B, 8 of 15
+    proposals were gdn_/kda_ prefill backends: linear-attention settings on a
+    model with none, each an engine rebuild that can only measure noise, and the
+    source of an earlier false keep. The predicted graph already knows the
+    model's family (registry.detect_family, read from its own config), so ask
+    it. A stand-in graph (``graph_default_why`` set) knows nothing about the
+    model, and then nothing is ruled out.
+    """
+    if graph_default_why is not None or family == "hybrid":
+        return None
+    hits = [k for k in spec.knob_values if any(n in k.lower() for n in _LINEAR_ATTENTION_KNOBS)]
+    if not hits:
+        return None
+    return (f"{', '.join(hits)} configures linear-attention layers, and this model "
+            f"({family}) has none")
+
+
 def _engine_arg_default(knob: str) -> Any:
     """vLLM's own default for an engine argument, or ``None`` when it has none
     or decides at run time (vLLM's ``None``), or vLLM is not installed."""
@@ -1864,7 +1890,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         if cfg.engine is not None and live_restart_fn is None and _has_structural_knob(c.spec):
             rejected.append(f"{c.spec.name} (structural knob: needs engine restart, no restart_fn)")
             continue
-        noop = _already_set(getattr(applicator, "engine", None), c.spec)
+        noop = (_already_set(getattr(applicator, "engine", None), c.spec)
+                or _not_for_this_model(c.spec, family, graph_default_why))
         if noop is not None:
             rejected.append(f"{c.spec.name} ({noop})")
             continue
@@ -2122,7 +2149,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 and _has_structural_knob(spec)
             ):
                 return "structural knob: needs engine restart, no restart_fn"
-            noop = _already_set(getattr(applicator, "engine", None), spec)
+            noop = (_already_set(getattr(applicator, "engine", None), spec)
+                    or _not_for_this_model(spec, family, graph_default_why))
             if noop is not None:
                 return noop
             values = spec.knob_values

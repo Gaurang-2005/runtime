@@ -678,3 +678,16 @@ def test_a_relative_value_or_an_unknown_engine_is_never_skipped(monkeypatch):
     relative = _spec("max_num_batched_tokens", 8192).model_copy(update={"value_multiplier": 2.0})
     assert loop._already_set(_engine(), relative) is None
     assert loop._already_set(object(), _spec("max_num_batched_tokens", 8192)) is None
+
+
+def test_linear_attention_settings_are_not_tried_on_a_model_without_it():
+    """On Qwen2.5-0.5B, 8 of 15 autoresearch proposals were gdn_/kda_ backends."""
+    from gitm.scheduler.loop import _not_for_this_model
+
+    for knob in ("gdn_prefill_backend", "kda_prefill_backend", "mamba_cache_dtype"):
+        assert "has none" in _not_for_this_model(_spec(knob, "triton"), "dense", None)
+    # A hybrid model has them; a stand-in graph knows nothing about the model.
+    assert _not_for_this_model(_spec("gdn_prefill_backend", "triton"), "hybrid", None) is None
+    assert _not_for_this_model(_spec("gdn_prefill_backend", "triton"), "dense",
+                               "the engine exposes no HF config") is None
+    assert _not_for_this_model(_spec("max_num_seqs", 128), "dense", None) is None
