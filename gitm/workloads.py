@@ -827,7 +827,8 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                               torch.compile + graph capture, so engine builds
                               (and restart-A/B candidates) are much faster.
         GITM_VLLM_NVTX        "0" -> traced engines skip vLLM's layerwise NVTX
-                              ranges (default on). Without them a kernel is
+                              ranges (default on for NVIDIA, off for AMD, where
+                              the opening decode hung with them on; "1" opts in). Without them a kernel is
                               identified by its name alone, and library GEMMs
                               and MLA attention map to no op. Traced engines run
                               vLLM's V1 model runner for it (V2 ignores the flag)
@@ -1081,7 +1082,16 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         # and none of the model's. So a traced engine runs V1 unless the operator
         # chose a runner. It only explains where time goes; keep or rollback is
         # decided on untraced engines, which keep vLLM's default.
-        nvtx = traced and tracing and os.environ.get("GITM_VLLM_NVTX", "1") != "0"
+        #
+        # Off by default on AMD. Two Kimi K2.5 runs on MI355X with the labels on
+        # hung at the first traced decode: rocprofiler logged ~1000 stuck-signal
+        # warnings, kernels stopped after 37 s, and vLLM timed out sample_tokens.
+        # The labels themselves arrived (30k markers per rank, correct module
+        # names); what hangs is not isolated yet (marker tracing, per-call HIP
+        # API tracing, the roctx shim or the V1 runner). GITM_VLLM_NVTX=1 opts in.
+        nvtx_default = "0" if injection.active_vendor() == "amd" else "1"
+        nvtx = (traced and tracing
+                and os.environ.get("GITM_VLLM_NVTX", nvtx_default) != "0")
         build_kwargs = {**kwargs, "enable_layerwise_nvtx_tracing": True} if nvtx else kwargs
         runner = ({"VLLM_USE_V2_MODEL_RUNNER": "0"}
                   if nvtx and "VLLM_USE_V2_MODEL_RUNNER" not in os.environ else {})

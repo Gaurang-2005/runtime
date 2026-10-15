@@ -257,3 +257,23 @@ def test_an_operators_runner_choice_is_kept(tmp_path, monkeypatch):
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     seen, _ = _engines_with_nvtx(tmp_path, monkeypatch)
     assert all(row[2] == "1" for row in seen)
+
+
+def test_layer_labels_are_off_by_default_on_amd(tmp_path, monkeypatch):
+    """Two Kimi K2.5 runs on MI355X hung at the first labelled decode, so AMD
+    keeps the pre-label behaviour unless the operator opts in."""
+    monkeypatch.delenv("GITM_VLLM_NVTX", raising=False)
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    monkeypatch.setattr(injection, "active_vendor", lambda: "amd")
+    seen, _ = _engines_with_nvtx(tmp_path, monkeypatch)
+    assert all(row[0] is False for row in seen)
+
+
+def test_layer_labels_can_be_opted_into_on_amd(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITM_VLLM_NVTX", "1")
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    monkeypatch.setattr(injection, "active_vendor", lambda: "amd")
+    monkeypatch.setattr(injection, "detect_vendor", lambda: "amd")
+    seen, _ = _engines_with_nvtx(tmp_path, monkeypatch)
+    opening, candidate, baseline, retrace = seen
+    assert opening[0] and retrace[0] and not candidate[0] and not baseline[0]

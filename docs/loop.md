@@ -181,6 +181,8 @@ Only one engine is ever on the GPU. Parallel mode, where both are resident, is u
 
 **Traced engines name each kernel's layer and op.** The opening capture and each re-trace are built with vLLM's layerwise NVTX ranges (`enable_layerwise_nvtx_tracing`), so a kernel carries the module it ran in. By name alone, library GEMMs (cuBLAS, hipBLASLt) and MLA attention map to no op: the first Kimi K2.5 run left 71% of its launches unmodelled and could target nothing. vLLM 0.30 emits the ranges only from its V1 model runner, so traced engines run it (unless `VLLM_USE_V2_MODEL_RUNNER` is set); its V2 default accepts the flag and ignores it. The ranges cost host time on every module call, so A/B engines never carry them and keep vLLM's default runner. `GITM_VLLM_NVTX=0` turns them off.
 
+**Off by default on AMD.** Two Kimi K2.5 runs on MI355X with the labels on hung at the first traced decode: rocprofiler reported stuck signals, kernels stopped after 37 s, and vLLM timed out. The labels did arrive, with correct module names. Which part hangs (marker tracing, per-call HIP API tracing, the roctx shim or the V1 runner) is not isolated yet. `GITM_VLLM_NVTX=1` opts in.
+
 **Failures don't freeze or crash the run.**
 - **A hang:** a build or decode that runs past its deadline is killed (`GITM_BUILD_TIMEOUT_S`, default 3600; `GITM_DECODE_TIMEOUT_S`, default 1800). If killing frees nothing, the call is abandoned 60 s later.
 - **A failed candidate** is rolled back.
