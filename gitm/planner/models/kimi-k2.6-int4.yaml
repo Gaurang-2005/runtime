@@ -1,0 +1,39 @@
+# moonshotai/Kimi-K2.6 — Moonshot's own release, KimiK25ForConditionalGeneration,
+# int4 routed experts exactly as kimi-k2.5.
+# Source: https://huggingface.co/moonshotai/Kimi-K2.6/blob/main/config.json
+#
+# Not the NVFP4 build (kimi-k2.6.yaml, nvidia/Kimi-K2.6-NVFP4): that one stores
+# its experts in FP4 and runs W4A4 only on Blackwell. This is the checkpoint a
+# Hopper node serves, and the one on the H200s. Its config.json differs from
+# K2.5's in eos_token_id alone (163585 -> 163586), so the whole spec, precision
+# included, is inherited; nothing is overridden.
+
+name: moonshotai/Kimi-K2.6
+extends: kimi-k2.5
+description: >
+  Kimi K2.6, Moonshot's release: the K2.5 text model and precision. 61 layers,
+  hidden 7168, dense MLA (kv_lora_rank 512), layer 0 dense FFN, layers 1-60 MoE
+  (384 experts, top-8, one shared). Routed experts int4 (compressed-tensors
+  W4A16, group 32); everything else bf16.
+
+provenance:
+  verified:
+    - claim: same text model and precision as kimi-k2.5
+      detail: >
+        config.json (read 2026-10-15), flattened and compared key by key with
+        moonshotai/Kimi-K2.5's: the only differences are eos_token_id and
+        text_config.eos_token_id, 163585 -> 163586. quantization_config is
+        identical: compressed-tensors pack-quantized, int4 symmetric, group 32,
+        with self_attn, shared_experts, the dense MLP, lm_head and the vision
+        tower excluded.
+    - claim: predicted weight bytes match the published checkpoint
+      detail: >
+        595.18 GB over 64 safetensors shards (Hub tree API, 2026-10-15),
+        against 595.19 GB for K2.5; model_weight_bytes predicts the same
+        594.20 GB for both, the residual being the unmodelled vision tower.
+  estimated:
+    - field: MLA absorption, moe_router and attn_score_value precision
+      value: carried from kimi-k2.5
+      detail: Same model; see kimi-k2.5.yaml for each.
+  unmodelled:
+    - The vision tower (MoonViT) and mm_projector. Text requests never enter them.

@@ -882,6 +882,31 @@ def test_kimi_k26_weight_bytes_match_published_checkpoint():
     assert abs(model_weight_bytes(load_spec("kimi-k2.6")) / 595.19e9 - 1.0) < 0.005
 
 
+def test_moonshot_kimi_k26_is_the_k25_model_and_prices_on_h200():
+    """moonshotai/Kimi-K2.6 is the checkpoint on the H200s. Without an entry a
+    run there fell back to a default graph with unpriced floors. Its config.json
+    differs from K2.5's in eos_token_id alone, so everything but the name is
+    inherited, and it is not the NVFP4 build (which needs Blackwell)."""
+    from dataclasses import fields
+
+    from gitm.planner.context import hardware_spec_for, peak_for_sku
+
+    for ref in ("moonshotai/Kimi-K2.6", "kimi-k2.6-int4",
+                "/hf/hub/models--moonshotai--Kimi-K2.6/snapshots/abc"):
+        assert load_entry(ref)["name"] == "moonshotai/Kimi-K2.6"
+    assert load_entry("nvidia/Kimi-K2.6-NVFP4")["name"] == "nvidia/Kimi-K2.6-NVFP4"
+
+    k26, k25 = load_spec("moonshotai/Kimi-K2.6"), load_spec("kimi-k2.5")
+    assert [f.name for f in fields(k26) if getattr(k26, f.name) != getattr(k25, f.name)] == ["name"]
+    assert abs(model_weight_bytes(k26) / 595.18e9 - 1.0) < 0.005
+
+    graph, family = predict("moonshotai/Kimi-K2.6", hardware_spec_for(peak_for_sku("H200")),
+                            BatchConfig(batch=64, kv_cache_len=1024), ShardingConfig(tp=8))
+    ops = {n.op for n in graph.nodes}
+    assert family == "glm_moe_dsa"
+    assert {"attn_q_a", "attn_kv_b", "attn_score_value", "moe_routed", "moe_shared"} <= ops
+
+
 def test_generic_fp8_kv_prices_the_rope_slice_at_one_byte():
     """`--kv-cache-dtype fp8` on dense MLA stores the whole 576-dim entry at one
     byte. The default keeps the RoPE key at bf16, 64 B more per entry — right
