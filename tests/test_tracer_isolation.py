@@ -277,3 +277,46 @@ def test_layer_labels_can_be_opted_into_on_amd(tmp_path, monkeypatch):
     seen, _ = _engines_with_nvtx(tmp_path, monkeypatch)
     opening, candidate, baseline, retrace = seen
     assert opening[0] and retrace[0] and not candidate[0] and not baseline[0]
+
+
+def test_the_opening_capture_is_eager_and_the_baseline_is_stock_vllm(tmp_path, monkeypatch):
+    """The opening engine is traced, so it runs eager, as a re-trace does. The
+    baseline the loop swaps in before the first A/B is built from the recorded
+    configuration, which is vLLM's default unless GITM_VLLM_ENFORCE_EAGER asks
+    otherwise: a keep has to beat stock vLLM, not an eager engine gitm forced."""
+    from gitm.scheduler.loop import LoopConfig
+    from gitm.workloads import get_factory
+
+    seen: list = []
+    _fake_vllm(monkeypatch, seen)
+    monkeypatch.setenv(injection.ENV_LIB, "/x/libgitm_inject.so")
+    monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "t.jsonl"))
+    monkeypatch.delenv("GITM_VLLM_ENFORCE_EAGER", raising=False)
+    for var, val in (("GITM_VLLM_PROMPTS", "2"), ("GITM_VLLM_MAX_TOKENS", "3")):
+        monkeypatch.setenv(var, val)
+    monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)
+
+    opening = get_factory("vllm-decode")(LoopConfig(workload="vllm-decode")).engine
+    assert seen[-1] == ("/x/libgitm_inject.so", True)            # traced, and eager
+    assert "enforce_eager" not in opening.gitm_llm_kwargs
+    baseline = opening.gitm_untraced_rebuild_fn(opening)
+    assert seen[-1] == (None, None)                               # untraced, vLLM's default
+    assert not baseline.gitm_traced
+
+
+def test_enforce_eager_still_makes_the_baseline_eager(tmp_path, monkeypatch):
+    from gitm.scheduler.loop import LoopConfig
+    from gitm.workloads import get_factory
+
+    seen: list = []
+    _fake_vllm(monkeypatch, seen)
+    monkeypatch.setenv(injection.ENV_LIB, "/x/libgitm_inject.so")
+    monkeypatch.setenv(injection.ENV_OUT, str(tmp_path / "t.jsonl"))
+    monkeypatch.setenv("GITM_VLLM_ENFORCE_EAGER", "1")
+    for var, val in (("GITM_VLLM_PROMPTS", "2"), ("GITM_VLLM_MAX_TOKENS", "3")):
+        monkeypatch.setenv(var, val)
+    monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)
+
+    opening = get_factory("vllm-decode")(LoopConfig(workload="vllm-decode")).engine
+    opening.gitm_untraced_rebuild_fn(opening)
+    assert seen[-1] == (None, True)
