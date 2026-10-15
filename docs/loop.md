@@ -207,6 +207,7 @@ Only one engine is ever on the GPU. Parallel mode, where both are resident, is u
    - the minimum effect is `GITM_MIN_EFFECT`, 1% by default;
    - until the first A/A sample exists, the threshold is 2%.
 4. **Autoresearch candidates always get at least 2 rounds:** it tries many guesses, so a lucky single A/B is likelier there.
+5. **The run ends with one end-to-end A/B.** Each keep was judged against whatever was running then, so kept gains were never measured together, and their sum is not a result. After the last candidate, the original configuration is rebuilt and the final one is tried against it as a single candidate, with the same rounds and threshold. That number goes in the summary (`final_check`), the report and `final_check.json`. It runs only when something was kept and the budget allows; `GITM_FINAL_CHECK=0` turns it off.
 
 On an RTX 4050 (Qwen2.5-0.5B, 256 × 512), identical builds differ by about 0.45%, so the threshold is about 1%. The previous rule, "keep if ≥ 0", kept 8 of 15 changes that did nothing.
 
@@ -254,6 +255,7 @@ Everything lands in `$GITM_SCRATCH/runs/<run_id>/`.
 | `rerank.json` | 4 | Each re-rank: order before and after, causes, whether lost time was used |
 | `autoresearch.json` | 4b | Proposals, outcomes, why it stopped |
 | `collective_health.json` | 0 | The GPU health check's result |
+| `final_check.json` | 4b | The run's end-to-end A/B: the configuration it started from against the one it ends with |
 | `noise_floor.json` | 4 | The A/A samples, the floor, and the threshold for 1 round and for this run's validation level |
 | `verification.json` | 4–5 | The A/B behind every claim |
 | `degradations.json`, `report.md` | 5 | Every fallback the run took, and the summary |

@@ -547,3 +547,63 @@ def test_an_engine_a_retrace_swaps_in_is_a_fresh_build():
     app.install(box.build("A"))             # what the re-trace leaves running
     app.snapshot()
     assert app.noise.samples == pytest.approx([0.0, 0.01])
+
+
+# --------------------------------------------------------------------------- #
+# the end-to-end check                                                         #
+# --------------------------------------------------------------------------- #
+def _config_engines(speed):
+    """Engines whose throughput is a function of their configuration."""
+    class E:
+        def __init__(self, kwargs):
+            self.gitm_llm_kwargs = dict(kwargs)
+            self.gitm_untraced_rebuild_fn = lambda old: E(old.gitm_llm_kwargs)
+
+    built: list[dict] = []
+
+    def make(kwargs):
+        built.append(dict(kwargs))
+        return E(kwargs)
+
+    def applicator(start):
+        return LiveEngineApplicator(
+            make(start), throughput_fn=lambda e: speed(e.gitm_llm_kwargs),
+            restart_fn=lambda old, kv: make({**old.gitm_llm_kwargs, **kv}),
+            baseline_restart_fn=lambda old: make(old.gitm_llm_kwargs),
+            restart_mode="serial", noise_gate=True, validation=2, min_effect=0.01,
+            threshold_without_floor=0.02)
+
+    return applicator, built
+
+
+def test_the_final_check_measures_the_end_against_the_start(monkeypatch):
+    from gitm.scheduler.loop import _final_check
+
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(lambda e: None))
+    def speed(kw):
+        return 1000.0 * (1.05 if not kw.get("enforce_eager", True) else 1.0)
+
+    make_app, built = _config_engines(speed)
+    app = make_app({"enforce_eager": False, "max_num_seqs": 64})   # where the run ended
+    out = _final_check(app, {"enforce_eager": True, "max_num_seqs": 64})
+    assert out["changed"] == {"enforce_eager": False}
+    assert out["original_tps"] == pytest.approx(1000.0) and out["final_tps"] == pytest.approx(1050.0)
+    assert out["delta"] == pytest.approx(0.05) and out["holds"]
+    assert {"enforce_eager": True, "max_num_seqs": 64} in built     # the original was rebuilt
+
+
+def test_a_final_configuration_that_does_not_hold_up_says_so(monkeypatch):
+    from gitm.scheduler.loop import _final_check
+
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(lambda e: None))
+    make_app, _ = _config_engines(lambda kw: 1000.0)               # nothing changes speed
+    out = _final_check(make_app({"block_size": 32}), {"block_size": 16})
+    assert out["delta"] == pytest.approx(0.0) and not out["holds"]
+
+
+def test_no_final_check_when_nothing_was_kept():
+    from gitm.scheduler.loop import _final_check
+
+    make_app, built = _config_engines(lambda kw: 1000.0)
+    out = _final_check(make_app({"block_size": 16}), {"block_size": 16})
+    assert "skipped" in out and len(built) == 1                     # nothing rebuilt

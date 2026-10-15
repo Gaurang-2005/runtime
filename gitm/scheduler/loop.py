@@ -31,6 +31,7 @@ from gitm.agents.autoresearch import (
 from gitm.agents.policy import Policy, select_interventions
 from gitm.agents.targeting import targets_from_recoverable
 from gitm.kernels.library import load_library, parse_skips, skipped_by
+from gitm.kernels.spec import InterventionSpec
 from gitm.optimizer.apply import (
     Applicator,
     DryRunApplicator,
@@ -152,6 +153,50 @@ def _next_cycle_overruns(elapsed_s: float, budget_s: float,
             return (f"{left / 60:.0f} min left, and a candidate has taken "
                     f"{mean / 60:.0f} min on average")
     return None
+
+
+def _final_check(applicator: LiveEngineApplicator, original: dict[str, Any]) -> dict[str, Any]:
+    """The run's one end-to-end number: the configuration it started from
+    against the one it ends with, measured as a single A/B.
+
+    Each keep was judged against whatever was running at the time, so kept
+    gains were never measured together, and a sum of them is not a result.
+    Here the original configuration is rebuilt and the final one is tried
+    against it as one joint candidate, with the same alternating rounds and
+    noise threshold as every other candidate. The engine left running is the
+    final configuration if it held up, the original if it did not.
+    """
+    engine = applicator.engine
+    final = dict(getattr(engine, "gitm_llm_kwargs", None) or {})
+    changed = {k: v for k, v in final.items() if original.get(k) != v}
+    if not changed:
+        return {"skipped": "the final configuration is the original one"}
+    if any(k not in final for k in original):
+        return {"skipped": "a kept change removed a setting, which a candidate cannot express"}
+    rebuild = getattr(engine, "gitm_untraced_rebuild_fn", None)
+    if not callable(rebuild):
+        return {"skipped": "the engine cannot rebuild a configuration"}
+    import types
+
+    LiveEngineApplicator._shutdown(engine)
+    applicator.rebase(rebuild(types.SimpleNamespace(gitm_llm_kwargs=dict(original))))
+    label = ",".join(f"{k}={v}" for k, v in sorted(changed.items()))
+    spec = InterventionSpec(
+        name="final_check", summary="the final configuration against the original one",
+        knob=label, knobs=changed, expected_delta_mean=0.0, expected_delta_lo=0.0,
+        expected_delta_hi=0.0, source="final_check")
+    result = apply_intervention(spec, applicator, min_keep_delta=0.0)
+    ab = applicator.last_result
+    out: dict[str, Any] = {"changed": changed, "error": result.error}
+    if ab is not None and result.measured_delta is not None:
+        # measure() returns the margin over the bar; the change itself is that
+        # margin plus the bar, the mean of the rounds' ratios.
+        bar = ab.threshold or 0.0
+        out.update(
+            original_tps=ab.baseline_tps, final_tps=ab.candidate_tps,
+            delta=result.measured_delta + bar, threshold=bar, rounds=ab.rounds,
+            holds=bool(result.kept))
+    return out
 
 
 _BUDGET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
@@ -1701,6 +1746,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # which is what a re-rank has to re-order — and a candidate already popped,
     # applied or rejected, cannot return.
     queue = list(ranked)
+    # The configuration every candidate is first measured against, for the
+    # end-to-end check after the last one (_final_check).
+    original_config = dict(getattr(getattr(applicator, "engine", None),
+                                   "gitm_llm_kwargs", None) or {})
     reranks: list[dict[str, Any]] = []
     # Set when a candidate's rollback failed. From then on there is no baseline
     # to measure against, so the run stops trying candidates and goes straight
@@ -2106,6 +2155,24 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # file written before that pass would report none of them.
     _write_skips()
 
+    # One end-to-end A/B: where the run started against where it ended. Only
+    # when something was kept, the engine is live and the budget can afford a
+    # candidate's worth of time.
+    final_check: dict[str, Any] | None = None
+    if (isinstance(applicator, LiveEngineApplicator) and engine_lost is None
+            and applicator.engine is not None
+            and os.environ.get("GITM_FINAL_CHECK", "1") != "0"):
+        overrun = _next_cycle_overruns((time.time_ns() - started_ns) / 1e9, budget_s, cycle_s)
+        if overrun is not None:
+            final_check = {"skipped": f"budget {cfg.budget}: {overrun}"}
+        else:
+            try:
+                final_check = _final_check(applicator, original_config)
+            except RestoreFailed as exc:
+                final_check = {"skipped": f"could not rebuild a configuration: {exc}"}
+        (run_dir / "final_check.json").write_text(json.dumps(final_check, indent=2,
+                                                              default=str))
+
     # A kept restart replaced the engine and released the one cfg.engine still
     # points at: hand the caller the live engine, not a shut-down handle.
     if cfg.engine is not None:
@@ -2229,6 +2296,13 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             else None
         ),
     )
+    if final_check and "delta" in final_check:
+        report_md += (
+            "\n## Final check\n\nThe configuration this run ends with, against the one it "
+            f"started from, as one A/B: {final_check['original_tps']:.1f} -> "
+            f"{final_check['final_tps']:.1f} tok/s, {final_check['delta']:+.1%} "
+            f"(threshold {final_check['threshold']:.1%}): "
+            f"{'holds' if final_check['holds'] else 'does not clear the noise'}.\n")
     _write_report(run_dir, report_md)
 
     if isinstance(applicator, LiveEngineApplicator):
@@ -2289,6 +2363,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         "validation": _validation,
         "noise_floor": (applicator.noise.floor
                         if isinstance(applicator, LiveEngineApplicator) else None),
+        # Where the run started against where it ended, as one A/B.
+        "final_check": final_check,
         "scheduler_stats": asdict(sched_summary) if sched_stats.samples else None,
         "report_path": str(run_dir / "report.md"),
     }
