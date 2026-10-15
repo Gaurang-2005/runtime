@@ -818,7 +818,7 @@ def main(argv: list[str] | None = None) -> int:
             # The report is complete for what was tried, but the run stopped
             # early with the engine in an unknown state. A job that exits 0 here
             # reads as a finished run to whatever scheduled it.
-            print(f"gitm run: stopped early, the engine could not be restored: "
+            print(f"gitm run: stopped early, no engine to measure on: "
                   f"{summary['engine_lost']}", file=sys.stderr)
             return 5
         return 0

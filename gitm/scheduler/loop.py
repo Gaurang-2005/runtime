@@ -991,8 +991,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # carries it as ``.engine`` (see the vllm-decode factory). Without this the
     # loop stays predict-only (DryRunApplicator, live=False) — the engine is
     # built but never handed to the applicator.
+    engine_from_runner = False
     if cfg.engine is None and runner is not None:
         cfg.engine = getattr(runner, "engine", None)
+        engine_from_runner = cfg.engine is not None
 
     # A factory-built runner may know its own workload id better than the
     # guessed/default one above (e.g. a caller passed ``workload_runner``
@@ -1019,6 +1021,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # trace can't see. A no-op when no engine is attached (empty series).
     run_out: Any = None
     runner_s: float | None = None
+    # The runner ran and raised with a live engine under it: unlike a runner
+    # that was never available, this leaves no measured baseline to A/B against.
+    run_failed_on_engine = False
     with (
         capture(trace_path, workload_id=workload, run_id=run_id) as trace,
         sample_scheduler_stats(cfg.engine) as sched_stats,
@@ -1030,6 +1035,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 sync_device()  # ensure all kernels land in the trace before stop
             except Exception as exc:
                 runner_error = f"workload run failed: {exc}"
+                run_failed_on_engine = cfg.engine is not None
             runner_s = time.perf_counter() - _t_run
     if runner_error is not None:
         # Carried on every path, not only the no-data one: a runner that failed
@@ -1534,6 +1540,21 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # One extra engine build, once.
     tracing_swaps: list[dict[str, Any]] = []
     early_engine_lost: str | None = None
+    if run_failed_on_engine:
+        # The opening run failed on the live engine, so no baseline was measured
+        # and the trace is a fragment. Every A/B would be judged against an
+        # engine that just failed, and ranked from that fragment: two Kimi K2.5
+        # runs on MI355X hung at the opening decode, and the loop built a fresh
+        # engine and carried on into an hours-long Phase 4. Stop instead, with
+        # the report saying why.
+        early_engine_lost = f"the opening workload run failed: {runner_error}"
+        degradations.record(
+            ENGINE_LOST, used="no live A/B (predict-only)",
+            reason=early_engine_lost, severity=APPROXIMATE,
+            affects=(AFFECTS_CLAIMS,))
+        if engine_from_runner:
+            LiveEngineApplicator._shutdown(cfg.engine)
+        cfg.engine = None
     if cfg.engine is not None and getattr(cfg.engine, "gitm_traced", False):
         untraced = getattr(cfg.engine, "gitm_untraced_rebuild_fn", None)
         if callable(untraced):
@@ -1687,9 +1708,12 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # how many re-traces in a row were skipped (see _retrace_skip_reason).
     causes_seen = bool(_motivated)
     retrace_skips = 0
-    if engine_lost is not None and isinstance(applicator, LiveEngineApplicator):
-        # The engine was lost before the first candidate (a failed noise
-        # calibration): there is nothing to measure them against.
+    if engine_lost is not None:
+        # The engine was lost before the first candidate (a failed opening run,
+        # tracer swap or noise calibration): there is nothing to measure them
+        # against. Cleared whichever applicator is left, not only a live one: a
+        # predict-only queue would still re-trace, re-running the workload on
+        # the engine that was just released.
         n_untried = sum(1 for x in queue if x.rejected_reason is None)
         rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
                         for x in queue if x.rejected_reason is not None)

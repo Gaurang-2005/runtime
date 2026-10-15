@@ -190,6 +190,7 @@ Only one engine is ever on the GPU. Parallel mode, where both are resident, is u
   - candidates stop, and the run records "engine lost";
   - the report is still written;
   - the run exits 5.
+- **An opening run that fails on the engine** (a hang the watchdog kills, a crash) stops the run the same way, before any candidate. There is no measured baseline, and the trace is a fragment, so nothing is A/B-tested or ranked from it.
 - **Results are saved as they happen:** `verification.json` is rewritten after every A/B, so a run that's killed keeps what it measured.
 
 **Re-ranking** (`--rerank recapture`):
