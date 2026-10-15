@@ -125,7 +125,7 @@ If earlier runs left results, the CLI asks whether to rank this run from them, u
 - On NVIDIA it's CUPTI, via `CUDA_INJECTION64_PATH`. On AMD it's rocprofiler-sdk, via `ROCP_TOOL_LIBRARIES`.
 - The driver reads these once, when a process starts using the GPU. So they must be exported before `gitm run` starts; nothing can add them to a running engine.
 - On AMD the engine workers start with spawn rather than fork: a forked worker keeps the GPU runtime but loses the profiler.
-- **On AMD, run the opening capture eager** (`GITM_VLLM_ENFORCE_EAGER=1`). rocprofiler's queue interposition can deadlock against graph replay. It's a ROCm bug (vLLM #56506, ROCm #11623), and this setting avoids it.
+- **Traced engines always run eager,** the opening capture as well as every re-trace. Graph replay hides decode kernels from the tracer, and on AMD rocprofiler's queue interposition can deadlock against it (vLLM #56506, ROCm #11623). The A/B baseline is not traced, so it keeps vLLM's defaults (graphs, compile), and a keep has to beat stock vLLM. `GITM_VLLM_ENFORCE_EAGER=1` makes the baseline eager too, which only makes builds faster.
 
 **The scheduler** is sampled over the same window through `LLM.get_metrics()`. On vLLM 0.30 the scheduler runs in a separate EngineCore process, so its state is only visible there. It records:
 - running and queued requests;
@@ -264,7 +264,6 @@ Everything lands in `$GITM_SCRATCH/runs/<run_id>/`.
 export CUDA_INJECTION64_PATH=...           # NVIDIA tracer, or ROCP_TOOL_LIBRARIES on AMD; before the run
 export GITM_TRACE_OUT=/path/to/fresh.jsonl # a fresh path per capture: shared, two runs' shards mix
 export GITM_VLLM_MODEL=Qwen/Qwen2.5-0.5B-Instruct
-export GITM_VLLM_ENFORCE_EAGER=1           # required on AMD for the traced opening capture
 
 gitm run --workload vllm-decode --budget 2h --rerank recapture --validation 2
 ```
