@@ -991,10 +991,13 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # carries it as ``.engine`` (see the vllm-decode factory). Without this the
     # loop stays predict-only (DryRunApplicator, live=False) — the engine is
     # built but never handed to the applicator.
-    engine_from_runner = False
+    # Whether this run owns the engine: the loop built the runner from the
+    # workload registry, and the engine came with it. A runner the caller
+    # passed is the caller's, and so is any engine it carries.
+    engine_built_here = False
     if cfg.engine is None and runner is not None:
         cfg.engine = getattr(runner, "engine", None)
-        engine_from_runner = cfg.engine is not None
+        engine_built_here = cfg.engine is not None and cfg.workload_runner is None
 
     # A factory-built runner may know its own workload id better than the
     # guessed/default one above (e.g. a caller passed ``workload_runner``
@@ -1552,7 +1555,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             ENGINE_LOST, used="no live A/B (predict-only)",
             reason=early_engine_lost, severity=APPROXIMATE,
             affects=(AFFECTS_CLAIMS,))
-        if engine_from_runner:
+        if engine_built_here:
             LiveEngineApplicator._shutdown(cfg.engine)
         cfg.engine = None
     if cfg.engine is not None and getattr(cfg.engine, "gitm_traced", False):

@@ -779,8 +779,10 @@ def test_a_failed_opening_run_stops_the_run_instead_of_ranking_a_fragment(tmp_pa
     monkeypatch.setattr(loop, "autoresearch", lambda *a, **kw: applies.append("ar"))
     monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(released.append))
 
-    out = loop.run_loop(loop.LoopConfig(budget="5h", scratch=str(tmp_path),
-                                        workload_runner=_HangingRunner(), rerank="recapture"))
+    # The loop built this runner (from the registry), so the engine is the run's.
+    monkeypatch.setattr(loop, "get_factory", lambda w: lambda cfg: _HangingRunner())
+    out = loop.run_loop(loop.LoopConfig(workload="vllm-decode", budget="5h",
+                                        scratch=str(tmp_path), rerank="recapture"))
     s = out["summary"]
     assert applies == [] and built == []
     assert len(released) == 1
@@ -809,3 +811,26 @@ def test_a_callers_engine_is_not_released_when_no_runner_was_available(tmp_path,
     out = loop.run_loop(loop.LoopConfig(engine=object(), workload="vllm-decode",
                                         budget="30s", scratch=str(tmp_path)))
     assert "opening workload run failed" not in str(out["summary"].get("engine_lost"))
+
+
+def test_a_callers_runner_keeps_its_engine_when_the_opening_run_fails(tmp_path, monkeypatch):
+    """Review finding: a workload_runner the caller passed carries the caller's
+    engine. The run still stops, but leaves that engine for the caller."""
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        yield _trace(run_id or "r")
+
+    class _CallersRunner(_Runner):
+        engine = object()
+
+        def __call__(self) -> dict:
+            raise TimeoutError("RPC call to sample_tokens timed out")
+
+    released: list = []
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(released.append))
+    out = loop.run_loop(loop.LoopConfig(budget="5h", scratch=str(tmp_path),
+                                        workload_runner=_CallersRunner()))
+    assert released == []
+    assert "opening workload run failed" in out["summary"]["engine_lost"]
