@@ -155,6 +155,43 @@ def _next_cycle_overruns(elapsed_s: float, budget_s: float,
     return None
 
 
+def _engine_arg_default(knob: str) -> Any:
+    """vLLM's own default for an engine argument, or ``None`` when it has none
+    or decides at run time (vLLM's ``None``), or vLLM is not installed."""
+    try:
+        import dataclasses
+
+        from vllm.engine.arg_utils import EngineArgs
+    except Exception:  # noqa: BLE001 - no vLLM: nothing to compare against
+        return None
+    for f in dataclasses.fields(EngineArgs):
+        if f.name == knob:
+            return None if f.default is dataclasses.MISSING else f.default
+    return None
+
+
+def _already_set(engine: Any, spec: Any) -> str | None:
+    """Why ``spec`` would change nothing on ``engine``, or ``None``.
+
+    A candidate that sets what the engine already runs builds an identical
+    engine and measures noise: with the baseline at vLLM's defaults,
+    cuda_graphs_enable (enforce_eager=False) is exactly that, and on Kimi a
+    candidate costs two or three engine builds. The engine's recorded
+    configuration answers for what it states; vLLM's own EngineArgs default for
+    what it does not. A default vLLM resolves at run time (``None``), a relative
+    value, and an engine with no recorded configuration are never skipped.
+    """
+    kwargs = getattr(engine, "gitm_llm_kwargs", None)
+    if kwargs is None or getattr(spec, "value_multiplier", None) is not None:
+        return None
+    values = spec.knob_values
+    for k, v in values.items():
+        current = kwargs[k] if k in kwargs else _engine_arg_default(k)
+        if current is None or v is None or current != v:
+            return None
+    return "the engine already runs " + ", ".join(f"{k}={v}" for k, v in values.items())
+
+
 def _final_check(applicator: LiveEngineApplicator, original: dict[str, Any]) -> dict[str, Any]:
     """The run's one end-to-end number: the configuration it started from
     against the one it ends with, measured as a single A/B.
@@ -1827,6 +1864,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         if cfg.engine is not None and live_restart_fn is None and _has_structural_knob(c.spec):
             rejected.append(f"{c.spec.name} (structural knob: needs engine restart, no restart_fn)")
             continue
+        noop = _already_set(getattr(applicator, "engine", None), c.spec)
+        if noop is not None:
+            rejected.append(f"{c.spec.name} ({noop})")
+            continue
         cycle_started_ns = time.time_ns()
         # Snapshot the engine config BEFORE the apply: a hot-swap mutates these
         # kwargs in place and a restart replaces the engine outright, so reading
@@ -2081,6 +2122,9 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                 and _has_structural_knob(spec)
             ):
                 return "structural knob: needs engine restart, no restart_fn"
+            noop = _already_set(getattr(applicator, "engine", None), spec)
+            if noop is not None:
+                return noop
             values = spec.knob_values
             # The engine running *now*: a Phase-4 restart that was kept has
             # replaced cfg.engine, and a prerequisite it turned on (or off) is

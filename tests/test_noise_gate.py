@@ -639,3 +639,42 @@ def test_a_final_check_that_loses_its_baseline_reports_a_lost_engine(monkeypatch
     make_app, _ = _config_engines(lambda kw: 1000.0)
     out = _final_check(make_app({"block_size": 32}), {"block_size": 16})
     assert "baseline decode timed out" in out["engine_lost"]
+
+
+# --------------------------------------------------------------------------- #
+# candidates that change nothing                                               #
+# --------------------------------------------------------------------------- #
+def _engine(**kwargs):
+    e = type("E", (), {})()
+    e.gitm_llm_kwargs = dict(kwargs)
+    return e
+
+
+def test_a_candidate_the_engine_already_runs_is_skipped(monkeypatch):
+    """With the baseline at vLLM's defaults, cuda_graphs_enable sets
+    enforce_eager=False, which is already vLLM's default: an identical engine,
+    measured for nothing."""
+    from gitm.scheduler import loop
+
+    defaults = {"enforce_eager": False, "max_num_seqs": None}
+    monkeypatch.setattr(loop, "_engine_arg_default", lambda k: defaults.get(k))
+    graphs = _spec("enforce_eager", False)
+
+    assert "enforce_eager=False" in loop._already_set(_engine(), graphs)
+    assert loop._already_set(_engine(enforce_eager=True), graphs) is None   # an eager baseline
+    assert "already" in loop._already_set(_engine(max_num_seqs=64), _spec("max_num_seqs", 64))
+    # vLLM decides at run time: not known to be a no-op, so it is tried.
+    assert loop._already_set(_engine(), _spec("max_num_seqs", 256)) is None
+    # A joint candidate is a no-op only if every knob is.
+    joint = _spec("enforce_eager", False).model_copy(
+        update={"knobs": {"enforce_eager": False, "max_num_seqs": 128}})
+    assert loop._already_set(_engine(max_num_seqs=64), joint) is None
+
+
+def test_a_relative_value_or_an_unknown_engine_is_never_skipped(monkeypatch):
+    from gitm.scheduler import loop
+
+    monkeypatch.setattr(loop, "_engine_arg_default", lambda k: 8192)
+    relative = _spec("max_num_batched_tokens", 8192).model_copy(update={"value_multiplier": 2.0})
+    assert loop._already_set(_engine(), relative) is None
+    assert loop._already_set(object(), _spec("max_num_batched_tokens", 8192)) is None
