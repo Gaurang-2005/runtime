@@ -685,9 +685,32 @@ def test_linear_attention_settings_are_not_tried_on_a_model_without_it():
     from gitm.scheduler.loop import _not_for_this_model
 
     for knob in ("gdn_prefill_backend", "kda_prefill_backend", "mamba_cache_dtype"):
-        assert "has none" in _not_for_this_model(_spec(knob, "triton"), "dense", None)
-    # A hybrid model has them; a stand-in graph knows nothing about the model.
-    assert _not_for_this_model(_spec("gdn_prefill_backend", "triton"), "hybrid", None) is None
-    assert _not_for_this_model(_spec("gdn_prefill_backend", "triton"), "dense",
-                               "the engine exposes no HF config") is None
-    assert _not_for_this_model(_spec("max_num_seqs", 128), "dense", None) is None
+        assert "declares none" in _not_for_this_model(_spec(knob, "triton"), False)
+    # A model with such layers, or one whose config could not be read: tried.
+    assert _not_for_this_model(_spec("gdn_prefill_backend", "triton"), True) is None
+    assert _not_for_this_model(_spec("gdn_prefill_backend", "triton"), None) is None
+    assert _not_for_this_model(_spec("max_num_seqs", 128), False) is None
+
+
+def test_linear_layers_are_read_from_the_models_own_config(monkeypatch):
+    """Review finding: the planner's family is hybrid only for models that also
+    have experts, so a dense model with linear-attention layers read as having
+    none. Its own config says otherwise."""
+    from gitm.scheduler import loop
+
+    def engine_with(cfg):
+        monkeypatch.setattr(loop, "_hf_config_from_engine", lambda e: cfg)
+        monkeypatch.setattr(loop, "_hf_config_dict", lambda hf: hf)
+        return loop._declares_linear_layers(object())
+
+    qwen2 = {"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"],
+             "num_hidden_layers": 24, "layer_types": ["full_attention"] * 24}
+    assert engine_with(qwen2) is False
+    dense_hybrid = {"model_type": "falcon_h1", "num_hidden_layers": 4}
+    assert engine_with(dense_hybrid) is True
+    by_layer = {"model_type": "x", "layer_types": ["linear_attention", "full_attention"]}
+    assert engine_with(by_layer) is True
+    by_field = {"model_type": "x", "mamba_d_state": 128}
+    assert engine_with(by_field) is True
+    monkeypatch.setattr(loop, "_hf_config_from_engine", lambda e: None)
+    assert loop._declares_linear_layers(object()) is None

@@ -161,24 +161,59 @@ def _next_cycle_overruns(elapsed_s: float, budget_s: float,
 _LINEAR_ATTENTION_KNOBS = ("mamba", "gdn_", "kda_", "linear_attn", "short_conv")
 
 
-def _not_for_this_model(spec: Any, family: str, graph_default_why: str | None) -> str | None:
+#: Config fields and model names that declare layers other than softmax
+#: attention: linear attention, Mamba/SSM, short convolutions, or a per-layer
+#: hybrid pattern. Read from the model's own config, not from the planner's
+#: family, which is ``hybrid`` only for models that also have experts.
+_LINEAR_LAYER_FIELDS = ("linear_", "mamba", "ssm_", "conv_kernel", "short_conv",
+                        "attn_layer_period", "attn_layer_indices",
+                        "full_attention_interval", "hybrid_override_pattern",
+                        "layers_block_type", "block_types")
+_LINEAR_LAYER_NAMES = ("mamba", "jamba", "zamba", "falcon_h1", "nemotron_h", "lfm2",
+                       "kimi_linear", "qwen3_next", "hybrid", "rwkv", "recurrent")
+_SOFTMAX_LAYER_TYPES = ("full_attention", "attention", "sliding_attention",
+                        "chunked_attention", "global", "local")
+
+
+def _declares_linear_layers(engine: Any) -> bool | None:
+    """Whether the engine's model declares any non-softmax-attention layer, or
+    ``None`` when its config cannot be read (then nothing is ruled out)."""
+    from gitm.planner.registry import text_config
+
+    hf = _hf_config_from_engine(engine)
+    if hf is None:
+        return None
+    outer = _hf_config_dict(hf)
+    for cfg in (outer, text_config(outer)):
+        layer_types = cfg.get("layer_types") or ()
+        if any(str(t).lower() not in _SOFTMAX_LAYER_TYPES for t in layer_types):
+            return True
+        if any(str(k).lower().startswith(_LINEAR_LAYER_FIELDS) for k in cfg):
+            return True
+        names = " ".join([str(cfg.get("model_type") or "")]
+                         + [str(a) for a in cfg.get("architectures") or ()]).lower()
+        if any(n in names for n in _LINEAR_LAYER_NAMES):
+            return True
+    return False
+
+
+def _not_for_this_model(spec: Any, has_linear_layers: bool | None) -> str | None:
     """Why ``spec`` configures layers this model does not have, or ``None``.
 
     Autoresearch proposes from every EngineArgs field. On Qwen2.5-0.5B, 8 of 15
     proposals were gdn_/kda_ prefill backends: linear-attention settings on a
     model with none, each an engine rebuild that can only measure noise, and the
-    source of an earlier false keep. The predicted graph already knows the
-    model's family (registry.detect_family, read from its own config), so ask
-    it. A stand-in graph (``graph_default_why`` set) knows nothing about the
-    model, and then nothing is ruled out.
+    source of an earlier false keep. The answer comes from the model's own
+    config (_declares_linear_layers); when that cannot be read, nothing is
+    ruled out.
     """
-    if graph_default_why is not None or family == "hybrid":
+    if has_linear_layers is not False:
         return None
     hits = [k for k in spec.knob_values if any(n in k.lower() for n in _LINEAR_ATTENTION_KNOBS)]
     if not hits:
         return None
-    return (f"{', '.join(hits)} configures linear-attention layers, and this model "
-            f"({family}) has none")
+    return (f"{', '.join(hits)} configures linear-attention or state-space layers, and "
+            "this model's config declares none")
 
 
 def _engine_arg_default(knob: str) -> Any:
@@ -1418,6 +1453,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     # rather than defaulting.
     _batch, _batch_source = _batch_config_from_stats(sched_summary)
     graph, family, graph_default_why = _execution_graph_basis(cfg.engine, _hw, _batch)
+    # Read once: whether the model has layers that linear-attention settings act on.
+    _has_linear_layers = _declares_linear_layers(cfg.engine)
     # The engine the floors are priced for, as it describes itself. A re-rank
     # compares the running engine with this (see _floors_hold).
     _priced_config = dict(getattr(cfg.engine, "gitm_llm_kwargs", None) or {})
@@ -1891,7 +1928,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             rejected.append(f"{c.spec.name} (structural knob: needs engine restart, no restart_fn)")
             continue
         noop = (_already_set(getattr(applicator, "engine", None), c.spec)
-                or _not_for_this_model(c.spec, family, graph_default_why))
+                or _not_for_this_model(c.spec, _has_linear_layers))
         if noop is not None:
             rejected.append(f"{c.spec.name} ({noop})")
             continue
@@ -2150,7 +2187,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             ):
                 return "structural knob: needs engine restart, no restart_fn"
             noop = (_already_set(getattr(applicator, "engine", None), spec)
-                    or _not_for_this_model(spec, family, graph_default_why))
+                    or _not_for_this_model(spec, _has_linear_layers))
             if noop is not None:
                 return noop
             values = spec.knob_values
