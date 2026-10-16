@@ -72,14 +72,18 @@ def parse_spec(spec: str) -> tuple[str, Path]:
     return kind, Path(path)
 
 
-def _block_tokens(block_id: int, n: int, vocab_size: int) -> list[int]:
-    """The same ``n`` token ids for the same block id, every time and on every
-    machine: hashed, not drawn from a seeded RNG whose sequence could shift."""
+def _block_tokens(key: str, n: int, vocab_size: int) -> list[int]:
+    """The same ``n`` token ids for the same key, every time and on every
+    machine: hashed, not drawn from a seeded RNG whose sequence could shift.
+
+    Keys are namespaced (``block:<id>`` for a trace's prefix blocks,
+    ``private:<n>`` for a request's own tail), so no trace block id, negative
+    ones included, can collide with a tail and share tokens it never shared."""
     span = vocab_size - _ID_FLOOR
     out: list[int] = []
     counter = 0
     while len(out) < n:
-        digest = hashlib.blake2b(f"{block_id}:{counter}".encode(), digest_size=64).digest()
+        digest = hashlib.blake2b(f"{key}:{counter}".encode(), digest_size=64).digest()
         for i in range(0, len(digest), 4):
             out.append(_ID_FLOOR + int.from_bytes(digest[i:i + 4], "little") % span)
             if len(out) == n:
@@ -115,14 +119,14 @@ def batch_from_trace(trace: Trace, *, n: int, vocab_size: int,
         ids: list[int] = []
         if req.prefix_blocks and block:
             for b in req.prefix_blocks:
-                ids.extend(_block_tokens(b, block, vocab_size))
+                ids.extend(_block_tokens(f"block:{b}", block, vocab_size))
                 if len(ids) >= req.input_tokens:
                     break
         if len(ids) < req.input_tokens:
             # No prefix identity (BurstGPT), or a chain shorter than the input:
             # the rest is this request's own, shared with nobody.
             unique += 1
-            ids.extend(_block_tokens(-unique, req.input_tokens - len(ids), vocab_size))
+            ids.extend(_block_tokens(f"private:{unique}", req.input_tokens - len(ids), vocab_size))
         batch.prompt_token_ids.append(ids[:req.input_tokens])
         batch.output_tokens.append(req.output_tokens)
     return batch

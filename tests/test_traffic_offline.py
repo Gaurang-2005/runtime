@@ -107,6 +107,9 @@ def test_the_decode_workload_sends_the_traces_requests(tmp_path, monkeypatch):
         def get_tokenizer(self):
             return _Tok()
 
+        def reset_prefix_cache(self):
+            sent.append("reset")
+
         def generate(self, prompts, params):
             sent.append((prompts, params))
             return [types.SimpleNamespace(outputs=[types.SimpleNamespace(
@@ -125,9 +128,24 @@ def test_the_decode_workload_sends_the_traces_requests(tmp_path, monkeypatch):
 
     runner = get_factory("vllm-decode")(LoopConfig(workload="vllm-decode"))
     out = runner()
+    # The cache is emptied before the measured batch, so no measurement starts
+    # warm from the one before it (review finding).
+    assert sent[-2] == "reset"
     prompts, params = sent[-1]
     assert len(prompts) == len(params) == 12
     assert all(isinstance(p, dict) and len(p["prompt_token_ids"]) > 100 for p in prompts)
     assert all(p.ignore_eos for p in params)
     assert out["traffic"]["source"] == "mooncake" and out["traffic"]["requests"] == 12
     assert out["generated_tokens"] == sum(p.max_tokens for p in params)
+
+
+def test_a_private_tail_never_collides_with_a_trace_block():
+    """Review finding: tails used negative ids, and a trace may carry negative
+    block ids too, so two unrelated requests could share tokens."""
+    shared_with_nobody = CanonicalRequest(arrival_s=0, input_tokens=8, output_tokens=1)
+    negative_block = CanonicalRequest(arrival_s=1, input_tokens=8, output_tokens=1,
+                                      prefix_blocks=(-1, -2))
+    batch = batch_from_trace(_trace([shared_with_nobody, negative_block]), n=2,
+                             vocab_size=50_000)
+    a, b = batch.prompt_token_ids
+    assert a[:4] != b[:4]

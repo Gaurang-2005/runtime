@@ -1098,6 +1098,7 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         active = engine_ref.get("engine")
         if active is None:
             raise RuntimeError("vLLM engine is not active")
+        _cold_prefix_cache(active)
         outputs = _with_watchdog(
             lambda: active.generate(prompts, params), what="decode",
             timeout_s=_timeout_s("GITM_DECODE_TIMEOUT_S", 1800.0),
@@ -1124,6 +1125,7 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         on itself, not on the original. (The loop's default probe re-runs the
         original runner, which cannot measure a restarted engine.)
         """
+        _cold_prefix_cache(eng)          # outside the timer
         t0 = time.perf_counter()
         outs = _with_watchdog(
             lambda: eng.generate(prompts, params), what="A/B decode",
@@ -1219,6 +1221,25 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     for name, fn in hooks.items():
         setattr(llm, name, fn)
     return run
+
+def _cold_prefix_cache(llm: Any) -> None:
+    """Empty the engine's prefix cache before a measured batch, outside its timer.
+
+    Requests within one batch still share prefixes, as production's do. What
+    must not carry over is the *previous* measurement: a baseline measured again
+    on the same engine would find the whole batch cached while a freshly built
+    candidate prefills it cold, and with trace prompts thousands of tokens long
+    that gap alone can reject a real gain. Best effort: an engine without the
+    call, or without a prefix cache, has nothing to carry over.
+    """
+    reset = getattr(llm, "reset_prefix_cache", None)
+    if callable(reset):
+        try:
+            reset()
+        except Exception as exc:  # noqa: BLE001 - must not fail the measurement
+            warnings.warn(f"gitm: could not reset the prefix cache: {exc}",
+                          RuntimeWarning, stacklevel=2)
+
 
 def _vocab_size(llm: Any) -> int:
     """The engine's tokenizer vocabulary, for drawing prompt token ids."""
