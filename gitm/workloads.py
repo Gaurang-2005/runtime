@@ -791,6 +791,14 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                               The old 64 x 128 decoded in ~1.4 s on an RTX 4050
                               and finished before the tracer flushed anything
                               (L-4); 256 x 512 traces there and on MI355X.
+        GITM_VLLM_TRAFFIC     "<source>:<path>" (source mooncake | burstgpt): use a
+                              production trace's request shapes instead of the toy
+                              prompts: each request's real input and output length,
+                              and prompts that share exactly the prefix blocks the
+                              requests shared (gitm.traffic.offline). PROMPTS is the
+                              number of requests; MAX_TOKENS is unused. Requests
+                              longer than the engine's context are skipped and
+                              counted, never trimmed.
         GITM_VLLM_KV_DTYPE    kv_cache_dtype for the engine (e.g. "fp8"); unset
                               -> vLLM's "auto". Lets a serial A/B build each leg
                               directly in its dtype, one engine per process, so
@@ -843,8 +851,6 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     # costs rather than switched over.
     if (injection.active_vendor() == "amd"
             and "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ):
-        import warnings
-
         warnings.warn(
             "gitm: vLLM's workers will start with fork. On ROCm a forked "
             "EngineCore records no kernels at TP=1. The gitm command sets "
@@ -1062,8 +1068,31 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
 
     llm = _build_engine(dict(_base_kwargs), traced=True)
     _activate_engine(llm)
-    prompts = [f"Benchmark decode prompt {i}." for i in range(n_prompts)]
-    params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
+    traffic = os.environ.get("GITM_VLLM_TRAFFIC")
+    traffic_summary: dict[str, Any] | None = None
+    if traffic:
+        # Real request shapes from a production trace (gitm.traffic.offline): each
+        # request's own input and output length, and prompts built from its
+        # prefix-block chain so production prefix sharing reaches the prefix
+        # cache. ignore_eos makes every request generate exactly its length, so
+        # every engine in an A/B does the same work.
+        from gitm.traffic.offline import load_batch
+
+        batch = load_batch(traffic, n=n_prompts, vocab_size=_vocab_size(llm),
+                           max_model_len=_max_model_len(llm))
+        if not batch.output_tokens:
+            raise RuntimeError(
+                f"GITM_VLLM_TRAFFIC={traffic}: no usable request "
+                f"(skipped {batch.skipped}); raise GITM_VLLM_MAX_MODEL_LEN")
+        traffic_summary = batch.summary()
+        warnings.warn(f"gitm: vllm-decode traffic from {traffic}: {traffic_summary}",
+                      RuntimeWarning, stacklevel=2)
+        prompts: list[Any] = [{"prompt_token_ids": ids} for ids in batch.prompt_token_ids]
+        params: Any = [SamplingParams(max_tokens=o, temperature=0.0, ignore_eos=True)
+                       for o in batch.output_tokens]
+    else:
+        prompts = [f"Benchmark decode prompt {i}." for i in range(n_prompts)]
+        params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
 
     def run() -> dict[str, Any]:
         active = engine_ref.get("engine")
@@ -1083,6 +1112,7 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             "prompts": len(prompts),
             "generated_tokens": produced,
             "model": model,
+            "traffic": traffic_summary,
             "requests": request_records_from_outputs(outputs),
         }
 
@@ -1189,6 +1219,27 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     for name, fn in hooks.items():
         setattr(llm, name, fn)
     return run
+
+def _vocab_size(llm: Any) -> int:
+    """The engine's tokenizer vocabulary, for drawing prompt token ids."""
+    tok = llm.get_tokenizer()
+    return int(getattr(tok, "vocab_size", None) or len(tok))
+
+
+def _max_model_len(llm: Any) -> int | None:
+    """The context limit the engine was built with, or ``None`` if unreadable."""
+    for path in ("llm_engine.model_config.max_model_len",
+                 "llm_engine.vllm_config.model_config.max_model_len"):
+        obj: Any = llm
+        for attr in path.split("."):
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if isinstance(obj, int):
+            return obj
+    env = os.environ.get("GITM_VLLM_MAX_MODEL_LEN")
+    return int(env) if env else None
+
 
 def _vllm_synthetic_runner(n_prompts: int, max_tokens: int) -> WorkloadRunner:
     """A CPU-only stand-in for the decode loop (no vLLM, no GPU).
