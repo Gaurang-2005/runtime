@@ -545,7 +545,9 @@ class Controller:
             raise ValueError("this server runs without a canary, so it cannot test anything")
         if not knobs:
             raise ValueError("an intervention needs at least one knob")
-        same = unchanged_knobs(self.engines["stable"].spec.serve_args, knobs)
+        stable = self.engines["stable"]
+        resolved = stable.resolved_config() if hasattr(stable, "resolved_config") else {}
+        same = unchanged_knobs(stable.spec.serve_args, knobs, resolved)
         if same:
             raise ValueError(f"stable already runs {same} at the requested value")
         iv = Intervention(id=uuid.uuid4().hex[:10], knobs=dict(knobs), submitter=submitter,
@@ -690,7 +692,7 @@ class Controller:
 
     def _maybe_explore(self) -> Intervention | None:
         """Queue the next catalogue candidate if exploring is on and the canary is idle."""
-        from gitm.server.explore import candidates
+        from gitm.server.explore import candidates, model_facts
         from gitm.server.promotion import knob_key
 
         if (not self.policy["auto_explore"] or self.policy["paused"] or self.probation is not None
@@ -702,7 +704,9 @@ class Controller:
                  if i.stable_args in (None, stable_args)}
         blocked = {r["knobs"] for r in self.state["reverted"]}
         try:
-            todo = candidates(stable_args, tried=tried, blocked=blocked, policy=self.policy)
+            todo = candidates(stable_args, tried=tried, blocked=blocked, policy=self.policy,
+                              resolved=self.engines["stable"].resolved_config(),
+                              facts=model_facts(self.cfg.model, stable_args))
         except Exception as exc:  # noqa: BLE001 - a catalogue problem must not stop serving
             self.event("explore.error", error=str(exc))
             return None

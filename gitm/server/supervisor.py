@@ -129,6 +129,27 @@ class EngineProcess:
         if self.proc is not None:
             shutdown(self.proc)
 
+    def resolved_config(self) -> dict[str, str]:
+        """The configuration vLLM actually resolved, from this engine's own log.
+
+        Some defaults (prefix caching, chunked prefill) are decided by vLLM at
+        startup, so neither the flags nor ``EngineArgs`` can say what is on.
+        The engine prints the resolved values once, in its "Initializing a V1
+        LLM engine ... with config:" line; this reads the simple ``key=value``
+        pairs from the most recent such line. Empty when there is none yet.
+        """
+        import re
+
+        try:
+            text = self.log_path.read_text(errors="replace")
+        except OSError:
+            return {}
+        lines = re.findall(r"Initializing a V1 LLM engine.*", text)
+        if not lines:
+            return {}
+        return dict(re.findall(r"(?:^|, |config: )([a-z_]+)=([^,{}\[\]()]+?)(?=, |$)",
+                               lines[-1]))
+
     def info(self) -> dict[str, Any]:
         return {
             "role": self.spec.role,

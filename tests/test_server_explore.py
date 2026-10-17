@@ -40,3 +40,38 @@ def test_operator_deny_list_applies_to_exploring_too():
     c = keys(candidates([], tried=set(), blocked=set(),
                         policy=merged({"deny_knobs": ["max_num_*"]})))
     assert not any(k.startswith("max_num_") for k in c)
+
+
+def test_what_the_engine_resolved_counts_as_already_running():
+    from gitm.server.canary import unchanged_knobs
+
+    resolved = {"enable_prefix_caching": "True", "kv_cache_dtype": "auto"}
+    assert unchanged_knobs([], {"enable_prefix_caching": True}, resolved) == ["enable_prefix_caching"]
+    assert unchanged_knobs([], {"kv_cache_dtype": "fp8"}, resolved) == []
+    c = keys(candidates([], tried=set(), blocked=set(), policy=merged(None), resolved=resolved))
+    assert "enable_prefix_caching=True" not in c
+
+
+def test_moe_and_multi_gpu_levers_are_skipped_where_they_cannot_apply():
+    dense = keys(candidates([], tried=set(), blocked=set(), policy=merged(None),
+                            facts={"moe": False, "tp": 1}))
+    assert not any(k.startswith(("moe_backend", "enable_eplb", "enable_dbo",
+                                 "disable_custom_all_reduce")) for k in dense)
+    unknown = keys(candidates([], tried=set(), blocked=set(), policy=merged(None),
+                              facts={"moe": None, "tp": 2}))
+    assert any(k.startswith("moe_backend") for k in unknown)   # unreadable config: kept
+    assert any(k.startswith("disable_custom_all_reduce") for k in unknown)
+
+
+def test_resolved_config_is_read_from_the_engines_log(tmp_path):
+    from gitm.server.supervisor import EngineProcess, EngineSpec
+
+    e = EngineProcess(EngineSpec("stable", "m", 8100, []), tmp_path)
+    assert e.resolved_config() == {}
+    e.log_path.write_text("x\nINFO Initializing a V1 LLM engine (v0.30.0) with config: "
+                          "model='m', max_seq_len=8192, enforce_eager=True, "
+                          "compilation_config={'mode': 0}, enable_prefix_caching=True, "
+                          "enable_chunked_prefill=False\n")
+    r = e.resolved_config()
+    assert r["enable_prefix_caching"] == "True" and r["enable_chunked_prefill"] == "False"
+    assert r["max_seq_len"] == "8192"

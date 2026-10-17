@@ -109,11 +109,20 @@ def candidate_args(serve_args: list[str], knobs: dict[str, Any]) -> list[str]:
     return out
 
 
-def unchanged_knobs(serve_args: list[str], knobs: dict[str, Any]) -> list[str]:
-    """Knobs the stable configuration already runs at the requested value."""
+def unchanged_knobs(serve_args: list[str], knobs: dict[str, Any],
+                    resolved: dict[str, str] | None = None) -> list[str]:
+    """Knobs the stable configuration already runs at the requested value.
+
+    The flags answer for what they set. For what they leave at vLLM's default,
+    ``resolved`` (the engine's own resolved configuration, see
+    :meth:`~gitm.server.supervisor.EngineProcess.resolved_config`) answers when
+    it reports the knob; otherwise the knob is treated as unknown, not as same.
+    """
     same = []
     for knob, value in knobs.items():
         cur = current_value(serve_args, knob)
+        if cur is None and resolved and knob in resolved:
+            cur = {"True": True, "False": False}.get(resolved[knob], resolved[knob])
         if cur is None:
             continue
         if isinstance(value, bool) or isinstance(cur, bool):
