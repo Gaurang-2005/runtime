@@ -171,6 +171,33 @@ class CanaryApplicator:
         self.engine.start()
         self.on_change(serve_args)
         self.engine.wait_healthy(self.startup_timeout_s)
+        warm_up(self.engine)
+
+
+def warm_up(engine: EngineProcess, *, concurrent: int = 16) -> None:
+    """A short burst of short and long requests right after a (re)launch.
+
+    The first replay on a fresh engine ran cold: on the laptop its p99 TTFT
+    was 44.6 ms against 37.5 for every later baseline sample, which alone made
+    an arm look worse. A few seconds of mixed traffic pays that cost before
+    anything is measured, without a whole discarded replay per switch.
+    """
+    import concurrent.futures as cf
+
+    model = engine.served_model or engine.spec.model
+    short = "Summarize the idea of paged attention in one sentence."
+    long = " ".join(["The quick brown fox jumps over the lazy dog."] * 220)
+
+    def one(i: int) -> None:
+        try:
+            _post(engine.base_url + "/v1/completions",
+                  {"model": model, "prompt": long if i % 4 == 0 else short,
+                   "max_tokens": 32, "temperature": 0.0}, timeout=120)
+        except Exception:
+            pass  # warm-up is best effort; the measurement will fail loudly if needed
+
+    with cf.ThreadPoolExecutor(concurrent) as pool:
+        list(pool.map(one, range(concurrent * 2)))
 
 
 # ----------------------------------------------------------------- sampler
@@ -234,7 +261,9 @@ class ReplaySampler:
 
     def __init__(self, engine: EngineProcess, plan: ReplayPlan, regime: Regime, *,
                  result_dir: Path, tokenizer: str, timeout_s: float = 3600.0,
-                 cancel: threading.Event | None = None, on_sample=None, stable_load=None):
+                 cancel: threading.Event | None = None, on_sample=None, stable_load=None,
+                 shared_gpu: bool = False, max_stable_rps: float = 0.1, max_retries: int = 2,
+                 quiet_wait_s: float = 300.0):
         self.engine = engine
         self.plan = plan
         self.regime = regime
@@ -244,10 +273,44 @@ class ReplaySampler:
         self.cancel = cancel or threading.Event()
         self.on_sample = on_sample or (lambda arm, index, sample: None)
         self.stable_load = stable_load
+        self.shared_gpu = shared_gpu
+        self.max_stable_rps = max_stable_rps
+        self.max_retries = max_retries
+        self.quiet_wait_s = quiet_wait_s
         self.sequences: list[list[int]] | None = None
         self.reference: list[list[int]] | None = None
 
     def sample(self, arm: str, index: int) -> Sample:
+        """One measurement, repeated when production load spoiled it.
+
+        On a GPU shared with stable, a sample during which stable served more
+        than ``max_stable_rps`` measured the candidate *and* production. On the
+        laptop one such sample (stable at 0.54 req/s) turned a no-effect change
+        into "+6.6%, CI -14%..+28%". It is thrown away, the sampler waits for
+        stable to go quiet, and measures again, up to ``max_retries`` times; the
+        last attempt is kept either way, and isolated_measurement judges it.
+        """
+        attempts = 0
+        while True:
+            s = self._sample_once(arm, index)
+            busy = s.metrics.get("stable_rps", 0.0)
+            if (not self.shared_gpu or self.stable_load is None
+                    or not busy > self.max_stable_rps or attempts >= self.max_retries):
+                s.metrics["remeasured"] = float(attempts)
+                self.on_sample(arm, index, s)
+                return s
+            attempts += 1
+            self._wait_for_quiet()
+
+    def _wait_for_quiet(self) -> None:
+        deadline = time.time() + self.quiet_wait_s
+        while time.time() < deadline and not self.cancel.is_set():
+            now = time.time()
+            if self.stable_load(now - 10.0, now) <= self.max_stable_rps:
+                return
+            time.sleep(5.0)
+
+    def _sample_once(self, arm: str, index: int) -> Sample:
         if self.cancel.is_set():
             raise Cancelled("stopped between samples")
         # Every sample starts from an empty prefix cache, so the second sample on
@@ -283,9 +346,7 @@ class ReplaySampler:
                        agreement(teacher_forced_top1(self.engine, self.sequences),
                                  self.reference))
         wall = time.monotonic() - started
-        s = Sample(metrics=metrics, wall_s=wall, accelerator_s=wall, correctness=correctness)
-        self.on_sample(arm, index, s)
-        return s
+        return Sample(metrics=metrics, wall_s=wall, accelerator_s=wall, correctness=correctness)
 
 
 # ----------------------------------------------------------------- the workload

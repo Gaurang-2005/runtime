@@ -75,3 +75,13 @@ def test_resolved_config_is_read_from_the_engines_log(tmp_path):
     r = e.resolved_config()
     assert r["enable_prefix_caching"] == "True" and r["enable_chunked_prefill"] == "False"
     assert r["max_seq_len"] == "8192"
+
+
+def test_relative_levers_use_vllms_own_default_for_this_gpu():
+    c = candidates([], tried=set(), blocked=set(), policy=merged(None),
+                   defaults={"max_num_batched_tokens": 2048, "max_num_seqs": 256})
+    got = keys(c)
+    assert {"max_num_batched_tokens=1024", "max_num_batched_tokens=4096",
+            "max_num_batched_tokens=8192"} <= set(got)
+    assert "max_num_batched_tokens=16384" not in got     # not built off the catalogue's 8192
+    assert any("vLLM's default for this GPU (2048)" in x["note"] for x in c)

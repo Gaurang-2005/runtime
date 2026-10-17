@@ -21,9 +21,11 @@ A catalogue lever becomes a candidate when:
   exact stable configuration, and it was never reverted.
 
 Relative levers ("x2 the per-step token budget") are resolved against the value
-stable runs. When stable leaves the flag at vLLM's default, the catalogue's own
-reference value is used and the note says so, because vLLM computes some of
-those defaults at startup and the server's flags cannot show them.
+stable runs: its flag if set, else the default vLLM itself picks for this GPU
+(:func:`serve_defaults`), else the catalogue's reference value. The note says
+which. The catalogue's 8192 is the offline default; a server on a small GPU
+gets 2048, so resolving against the catalogue built every multiple off the
+wrong base.
 """
 
 from __future__ import annotations
@@ -68,6 +70,43 @@ def model_facts(model: str, stable_args: list[str]) -> dict[str, Any]:
     return {"moe": moe, "tp": tp}
 
 
+_DEFAULTS_SRC = """
+import json, sys
+from vllm.engine.arg_utils import EngineArgs
+from vllm.usage.usage_lib import UsageContext
+tokens, seqs = EngineArgs.get_batch_defaults(int(sys.argv[1]))
+ctx = UsageContext.OPENAI_API_SERVER
+print(json.dumps({"max_num_batched_tokens": tokens.get(ctx), "max_num_seqs": seqs.get(ctx)}))
+"""
+
+
+def serve_defaults(world_size: int = 1, gpus: str | None = None) -> dict[str, int]:
+    """The batch limits ``vllm serve`` picks for this GPU when the flags leave them unset.
+
+    vLLM decides them at startup from the device (``EngineArgs.get_batch_defaults``):
+    on anything smaller than an H100 a server gets ``max_num_batched_tokens=2048``,
+    a quarter of the offline 8192, under a "tune the default values for other
+    hardware" TODO. Neither the flags nor the engine's logged config show it, so
+    vLLM's own function is asked, in a subprocess on stable's GPUs: it has to
+    read the device, and the controller should not hold a CUDA context.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+
+    env = os.environ.copy()
+    if gpus is not None:
+        env["CUDA_VISIBLE_DEVICES"] = gpus
+    try:
+        p = subprocess.run([sys.executable, "-c", _DEFAULTS_SRC, str(world_size)], env=env,
+                           capture_output=True, text=True, timeout=180)
+        out = json.loads(p.stdout.strip().splitlines()[-1])
+        return {k: int(v) for k, v in out.items() if v}
+    except Exception:  # noqa: BLE001 - no vLLM or no device: no defaults known
+        return {}
+
+
 def _number(v: Any) -> float | None:
     try:
         return float(v)
@@ -77,7 +116,8 @@ def _number(v: Any) -> float | None:
 
 def candidates(stable_args: list[str], *, tried: set[str], blocked: set[str],
                policy: dict[str, Any], library=None, resolved: dict[str, str] | None = None,
-               facts: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+               facts: dict[str, Any] | None = None,
+               defaults: dict[str, int] | None = None) -> list[dict[str, Any]]:
     """Every catalogue candidate worth testing against ``stable_args``, in catalogue order."""
     import fnmatch
 
@@ -108,8 +148,12 @@ def candidates(stable_args: list[str], *, tried: set[str], blocked: set[str],
         grid = list(spec.value_multiplier_grid or [])
         if grid:
             cur = _number(current_value(stable_args, knob))
-            ref, how = (cur, "stable's value") if cur else (_number(spec.value),
-                                                            "the catalogue's reference value")
+            if cur:
+                ref, how = cur, "stable's value"
+            elif (defaults or {}).get(knob):
+                ref, how = float(defaults[knob]), "vLLM's default for this GPU"
+            else:
+                ref, how = _number(spec.value), "the catalogue's reference value"
             if not ref:
                 continue
             values = [(int(round(ref * m)) if float(ref).is_integer() else round(ref * m, 4),

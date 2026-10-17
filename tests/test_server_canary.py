@@ -149,3 +149,32 @@ def test_submitting_needs_a_canary_and_a_real_change(tmp_path):
     iv = ctl.submit({"max_num_seqs": 128}, submitter="agent")
     assert iv.status == "queued" and (tmp_path / "interventions" / f"{iv.id}.json").exists()
     assert ctl.stop_intervention(iv.id).status == "stopped"
+
+
+def test_a_sample_spoiled_by_production_load_is_measured_again(tmp_path):
+    from gitm.server.canary import ReplaySampler
+
+    loads = iter([0.54, 0.0])            # first attempt: stable busy; second: quiet
+    s = ReplaySampler.__new__(ReplaySampler)
+    s.shared_gpu, s.max_stable_rps, s.max_retries, s.quiet_wait_s = True, 0.1, 2, 0.0
+    s.stable_load = lambda t0, t1: 0.0
+    s.cancel = __import__("threading").Event()
+    seen = []
+    s.on_sample = lambda arm, index, smp: seen.append(smp)
+    s._sample_once = lambda arm, index: Sample(metrics={"stable_rps": next(loads)},
+                                               wall_s=1, accelerator_s=1, correctness=1.0)
+    out = s.sample("baseline", 7)
+    assert out.metrics["stable_rps"] == 0.0 and out.metrics["remeasured"] == 1.0
+    assert len(seen) == 1                 # only the kept attempt is reported
+
+
+def test_on_its_own_gpu_a_busy_stable_is_not_a_reason_to_remeasure(tmp_path):
+    from gitm.server.canary import ReplaySampler
+
+    s = ReplaySampler.__new__(ReplaySampler)
+    s.shared_gpu, s.max_stable_rps, s.max_retries, s.quiet_wait_s = False, 0.1, 2, 0.0
+    s.stable_load = lambda t0, t1: 5.0
+    s.on_sample = lambda *a: None
+    s._sample_once = lambda arm, index: Sample(metrics={"stable_rps": 5.0}, wall_s=1,
+                                               accelerator_s=1, correctness=1.0)
+    assert s.sample("candidate", 1).metrics["remeasured"] == 0.0

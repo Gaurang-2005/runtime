@@ -125,6 +125,7 @@ class Controller:
                                       "promotions": [], "reverted": []}
         self.probation: dict[str, Any] | None = None
         self.simulator = None
+        self._serve_defaults: dict[str, int] | None = None
         self._swap_lock = threading.Lock()
         # Held by whoever is relaunching or measuring on the canary, so a test
         # and a restore never relaunch it under each other.
@@ -632,6 +633,16 @@ class Controller:
             self._save(iv)
             self.event("intervention.finished", id=iv.id, status=iv.status,
                        effect=(iv.verdict or {}).get("effect"))
+            if iv.verdict is not None and iv.status != "improved":
+                # Not a promotion candidate, but the rules still say what a win
+                # would have run into (e.g. isolated_measurement), so "why not?"
+                # has an answer on every outcome.
+                from gitm.server.promotion import as_dicts
+
+                try:
+                    iv.rules = as_dicts(self.rules_for(iv))
+                except Exception:  # noqa: BLE001
+                    pass
             if iv.status == "improved":
                 try:
                     self._consider(iv)
@@ -694,7 +705,7 @@ class Controller:
                                 "correctness": s.correctness,
                                 **{k: s.metrics.get(k) for k in
                                    (self.policy["primary_metric"]["name"], "output_throughput",
-                                    "p99_ttft_ms", "p99_itl_ms", "stable_rps")}})
+                                    "p99_ttft_ms", "p99_itl_ms", "stable_rps", "remeasured")}})
             self._save(iv)
             self.event("intervention.sample", id=iv.id, arm=arm, index=index)
 
@@ -708,7 +719,8 @@ class Controller:
 
         sampler = ReplaySampler(canary, plan, regime, result_dir=out / "bench",
                                 tokenizer=self.cfg.model, cancel=cancel, on_sample=on_sample,
-                                stable_load=stable_load)
+                                stable_load=stable_load, shared_gpu=shares_gpus(stable, canary),
+                                max_stable_rps=self.policy["max_shared_gpu_stable_rps"])
         verdict = evaluate(contract, applicator, sampler,
                            provenance={"window": str(window), "policy": self.policy,
                                        "stable_args": stable_args,
@@ -725,7 +737,7 @@ class Controller:
 
     def _maybe_explore(self) -> Intervention | None:
         """Queue the next catalogue candidate if exploring is on and the canary is idle."""
-        from gitm.server.explore import candidates, model_facts
+        from gitm.server.explore import candidates, model_facts, serve_defaults
         from gitm.server.promotion import knob_key
 
         if (not self.policy["auto_explore"] or self.policy["paused"] or self.probation is not None
@@ -737,9 +749,12 @@ class Controller:
                  if i.stable_args in (None, stable_args)}
         blocked = {r["knobs"] for r in self.state["reverted"]}
         try:
+            facts = model_facts(self.cfg.model, stable_args)
+            if self._serve_defaults is None:
+                self._serve_defaults = serve_defaults(facts["tp"], self.engines["stable"].spec.gpus)
             todo = candidates(stable_args, tried=tried, blocked=blocked, policy=self.policy,
                               resolved=self.engines["stable"].resolved_config(),
-                              facts=model_facts(self.cfg.model, stable_args))
+                              facts=facts, defaults=self._serve_defaults)
         except Exception as exc:  # noqa: BLE001 - a catalogue problem must not stop serving
             self.event("explore.error", error=str(exc))
             return None
