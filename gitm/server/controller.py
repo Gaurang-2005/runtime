@@ -1,7 +1,9 @@
 """The controller: owns the engines and the proxy, and answers the API.
 
-Milestone 1 scope: launch the stable engine, put the proxy in front of it with
-recording on, and report state. Canary testing and promotion build on this.
+It launches the stable engine, puts the proxy in front of it with recording on,
+launches the canary beside it, and runs submitted interventions one at a time:
+each is an A/B in the canary slot against a recorded window, decided by
+:func:`gitm.experiment.evaluate.evaluate`. Promotion builds on this.
 
 Shutdown is deliberate about what it takes down. A clean stop (Ctrl-C on
 ``gitm run --server``) stops the proxy and every engine this controller started.
@@ -11,16 +13,21 @@ traffic keeps flowing to the last stable engine.
 
 from __future__ import annotations
 
+import json
 import os
+import queue
 import secrets
 import socket
 import subprocess
 import sys
+import threading
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from gitm.server import policy as policy_mod
 from gitm.server.supervisor import EngineProcess, EngineSpec
 
 
@@ -38,7 +45,39 @@ class ServerConfig:
     canary_gpus: str | None = None
     mem_fraction: float | None = None
     record: bool = True
+    canary: bool = True
+    policy: dict[str, Any] = field(default_factory=dict)
     startup_timeout_s: float = 1800.0
+
+
+#: Intervention states before a verdict exists. After one, the state is the
+#: verdict's own (improved / regressed / inconclusive / invalid / failed_to_execute).
+QUEUED, RUNNING, STOPPED, REJECTED = "queued", "running", "stopped", "rejected"
+
+
+@dataclass
+class Intervention:
+    id: str
+    knobs: dict[str, Any]
+    submitter: str
+    note: str
+    created: float
+    status: str = QUEUED
+    started: float | None = None
+    finished: float | None = None
+    detail: str = ""
+    window: str | None = None
+    candidate_args: list[str] | None = None
+    progress: list[dict[str, Any]] = field(default_factory=list)
+    verdict: dict[str, Any] | None = None
+
+    def brief(self) -> dict[str, Any]:
+        v = self.verdict or {}
+        return {"id": self.id, "knobs": self.knobs, "status": self.status,
+                "submitter": self.submitter, "created": self.created,
+                "finished": self.finished, "detail": self.detail,
+                "effect": v.get("effect"), "interval": v.get("interval"),
+                "samples": len(self.progress)}
 
 
 def port_free(port: int, host: str = "127.0.0.1") -> bool:
@@ -60,6 +99,12 @@ class Controller:
         self.engines: dict[str, EngineProcess] = {}
         self.proxy: subprocess.Popen | None = None
         self.events: list[dict[str, Any]] = []
+        self.policy = policy_mod.merged(cfg.policy)
+        self.interventions: dict[str, Intervention] = {}
+        self._queue: queue.Queue[str] = queue.Queue()
+        self._cancel: dict[str, threading.Event] = {}
+        self._worker: threading.Thread | None = None
+        self._stopping = threading.Event()
 
     # ------------------------------------------------------------------ paths
 
@@ -80,9 +125,12 @@ class Controller:
     def preflight(self) -> list[str]:
         """Problems that would make starting pointless. Empty means go."""
         problems = []
-        for name, port in (("proxy", self.cfg.port), ("api", self.cfg.api_port),
-                           ("stable engine", self.cfg.stable_port)):
-            if not port_free(port, self.cfg.host if name != "stable engine" else "127.0.0.1"):
+        ports = [("proxy", self.cfg.port), ("api", self.cfg.api_port),
+                 ("stable engine", self.cfg.stable_port)]
+        if self.cfg.canary:
+            ports.append(("canary engine", self.cfg.canary_port))
+        for name, port in ports:
+            if not port_free(port, self.cfg.host if name == "proxy" else "127.0.0.1"):
                 problems.append(f"port {port} ({name}) is already in use")
         return problems
 
@@ -104,6 +152,23 @@ class Controller:
 
         self._start_proxy(stable.base_url)
         self.event("proxy.started", port=self.cfg.port, upstream=stable.base_url)
+
+        if self.cfg.canary:
+            # After stable is healthy, not beside it: two engines profiling GPU
+            # memory at once on one card each see the other's allocations.
+            canary = EngineProcess(EngineSpec(
+                role="canary", model=self.cfg.model, port=self.cfg.canary_port,
+                serve_args=list(self.cfg.serve_args), gpus=self.cfg.canary_gpus,
+                mem_fraction=self.cfg.mem_fraction,
+                env={"VLLM_SERVER_DEV_MODE": "1"}), self.log_dir)
+            self.engines["canary"] = canary
+            self.event("engine.starting", role="canary", argv=canary.spec.argv())
+            canary.start()
+            canary.wait_healthy(self.cfg.startup_timeout_s)
+            self.event("engine.healthy", role="canary", startup_s=canary.info()["startup_s"])
+            self._worker = threading.Thread(target=self._work, name="gitm-interventions",
+                                            daemon=True)
+            self._worker.start()
 
     def _start_proxy(self, upstream: str) -> None:
         cmd = [sys.executable, "-m", "gitm.server.proxy", "--host", self.cfg.host,
@@ -130,6 +195,9 @@ class Controller:
 
     def stop(self) -> None:
         """Clean stop: proxy first (no new requests), then the engines."""
+        self._stopping.set()
+        for ev in self._cancel.values():
+            ev.set()
         if self.proxy is not None and self.proxy.poll() is None:
             self.proxy.terminate()
             try:
@@ -164,11 +232,172 @@ class Controller:
             proxy = self.proxy_call("GET", "/admin/state")
         except Exception as exc:
             proxy = {"error": str(exc)}
+        running = [i.brief() for i in self.interventions.values() if i.status == RUNNING]
         return {
             "model": self.cfg.model,
             "uptime_s": round(time.time() - self.started_at, 1),
             "endpoint": f"http://{self.cfg.host}:{self.cfg.port}/v1",
             "engines": {role: e.info() for role, e in self.engines.items()},
             "proxy": proxy,
+            "running": running[0] if running else None,
+            "queued": [i.id for i in self.interventions.values() if i.status == QUEUED],
             "workdir": str(self.workdir),
         }
+
+    # ------------------------------------------------------------------ interventions
+
+    def submit(self, knobs: dict[str, Any], *, submitter: str = "api",
+               note: str = "") -> Intervention:
+        """Queue an A/B of ``knobs`` against the stable configuration.
+
+        Refused up front (ValueError) when there is no canary, or when stable
+        already runs every requested value: an A/B of a configuration against
+        itself is an A/A, and would be reported as a lever that did nothing.
+        """
+        from gitm.server.canary import unchanged_knobs
+
+        if "canary" not in self.engines:
+            raise ValueError("this server runs without a canary, so it cannot test anything")
+        if not knobs:
+            raise ValueError("an intervention needs at least one knob")
+        same = unchanged_knobs(self.engines["stable"].spec.serve_args, knobs)
+        if same:
+            raise ValueError(f"stable already runs {same} at the requested value")
+        iv = Intervention(id=uuid.uuid4().hex[:10], knobs=dict(knobs), submitter=submitter,
+                          note=note, created=time.time())
+        self.interventions[iv.id] = iv
+        self._cancel[iv.id] = threading.Event()
+        self._save(iv)
+        self._queue.put(iv.id)
+        self.event("intervention.queued", id=iv.id, knobs=iv.knobs, submitter=submitter)
+        return iv
+
+    def stop_intervention(self, ident: str) -> Intervention:
+        iv = self.interventions[ident]
+        self._cancel[ident].set()
+        if iv.status == QUEUED:
+            iv.status, iv.finished, iv.detail = STOPPED, time.time(), "stopped before it ran"
+            self._save(iv)
+        self.event("intervention.stop_requested", id=ident)
+        return iv
+
+    def _save(self, iv: Intervention) -> None:
+        d = self.workdir / "interventions"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{iv.id}.json").write_text(json.dumps(asdict(iv), indent=2, default=str))
+
+    def _work(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                ident = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            iv = self.interventions[ident]
+            if iv.status != QUEUED:
+                continue
+            try:
+                self._run(iv)
+            except Exception as exc:  # noqa: BLE001 - one bad intervention must not kill the worker
+                iv.status, iv.detail = "failed_to_execute", f"{type(exc).__name__}: {exc}"
+            iv.finished = time.time()
+            self._save(iv)
+            self.event("intervention.finished", id=iv.id, status=iv.status,
+                       effect=(iv.verdict or {}).get("effect"))
+
+    def _run(self, iv: Intervention) -> None:
+        from gitm.experiment.evaluate import evaluate
+        from gitm.serve.vllm import check_serve_args
+        from gitm.server.canary import (
+            CanaryApplicator,
+            ReplaySampler,
+            build_contract,
+            candidate_args,
+            load_window,
+            write_plan,
+        )
+
+        cancel = self._cancel[iv.id]
+        canary, stable = self.engines["canary"], self.engines["stable"]
+        iv.status, iv.started = RUNNING, time.time()
+        self.event("intervention.started", id=iv.id)
+
+        stable_args = list(stable.spec.serve_args)
+        iv.candidate_args = candidate_args(stable_args, iv.knobs)
+        checks = check_serve_args(["vllm", "serve", self.cfg.model, *iv.candidate_args])
+        if any(c.status == "fail" for c in checks):
+            iv.status, iv.detail = REJECTED, checks[0].detail
+            return
+
+        window = self._window_for_test()
+        if window is None:
+            iv.status = REJECTED
+            iv.detail = (f"no recorded window with at least {self.policy['min_window_requests']}"
+                         " requests yet; send traffic through the proxy first")
+            return
+        iv.window = str(window)
+        trace, regime = load_window(window, max_requests=self.policy["max_replay_requests"],
+                                    speed=self.policy["replay_speed"])
+        out = self.workdir / "interventions" / iv.id
+        plan = write_plan(trace, out / "replay.jsonl")
+        contract = build_contract(intervention_id=iv.id, knobs=iv.knobs,
+                                  stable_args=stable_args, trace=trace, regime=regime,
+                                  policy=self.policy, submitter=iv.submitter, note=iv.note)
+        (out / "contract.json").write_text(contract.model_dump_json(indent=2))
+
+        # The canary must start the test on stable's configuration: the
+        # evaluator's snapshot is what it restores to.
+        applicator = CanaryApplicator(
+            canary, startup_timeout_s=self.cfg.startup_timeout_s, cancel=cancel,
+            on_change=lambda args: self.event("canary.relaunched", id=iv.id, serve_args=args))
+        if canary.spec.serve_args != stable_args or not canary.alive:
+            applicator.restore(stable_args)
+
+        def on_sample(arm, index, s):
+            iv.progress.append({"arm": arm, "index": index, "wall_s": round(s.wall_s, 1),
+                                "correctness": s.correctness,
+                                **{k: s.metrics.get(k) for k in
+                                   (self.policy["primary_metric"]["name"], "output_throughput",
+                                    "p99_ttft_ms", "p99_itl_ms")}})
+            self._save(iv)
+            self.event("intervention.sample", id=iv.id, arm=arm, index=index)
+
+        sampler = ReplaySampler(canary, plan, regime, result_dir=out / "bench",
+                                tokenizer=self.cfg.model, cancel=cancel, on_sample=on_sample)
+        verdict = evaluate(contract, applicator, sampler,
+                           provenance={"window": str(window), "policy": self.policy,
+                                       "stable_args": stable_args,
+                                       "candidate_args": iv.candidate_args},
+                           accelerators_held=1)
+        (out / "verdict.json").write_text(verdict.model_dump_json(indent=2))
+        iv.verdict = verdict.model_dump(mode="json")
+        iv.status = STOPPED if cancel.is_set() else verdict.state
+        iv.detail = verdict.reason
+        if verdict.rollback == "kept":
+            # Milestone 2: an improved candidate stays on the canary, waiting for
+            # promotion. Nothing reaches production without it.
+            self.event("canary.holds_candidate", id=iv.id, serve_args=canary.spec.serve_args)
+
+    def _window_for_test(self) -> Path | None:
+        """The newest closed recording window big enough to measure with.
+
+        The open window is closed first when it already qualifies, so a test can
+        use the traffic that just arrived rather than waiting for a rotation.
+        """
+        need = self.policy["min_window_requests"]
+
+        def size(p: Path) -> int:
+            with p.open() as fh:
+                return sum(1 for line in fh if line.strip())
+
+        try:
+            state = self.proxy_call("GET", "/admin/state")
+            windows = [Path(p) for p in self.proxy_call("GET", "/admin/recordings")]
+            if (state.get("recorded") or 0) and not any(size(p) >= need for p in windows):
+                self.proxy_call("POST", "/admin/rotate")
+                windows = [Path(p) for p in self.proxy_call("GET", "/admin/recordings")]
+        except Exception:
+            windows = sorted(self.record_dir.glob("window-*.jsonl"))
+        for p in reversed(windows):
+            if size(p) >= need:
+                return p
+        return None

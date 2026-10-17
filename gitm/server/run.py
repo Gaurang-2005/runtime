@@ -27,7 +27,21 @@ def config_from_args(args) -> ServerConfig:
         canary_gpus=args.canary_gpus,
         mem_fraction=args.mem_fraction,
         record=not args.no_record,
+        canary=not args.no_canary,
+        policy=_read_policy(args.policy),
     )
+
+
+def _read_policy(path: Path | None) -> dict:
+    if path is None:
+        return {}
+    import yaml
+
+    from gitm.server.policy import merged
+
+    data = yaml.safe_load(path.read_text()) or {}
+    merged(data)  # refuse unknown keys now, not when the first test runs
+    return data
 
 
 def run_server(cfg: ServerConfig) -> int:
@@ -42,8 +56,8 @@ def run_server(cfg: ServerConfig) -> int:
             print(f"gitm server: {p}", file=sys.stderr)
         return 2
 
-    print(f"gitm server: starting stable engine for {cfg.model} (logs in {ctl.log_dir})",
-          flush=True)
+    what = "stable and canary engines" if cfg.canary else "stable engine"
+    print(f"gitm server: starting {what} for {cfg.model} (logs in {ctl.log_dir})", flush=True)
     try:
         ctl.start()
     except BaseException as exc:

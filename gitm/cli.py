@@ -177,6 +177,10 @@ def _parser() -> argparse.ArgumentParser:
                      help="--gpu-memory-utilization per engine, e.g. 0.4 when both "
                           "share one GPU.")
     srv.add_argument("--no-record", action="store_true", help="Do not record served traffic.")
+    srv.add_argument("--no-canary", action="store_true",
+                     help="Serve and record only; no canary, so nothing can be tested.")
+    srv.add_argument("--policy", type=Path, default=None, metavar="FILE",
+                     help="YAML/JSON overrides of the test policy (GET /policy shows it).")
     # hft-only data-selection flags (mapped onto the GITM_BENCH_* env the
     # workload factory reads). No-ops for other workloads — using them there errors.
     run.add_argument("--seed", type=int, default=None, help="hft: dataset seed.")

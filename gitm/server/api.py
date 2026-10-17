@@ -7,6 +7,7 @@ It binds to localhost unless told otherwise; exposing it is a deliberate choice.
 from __future__ import annotations
 
 import time
+from dataclasses import asdict
 from typing import Any
 
 from gitm.server.controller import Controller
@@ -70,5 +71,38 @@ def build_api(ctl: Controller):
     @app.get("/events")
     def events(since: float = 0.0):
         return [e for e in ctl.events if e["t"] > since]
+
+    @app.get("/policy")
+    def get_policy():
+        return ctl.policy
+
+    @app.get("/interventions")
+    def list_interventions():
+        return [iv.brief() for iv in ctl.interventions.values()]
+
+    @app.post("/interventions", status_code=202)
+    def submit(body: dict):
+        knobs = body.get("knobs")
+        if not isinstance(knobs, dict):
+            raise HTTPException(status_code=400, detail='body needs "knobs": {knob: value}')
+        try:
+            iv = ctl.submit(knobs, submitter=str(body.get("submitter", "api")),
+                            note=str(body.get("note", "")))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        return iv.brief()
+
+    @app.get("/interventions/{ident}")
+    def get_intervention(ident: str):
+        iv = ctl.interventions.get(ident)
+        if iv is None:
+            raise HTTPException(status_code=404, detail="no such intervention")
+        return asdict(iv)
+
+    @app.post("/interventions/{ident}/stop")
+    def stop_intervention(ident: str):
+        if ident not in ctl.interventions:
+            raise HTTPException(status_code=404, detail="no such intervention")
+        return ctl.stop_intervention(ident).brief()
 
     return app
