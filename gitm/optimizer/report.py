@@ -21,12 +21,13 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 class Claim:
     summary: str
     residual_invariant: str  # "kernel_time" | "memory_traffic" | "stream_concurrency"
-    residual_value: float
-    causal_evidence: str  # human-readable from RankedHypotheses
+    residual_value: float | None  # None: not computed; residual_note says why
+    causal_evidence: str  # status text from attribution.granger_evidence, or the live A/B
     intervention_name: str
     predicted_delta: float
     measured_delta: float | None
     rolled_back: bool = False
+    residual_note: str | None = None
     #: The gate rejected this candidate and the baseline could not be put back.
     #: Not rolled back, and not kept either, so it is counted as neither.
     restore_failed: bool = False
