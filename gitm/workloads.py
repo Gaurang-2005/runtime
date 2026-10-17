@@ -576,6 +576,29 @@ def _shutdown_timeout() -> float:
         return 30.0
 
 
+def _call_shutdown(fn: Any, timeout: float) -> None:
+    """Call an engine's ``shutdown``, giving it ``timeout`` when it takes one.
+
+    vLLM's ``MPClient.shutdown(timeout=None)`` hands ``None`` to its process
+    manager, which then waits only its built-in 5 s before force-killing the
+    EngineCore. On 8x MI355X every Kimi teardown was cut off that way, and once
+    the next engine hung in its first all-gather and the run lost its engine;
+    ``VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS`` is not read on that path. The
+    window gitm already gives the workers (``GITM_SHUTDOWN_TIMEOUT_S``) is
+    passed through instead. A ``shutdown`` without a timeout is called as before.
+    """
+    import inspect
+
+    try:
+        takes_timeout = "timeout" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        takes_timeout = False
+    if takes_timeout:
+        fn(timeout=timeout)
+    else:
+        fn()
+
+
 def _timeout_s(var: str, default: float) -> float | None:
     """A watchdog limit from the environment, in seconds; ``None`` disables it."""
     raw = os.environ.get(var)
@@ -971,7 +994,7 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
                     break
             if callable(obj):
                 try:
-                    obj()
+                    _call_shutdown(obj, _shutdown_timeout())
                 except Exception as exc:
                     _warn_release(path, exc)
                 break
