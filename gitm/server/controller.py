@@ -70,6 +70,8 @@ class Intervention:
     detail: str = ""
     window: str | None = None
     candidate_args: list[str] | None = None
+    #: Stable's flags this was tested against: "tried" is per stable configuration.
+    stable_args: list[str] | None = None
     progress: list[dict[str, Any]] = field(default_factory=list)
     verdict: dict[str, Any] | None = None
     rules: list[dict[str, Any]] | None = None
@@ -574,6 +576,7 @@ class Controller:
             try:
                 ident = self._queue.get(timeout=0.5)
             except queue.Empty:
+                self._maybe_explore()
                 continue
             iv = self.interventions[ident]
             if iv.status != QUEUED:
@@ -620,6 +623,7 @@ class Controller:
         self.event("intervention.started", id=iv.id)
 
         stable_args = list(stable.spec.serve_args)
+        iv.stable_args = stable_args
         iv.candidate_args = candidate_args(stable_args, iv.knobs)
         checks = check_serve_args(["vllm", "serve", self.cfg.model, *iv.candidate_args])
         if any(c.status == "fail" for c in checks):
@@ -683,6 +687,38 @@ class Controller:
             # Milestone 2: an improved candidate stays on the canary, waiting for
             # promotion. Nothing reaches production without it.
             self.event("canary.holds_candidate", id=iv.id, serve_args=canary.spec.serve_args)
+
+    def _maybe_explore(self) -> Intervention | None:
+        """Queue the next catalogue candidate if exploring is on and the canary is idle."""
+        from gitm.server.explore import candidates
+        from gitm.server.promotion import knob_key
+
+        if (not self.policy["auto_explore"] or self.policy["paused"] or self.probation is not None
+                or "canary" not in self.engines or "stable" not in self.engines
+                or any(i.status in (QUEUED, RUNNING) for i in self.interventions.values())):
+            return None
+        stable_args = list(self.engines["stable"].spec.serve_args)
+        tried = {knob_key(i.knobs) for i in self.interventions.values()
+                 if i.stable_args in (None, stable_args)}
+        blocked = {r["knobs"] for r in self.state["reverted"]}
+        try:
+            todo = candidates(stable_args, tried=tried, blocked=blocked, policy=self.policy)
+        except Exception as exc:  # noqa: BLE001 - a catalogue problem must not stop serving
+            self.event("explore.error", error=str(exc))
+            return None
+        if not todo:
+            if not getattr(self, "_explore_done_for", None) == stable_args:
+                self._explore_done_for = stable_args
+                self.event("explore.exhausted", stable_args=stable_args)
+            return None
+        nxt = todo[0]
+        try:
+            iv = self.submit(nxt["knobs"], submitter="explorer", note=nxt["note"])
+        except ValueError as exc:
+            self.event("explore.skipped", knobs=nxt["knobs"], reason=str(exc))
+            return None
+        self.event("explore.queued", id=iv.id, lever=nxt["lever"], knobs=nxt["knobs"])
+        return iv
 
     def _window_for_test(self) -> Path | None:
         """The newest closed recording window big enough to measure with.

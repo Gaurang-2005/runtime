@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from gitm.server.explore import EXPLORE_DEFAULTS
 from gitm.server.promotion import PROMOTION_DEFAULTS
 
 DEFAULT_POLICY: dict[str, Any] = {
@@ -42,6 +43,8 @@ DEFAULT_POLICY: dict[str, Any] = {
 }
 # Promotion and probation: see gitm.server.promotion for what each one means.
 DEFAULT_POLICY.update(PROMOTION_DEFAULTS)
+# Exploring the catalogue on its own when idle: see gitm.server.explore.
+DEFAULT_POLICY.update(EXPLORE_DEFAULTS)
 
 
 def merged(overrides: dict[str, Any] | None) -> dict[str, Any]:
