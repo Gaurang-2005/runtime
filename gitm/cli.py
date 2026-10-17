@@ -237,6 +237,12 @@ def _parser() -> argparse.ArgumentParser:
     _add_capture(sub)
 
     sub.add_parser("doctor", help="Probe environment, GPUs, and data locations.")
+    mcp_cmd = sub.add_parser("mcp", help="Serve a gitm server's control API to an agent over "
+                                         "MCP (stdio).")
+    mcp_cmd.add_argument("--url", default="http://127.0.0.1:7070",
+                         help="The gitm server's control API.")
+    mcp_cmd.add_argument("--token-file", type=Path, required=True,
+                         help="api-token in the gitm server's working directory.")
 
     hist = sub.add_parser(
         "history",
@@ -1025,6 +1031,11 @@ def main(argv: list[str] | None = None) -> int:
             if getattr(args, flag, False):
                 argv.append("--" + flag.replace("_", "-"))
         return install_main(argv)
+
+    if args.cmd == "mcp":
+        from gitm.server.mcp import main as mcp_main
+
+        return mcp_main(["--url", args.url, "--token-file", str(args.token_file)])
 
     if args.cmd == "doctor":
         from gitm.doctor import doctor
