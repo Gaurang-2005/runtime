@@ -9,6 +9,15 @@ const store = {
 };
 let base = store.get("gitm.url") || "http://127.0.0.1:7070";
 let token = store.get("gitm.token") || "";
+// A link printed by `gitm run --server` carries #server=...&token=... . The
+// fragment never leaves the browser; it is read once, stored, and cleared.
+if (location.hash.length > 1) {
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get("server")) base = h.get("server");
+  if (h.get("token")) token = h.get("token");
+  store.set("gitm.url", base); store.set("gitm.token", token);
+  history.replaceState(null, "", location.pathname);
+}
 let selected = null;
 let timer = null;
 const hist = { tps: [], ttft: [], rps: [] };

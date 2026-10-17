@@ -71,6 +71,10 @@ def run_server(cfg: ServerConfig) -> int:
     print(f"  serving    http://{cfg.host}:{cfg.port}/v1   (OpenAI-compatible; point clients here)")
     print(f"  control    http://127.0.0.1:{cfg.api_port}     (token in {ctl.workdir / 'api-token'})")
     print(f"  recording  {ctl.record_dir}" if cfg.record else "  recording  off")
+    from urllib.parse import quote
+
+    print(f"  dashboard  gitm dashboard, then open http://127.0.0.1:7080/#server="
+          f"{quote(f'http://127.0.0.1:{cfg.api_port}', safe='')}&token={ctl.token}")
     print("  Ctrl-C stops the proxy and every engine this server started.", flush=True)
 
     server = uvicorn.Server(uvicorn.Config(build_api(ctl), host="127.0.0.1",
