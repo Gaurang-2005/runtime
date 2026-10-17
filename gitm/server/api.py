@@ -105,4 +105,58 @@ def build_api(ctl: Controller):
             raise HTTPException(status_code=404, detail="no such intervention")
         return ctl.stop_intervention(ident).brief()
 
+    def _iv(ident: str):
+        iv = ctl.interventions.get(ident)
+        if iv is None:
+            raise HTTPException(status_code=404, detail="no such intervention")
+        return iv
+
+    @app.get("/interventions/{ident}/rules")
+    def rules(ident: str):
+        from gitm.server.promotion import all_pass, as_dicts
+
+        try:
+            r = ctl.rules_for(_iv(ident))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        return {"promotable": all_pass(r), "rules": as_dicts(r)}
+
+    @app.post("/interventions/{ident}/promote")
+    def promote(ident: str, body: dict | None = None):
+        """Approve a promotion. The rules are checked again; approval skips none."""
+        try:
+            return ctl.promote(_iv(ident), cause=f"approved: {(body or {}).get('by', 'api')}")
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    @app.post("/revert")
+    def revert(body: dict | None = None):
+        try:
+            return ctl.revert(str((body or {}).get("reason", "reverted by operator")),
+                              cause="api")
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    @app.post("/pause")
+    def pause():
+        ctl.set_policy({"paused": True})
+        return {"paused": True}
+
+    @app.post("/resume")
+    def resume():
+        ctl.set_policy({"paused": False})
+        return {"paused": False}
+
+    @app.put("/policy")
+    def put_policy(body: dict):
+        try:
+            return ctl.set_policy(body)
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    @app.get("/promotions")
+    def promotions():
+        return {"promotions": ctl.state["promotions"], "reverted": ctl.state["reverted"],
+                "probation": ctl.probation_summary()}
+
     return app

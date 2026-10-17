@@ -9,6 +9,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from gitm.server.promotion import PROMOTION_DEFAULTS
+
 DEFAULT_POLICY: dict[str, Any] = {
     # --- the test --------------------------------------------------------------
     # Per-token decode speed under the recorded load. Throughput is not the
@@ -36,6 +38,8 @@ DEFAULT_POLICY: dict[str, Any] = {
     # >1 compresses the recorded arrivals to test at a higher load than was seen.
     "replay_speed": 1.0,
 }
+# Promotion and probation: see gitm.server.promotion for what each one means.
+DEFAULT_POLICY.update(PROMOTION_DEFAULTS)
 
 
 def merged(overrides: dict[str, Any] | None) -> dict[str, Any]:
