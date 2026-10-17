@@ -47,6 +47,8 @@ class ServerConfig:
     record: bool = True
     canary: bool = True
     policy: dict[str, Any] = field(default_factory=dict)
+    #: Browser origins allowed to call the API (the dashboard runs on its own port).
+    dashboard_origins: tuple[str, ...] = ("http://127.0.0.1:7080", "http://localhost:7080")
     startup_timeout_s: float = 1800.0
 
 
@@ -120,6 +122,7 @@ class Controller:
         self.state: dict[str, Any] = {"last_promotion_t": None, "last_revert_t": None,
                                       "promotions": [], "reverted": []}
         self.probation: dict[str, Any] | None = None
+        self.simulator = None
         self._swap_lock = threading.Lock()
         # Held by whoever is relaunching or measuring on the canary, so a test
         # and a restore never relaunch it under each other.
@@ -182,6 +185,10 @@ class Controller:
 
         self._start_proxy(stable.base_url)
         self.event("proxy.started", port=self.cfg.port, upstream=stable.base_url)
+        from gitm.server.simulate import Simulator
+
+        self.simulator = Simulator(f"http://127.0.0.1:{self.cfg.port}",
+                                   stable.served_model or self.cfg.model)
 
         if self.cfg.canary:
             # After stable is healthy, not beside it: two engines profiling GPU

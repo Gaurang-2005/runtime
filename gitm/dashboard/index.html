@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gitm dashboard</title>
+<style>
+:root {
+  --bg: #f6f7f4; --panel: #ffffff; --fg: #1d2420; --muted: #66706a; --line: #dfe3dd;
+  --accent: #2f6f4f; --accent-soft: #e3efe7; --warn: #a15c07; --bad: #b23a30; --good: #2f6f4f;
+  --chart1: #2f6f4f; --chart2: #a15c07; --chart3: #3d5a99;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #121614; --panel: #1a201d; --fg: #e4e9e5; --muted: #93a099; --line: #2b332f;
+    --accent: #6fbf94; --accent-soft: #1f3329; --warn: #e0a24a; --bad: #e57368; --good: #6fbf94;
+    --chart1: #6fbf94; --chart2: #e0a24a; --chart3: #8ea8e8; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 14px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif; }
+.wrap { max-width: 1280px; margin: 0 auto; padding: 16px 20px 40px; }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+  padding-bottom: 12px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+h1 { font-size: 18px; margin: 0; letter-spacing: .2px; }
+h1 small { color: var(--muted); font-weight: 400; margin-left: 8px; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
+  margin: 0 0 10px; font-weight: 600; }
+.conn { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+input, select, textarea { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 8px; min-width: 0; }
+textarea { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; width: 100%; }
+button { font: inherit; border: 1px solid var(--accent); background: var(--accent); color: var(--panel);
+  border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+button.ghost { background: transparent; color: var(--accent); }
+button.bad { border-color: var(--bad); background: var(--bad); }
+button:disabled { opacity: .5; cursor: default; }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(12, minmax(0, 1fr)); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+.s12 { grid-column: span 12; } .s8 { grid-column: span 8; } .s6 { grid-column: span 6; } .s4 { grid-column: span 4; }
+@media (max-width: 900px) { .s8, .s6, .s4 { grid-column: span 12; } }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+.kpi .v { font-size: 22px; font-variant-numeric: tabular-nums; font-weight: 600; }
+.kpi .l { color: var(--muted); font-size: 12px; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; margin-top: 12px; }
+.chart { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.chart .t { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+svg { width: 100%; height: 90px; display: block; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num { font-variant-numeric: tabular-nums; }
+tr.click { cursor: pointer; } tr.click:hover { background: var(--accent-soft); }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; word-break: break-word; }
+.pill { display: inline-block; border-radius: 999px; padding: 1px 8px; font-size: 12px; border: 1px solid var(--line); }
+.pill.good { color: var(--good); border-color: var(--good); } .pill.bad { color: var(--bad); border-color: var(--bad); }
+.pill.warn { color: var(--warn); border-color: var(--warn); }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+.muted { color: var(--muted); }
+.scroll { overflow-x: auto; }
+.log { max-height: 260px; overflow-y: auto; }
+.engines { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+.engine { border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+.engine .role { font-weight: 600; text-transform: capitalize; }
+.err { color: var(--bad); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>gitm <small id="model">not connected</small></h1>
+    <form class="conn" id="conn">
+      <input id="url" size="24" placeholder="http://127.0.0.1:7070" aria-label="gitm server URL">
+      <input id="token" size="28" type="password" placeholder="api token" aria-label="api token">
+      <button type="submit">Connect</button>
+      <span id="connstate" class="muted"></span>
+    </form>
+  </header>
+
+  <div class="grid">
+    <section class="panel s12">
+      <h2>Production, through the proxy</h2>
+      <div class="kpis">
+        <div class="kpi"><div class="v" id="k-tps">–</div><div class="l">output tokens / s</div></div>
+        <div class="kpi"><div class="v" id="k-rps">–</div><div class="l">requests / s</div></div>
+        <div class="kpi"><div class="v" id="k-ttft">–</div><div class="l">TTFT p50 / p99</div></div>
+        <div class="kpi"><div class="v" id="k-lat">–</div><div class="l">latency p50 / p99</div></div>
+        <div class="kpi"><div class="v" id="k-err">–</div><div class="l">errors (30 s)</div></div>
+        <div class="kpi"><div class="v" id="k-rec">–</div><div class="l">requests recorded</div></div>
+      </div>
+      <div class="charts">
+        <div class="chart"><div class="t"><span>output tokens / s</span><span id="c1v"></span></div><svg id="c1" viewBox="0 0 300 90" preserveAspectRatio="none"></svg></div>
+        <div class="chart"><div class="t"><span>TTFT p99 (ms)</span><span id="c2v"></span></div><svg id="c2" viewBox="0 0 300 90" preserveAspectRatio="none"></svg></div>
+        <div class="chart"><div class="t"><span>requests / s</span><span id="c3v"></span></div><svg id="c3" viewBox="0 0 300 90" preserveAspectRatio="none"></svg></div>
+      </div>
+    </section>
+
+    <section class="panel s8">
+      <h2>Engines</h2>
+      <div class="engines" id="engines"><span class="muted">connect to a server</span></div>
+      <div id="probation" style="margin-top:12px"></div>
+    </section>
+
+    <section class="panel s4">
+      <h2>Control</h2>
+      <div class="row">
+        <button id="pause" class="ghost">Pause</button>
+        <button id="revert" class="bad" disabled>Revert promotion</button>
+      </div>
+      <div class="row"><label><input type="checkbox" id="approval"> require approval before promoting</label></div>
+      <p class="muted" id="ctlnote" style="margin:6px 0 0">Pause stops new tests and promotions. Revert works during probation.</p>
+    </section>
+
+    <section class="panel s6">
+      <h2>Simulate traffic</h2>
+      <form id="simform">
+        <div class="row">
+          <select id="preset" aria-label="traffic preset"></select>
+          <label>rate <input id="rate" size="4" placeholder="req/s"></label>
+          <label>for <input id="dur" size="5" value="120"> s</label>
+          <label>burst <input id="burst" size="3" placeholder="1"></label>
+          <button type="submit">Start</button>
+        </div>
+        <p class="muted" id="presetnote" style="margin:0 0 8px"></p>
+      </form>
+      <div class="scroll"><table><thead><tr><th>run</th><th>preset</th><th>rate</th><th>sent / planned</th><th>ok</th><th>failed</th><th>status</th><th></th></tr></thead>
+        <tbody id="sims"></tbody></table></div>
+    </section>
+
+    <section class="panel s6">
+      <h2>Test a change on the canary</h2>
+      <form id="ivform">
+        <textarea id="knobs" rows="3" aria-label="knobs JSON">{"max_num_batched_tokens": 16384}</textarea>
+        <div class="row" style="margin-top:8px">
+          <input id="note" placeholder="note (optional)" style="flex:1">
+          <button type="submit">Queue A/B</button>
+        </div>
+        <p class="err" id="iverr" style="margin:0"></p>
+      </form>
+      <div class="scroll"><table><thead><tr><th>id</th><th>change</th><th>status</th><th>effect</th><th>interval</th><th>samples</th></tr></thead>
+        <tbody id="ivs"></tbody></table></div>
+    </section>
+
+    <section class="panel s12" id="detail" hidden>
+      <h2 id="dtitle">Intervention</h2>
+      <p id="ddetail" class="muted"></p>
+      <div class="grid">
+        <div class="s6" style="grid-column: span 6; min-width:0">
+          <div class="scroll"><table><thead><tr><th>#</th><th>arm</th><th>TPOT ms</th><th>tok/s</th><th>TTFT p99</th><th>ITL p99</th><th>correct</th><th>stable rps</th></tr></thead>
+            <tbody id="dsamples"></tbody></table></div>
+        </div>
+        <div class="s6" style="grid-column: span 6; min-width:0">
+          <div class="row"><button id="dpromote" disabled>Promote</button><button id="dstop" class="ghost">Stop</button></div>
+          <table><thead><tr><th>rule</th><th></th><th>evidence</th></tr></thead><tbody id="drules"></tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel s6">
+      <h2>Promotions</h2>
+      <div class="scroll"><table><thead><tr><th>when</th><th>change</th><th>outcome</th></tr></thead><tbody id="promos"></tbody></table></div>
+    </section>
+
+    <section class="panel s6">
+      <h2>Events</h2>
+      <div class="log"><table><tbody id="events"></tbody></table></div>
+    </section>
+  </div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -48,8 +48,17 @@ def build_api(ctl: Controller):
         if authorization != f"Bearer {ctl.token}":
             raise HTTPException(status_code=401, detail="missing or wrong bearer token")
 
+    from fastapi.middleware.cors import CORSMiddleware
+
     app = FastAPI(title="gitm server", dependencies=[Depends(auth)],
                   docs_url=None, redoc_url=None)
+    # The dashboard is a separate page on its own port, so the browser needs
+    # CORS to call this API. Only the configured origins; the token still
+    # guards every route. Preflight requests carry no token, so they are
+    # answered by the middleware before auth runs.
+    app.add_middleware(CORSMiddleware, allow_origins=list(ctl.cfg.dashboard_origins),
+                       allow_methods=["GET", "POST", "PUT"],
+                       allow_headers=["Authorization", "Content-Type"])
 
     @app.get("/status")
     def status():
@@ -153,6 +162,41 @@ def build_api(ctl: Controller):
             return ctl.set_policy(body)
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    def _sim():
+        if ctl.simulator is None:
+            raise HTTPException(status_code=409, detail="the server has not started serving yet")
+        return ctl.simulator
+
+    @app.get("/traffic/presets")
+    def traffic_presets():
+        from gitm.server.simulate import PRESETS
+
+        return PRESETS
+
+    @app.get("/traffic")
+    def traffic_runs():
+        return [r.brief() for r in _sim().runs.values()]
+
+    @app.post("/traffic/simulate", status_code=202)
+    def simulate(body: dict):
+        try:
+            run = _sim().start(str(body.get("preset", "chat")),
+                               rate_rps=body.get("rate_rps"),
+                               duration_s=float(body.get("duration_s", 120.0)),
+                               burstiness=body.get("burstiness"), seed=body.get("seed"))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        ctl.event("traffic.started", id=run.id, preset=run.preset, rate_rps=run.rate_rps,
+                  duration_s=run.duration_s)
+        return run.brief()
+
+    @app.post("/traffic/{ident}/stop")
+    def stop_traffic(ident: str):
+        sim = _sim()
+        if ident not in sim.runs:
+            raise HTTPException(status_code=404, detail="no such traffic run")
+        return sim.stop(ident).brief()
 
     @app.get("/promotions")
     def promotions():

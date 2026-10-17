@@ -237,6 +237,9 @@ def _parser() -> argparse.ArgumentParser:
     _add_capture(sub)
 
     sub.add_parser("doctor", help="Probe environment, GPUs, and data locations.")
+    dash = sub.add_parser("dashboard", help="Open a dashboard that links to a gitm server.")
+    dash.add_argument("--port", type=int, default=7080)
+    dash.add_argument("--no-open", action="store_true", help="Do not open a browser.")
     mcp_cmd = sub.add_parser("mcp", help="Serve a gitm server's control API to an agent over "
                                          "MCP (stdio).")
     mcp_cmd.add_argument("--url", default="http://127.0.0.1:7070",
@@ -1031,6 +1034,11 @@ def main(argv: list[str] | None = None) -> int:
             if getattr(args, flag, False):
                 argv.append("--" + flag.replace("_", "-"))
         return install_main(argv)
+
+    if args.cmd == "dashboard":
+        from gitm.dashboard import serve as serve_dashboard
+
+        return serve_dashboard(args.port, open_browser=not args.no_open)
 
     if args.cmd == "mcp":
         from gitm.server.mcp import main as mcp_main
