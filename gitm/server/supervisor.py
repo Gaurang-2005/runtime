@@ -89,6 +89,13 @@ class EngineProcess:
 
     def environment(self) -> dict[str, str]:
         env = os.environ.copy()
+        # The engine shells out to tools installed beside this interpreter (vLLM
+        # JIT-builds kernels with `ninja`). From an activated venv they are on
+        # PATH; from `.venv/bin/gitm` they are not, and the engine dies at
+        # warmup with "No such file or directory: 'ninja'".
+        bindir = str(Path(sys.executable).parent)
+        if bindir not in env.get("PATH", "").split(os.pathsep):
+            env["PATH"] = os.pathsep.join(filter(None, [bindir, env.get("PATH")]))
         env.update(self.spec.env)
         # Untraced: the injection variables are read once, at CUDA init, from
         # whatever the child inherits, so they are removed rather than left unset.
