@@ -216,3 +216,39 @@ def test_probation_watcher_reverts_a_promoted_engine_that_dies(server):
             break
         time.sleep(0.01)
     assert iv.status == "reverted" and "exited" in iv.detail
+
+
+def with_load(v, rps):
+    for r in v["raw"]:
+        r["metrics"]["stable_rps"] = rps
+    return v
+
+
+def test_a_shared_gpu_measurement_under_production_load_is_not_promoted():
+    rules = promotion.check(KNOBS, with_load(verdict(), 1.0), ctx(shared_gpu=True))
+    assert "isolated_measurement" in failed(rules)
+    quiet = promotion.check(KNOBS, with_load(verdict(), 0.0), ctx(shared_gpu=True))
+    assert "isolated_measurement" not in failed(quiet)
+    unknown = promotion.check(KNOBS, verdict(), ctx(shared_gpu=True))
+    assert "isolated_measurement" in failed(unknown)
+    own_gpus = promotion.check(KNOBS, with_load(verdict(), 5.0), ctx(shared_gpu=False))
+    assert "isolated_measurement" not in failed(own_gpus)
+
+
+def test_engines_share_a_gpu_unless_both_are_pinned_apart():
+    from gitm.server.controller import shares_gpus
+
+    a, b = FakeEngine("stable", 1, []), FakeEngine("canary", 2, [])
+    assert shares_gpus(a, b)                       # neither pinned: both see every GPU
+    a.spec.gpus, b.spec.gpus = "0,1,2,3", "4,5,6,7"
+    assert not shares_gpus(a, b)
+    b.spec.gpus = "3,4"
+    assert shares_gpus(a, b)
+
+
+def test_correctness_compares_the_arms_choices_position_by_position():
+    from gitm.server.canary import agreement
+
+    ref = [[1, 2, 3, 4], [5, 6]]
+    assert agreement(ref, ref) == 1.0              # an arm against itself
+    assert agreement([[1, 2, 3, 9], [5, 6]], ref) == pytest.approx(5 / 6)

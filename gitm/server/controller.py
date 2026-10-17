@@ -91,6 +91,15 @@ def port_free(port: int, host: str = "127.0.0.1") -> bool:
         return True
 
 
+def shares_gpus(a: EngineProcess | None, b: EngineProcess | None) -> bool:
+    """Whether two engines can run on the same GPU. Unset means every GPU."""
+    if a is None or b is None:
+        return False
+    if a.spec.gpus is None or b.spec.gpus is None:
+        return True
+    return bool(set(a.spec.gpus.split(",")) & set(b.spec.gpus.split(",")))
+
+
 class Controller:
     def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
@@ -339,6 +348,7 @@ class Controller:
             policy=self.policy, now=time.time(), verdict_finished=iv.finished,
             tested_regime=tested, live_regime=live,
             stable_placement=placement(stable), canary_placement=placement(canary),
+            shared_gpu=shares_gpus(stable, canary),
             canary_alive=bool(canary and canary.alive),
             canary_runs_candidate=bool(canary and canary.spec.serve_args == iv.candidate_args),
             last_promotion_t=self.state["last_promotion_t"],
@@ -638,12 +648,21 @@ class Controller:
                                 "correctness": s.correctness,
                                 **{k: s.metrics.get(k) for k in
                                    (self.policy["primary_metric"]["name"], "output_throughput",
-                                    "p99_ttft_ms", "p99_itl_ms")}})
+                                    "p99_ttft_ms", "p99_itl_ms", "stable_rps")}})
             self._save(iv)
             self.event("intervention.sample", id=iv.id, arm=arm, index=index)
 
+        def stable_load(t0: float, t1: float) -> float:
+            try:
+                done = [r for r in self.proxy_call("GET", "/admin/stats", params={"since": t0})
+                        if r["t_end"] <= t1 and r["upstream"] == stable.base_url]
+            except Exception:
+                return float("nan")
+            return len(done) / max(t1 - t0, 1e-6)
+
         sampler = ReplaySampler(canary, plan, regime, result_dir=out / "bench",
-                                tokenizer=self.cfg.model, cancel=cancel, on_sample=on_sample)
+                                tokenizer=self.cfg.model, cancel=cancel, on_sample=on_sample,
+                                stable_load=stable_load)
         verdict = evaluate(contract, applicator, sampler,
                            provenance={"window": str(window), "policy": self.policy,
                                        "stable_args": stable_args,

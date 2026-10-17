@@ -46,6 +46,11 @@ PROMOTION_DEFAULTS: dict[str, Any] = {
     "max_verdict_age_s": 7200.0,
     # log2 units on each regime axis (1.0 = traffic changed 2x on some axis).
     "max_regime_distance": 1.0,
+    # When stable and canary share a GPU, stable's production load competes
+    # with the canary's measurement. Above this many stable requests/s during
+    # any sample, the measurement is not of the candidate alone. Measured: ~1
+    # req/s on a shared RTX 4050 turned CUDA graphs' +21% into +2% (-16..+21%).
+    "max_shared_gpu_stable_rps": 0.1,
     "min_interval_s": 1800.0,
     "revert_cooldown_s": 3600.0,
     "paused": False,
@@ -82,8 +87,9 @@ class PromotionContext:
     live_regime: Any | None       # the newest window's regime, if any
     stable_placement: dict[str, Any]
     canary_placement: dict[str, Any]
-    canary_alive: bool
-    canary_runs_candidate: bool
+    shared_gpu: bool = False
+    canary_alive: bool = True
+    canary_runs_candidate: bool = True
     last_promotion_t: float | None = None
     last_revert_t: float | None = None
     reverted: list[dict[str, Any]] = field(default_factory=list)
@@ -145,6 +151,19 @@ def check(knobs: dict[str, Any], verdict: dict[str, Any], ctx: PromotionContext)
     rule("verdict_recent", age is not None and age <= p["max_verdict_age_s"],
          f"verdict age {'unknown' if age is None else f'{age:.0f}s'}, "
          f"limit {p['max_verdict_age_s']:.0f}s")
+
+    loads = [(r["metrics"] or {}).get("stable_rps") for r in verdict.get("raw", [])]
+    loads = [x for x in loads if x is not None]
+    if not ctx.shared_gpu:
+        rule("isolated_measurement", True, "canary has its own GPUs")
+    elif not loads or any(math.isnan(x) for x in loads):
+        rule("isolated_measurement", False,
+             "canary shares stable's GPU and stable's load during the test is unknown")
+    else:
+        worst = max(loads)
+        rule("isolated_measurement", worst <= p["max_shared_gpu_stable_rps"],
+             f"canary shares stable's GPU; stable served up to {worst:.2f} req/s during a "
+             f"sample, limit {p['max_shared_gpu_stable_rps']:g}")
 
     # --- traffic
     if ctx.live_regime is None:
