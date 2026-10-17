@@ -1,0 +1,141 @@
+"""Run ``vllm serve`` engines, each with its own environment, port and GPUs.
+
+:func:`gitm.serve.vllm.launch_and_capture` runs one server and sets its tracing
+variables on *this* process's ``os.environ``, which every child then inherits.
+Two engines cannot be launched that way with different settings, so an engine
+here gets a copied environment of its own, with the collector variables cleared
+by the same :func:`~gitm.serve.vllm.apply_tracing_env` the capture path uses.
+
+The serving flags (``serve_args``) are kept apart from the ones this module adds
+to place the engine (``--host``, ``--port``, ``--gpu-memory-utilization``): the
+first are the configuration being tuned and compared, the second are where it
+runs. That is the same split :data:`gitm.optimizer.harness_results.LAUNCH_ONLY_FLAGS`
+draws, so comparing two engines never counts their different ports as a change.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from gitm.serve.vllm import _arg_of, apply_tracing_env, served_model_name, shutdown, wait_healthy
+
+
+def _vllm_executable() -> str:
+    """The ``vllm`` beside this interpreter, so an un-activated venv still finds it."""
+    local = Path(sys.executable).parent / "vllm"
+    if local.exists():
+        return str(local)
+    return shutil.which("vllm") or "vllm"
+
+
+@dataclass
+class EngineSpec:
+    """What to run and where.
+
+    ``serve_args`` is the configuration (everything after ``vllm serve <model>``
+    that changes how the engine behaves). Placement lives in the other fields.
+    """
+
+    role: str                     # "stable" | "canary" | "standby"
+    model: str
+    port: int
+    serve_args: list[str] = field(default_factory=list)
+    gpus: str | None = None       # CUDA_VISIBLE_DEVICES for this engine
+    mem_fraction: float | None = None
+    env: dict[str, str] = field(default_factory=dict)
+
+    def argv(self) -> list[str]:
+        cmd = [_vllm_executable(), "serve", self.model, *self.serve_args,
+               "--host", "127.0.0.1", "--port", str(self.port)]
+        if self.mem_fraction is not None and _arg_of(self.serve_args,
+                                                     "--gpu-memory-utilization") is None:
+            cmd += ["--gpu-memory-utilization", f"{self.mem_fraction:g}"]
+        return cmd
+
+    def config_argv(self) -> list[str]:
+        """The configuration as ``vllm serve`` argv, without placement: what is compared."""
+        return ["vllm", "serve", self.model, *self.serve_args]
+
+
+class EngineProcess:
+    """One ``vllm serve`` process: start, wait for health, stop."""
+
+    def __init__(self, spec: EngineSpec, log_dir: str | Path):
+        self.spec = spec
+        self.log_dir = Path(log_dir)
+        self.proc: subprocess.Popen | None = None
+        self.started_at: float | None = None
+        self.healthy_at: float | None = None
+        self.served_model: str | None = None
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.spec.port}"
+
+    @property
+    def log_path(self) -> Path:
+        return self.log_dir / f"{self.spec.role}-{self.spec.port}.log"
+
+    @property
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def environment(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env.update(self.spec.env)
+        # Untraced: the injection variables are read once, at CUDA init, from
+        # whatever the child inherits, so they are removed rather than left unset.
+        apply_tracing_env(env, None, nvtx=False, no_trace=True)
+        if self.spec.gpus is not None:
+            env["CUDA_VISIBLE_DEVICES"] = self.spec.gpus
+        return env
+
+    def start(self) -> None:
+        if self.alive:
+            raise RuntimeError(f"{self.spec.role} engine already running (pid {self.proc.pid})")
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        log = self.log_path.open("ab")
+        # Own session: the engine is a process tree (EngineCore plus a worker per
+        # rank), and shutdown() signals the whole group. It also means a crash of
+        # the controller does not take a serving engine with it.
+        self.proc = subprocess.Popen(self.spec.argv(), env=self.environment(), stdout=log,
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+        log.close()
+        self.started_at = time.time()
+        self.healthy_at = None
+
+    def wait_healthy(self, timeout_s: float = 1800.0) -> None:
+        if self.proc is None:
+            raise RuntimeError("engine was never started")
+        wait_healthy(self.base_url, self.proc, timeout_s, self.log_path)
+        self.healthy_at = time.time()
+        self.served_model = served_model_name(self.base_url, self.spec.model)
+
+    def stop(self) -> None:
+        if self.proc is not None:
+            shutdown(self.proc)
+
+    def info(self) -> dict[str, Any]:
+        return {
+            "role": self.spec.role,
+            "model": self.spec.model,
+            "served_model": self.served_model,
+            "url": self.base_url,
+            "pid": self.proc.pid if self.proc else None,
+            "alive": self.alive,
+            "gpus": self.spec.gpus,
+            "mem_fraction": self.spec.mem_fraction,
+            "serve_args": list(self.spec.serve_args),
+            "started_at": self.started_at,
+            "healthy_at": self.healthy_at,
+            "startup_s": (round(self.healthy_at - self.started_at, 1)
+                          if self.healthy_at and self.started_at else None),
+            "log": str(self.log_path),
+        }

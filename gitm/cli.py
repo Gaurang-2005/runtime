@@ -98,7 +98,8 @@ def _parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd")
 
     run = sub.add_parser("run", help="Run the autonomous optimization loop.")
-    run.add_argument("--workload", required=True, help="Workload identifier, e.g. vllm-decode.")
+    run.add_argument("--workload", default=None,
+                     help="Workload identifier, e.g. vllm-decode. Required unless --server.")
     run.add_argument("--budget", default="24h", help="Wall-clock budget, e.g. 24h.")
     run.add_argument(
         "--rerank", choices=("off", "recapture"), default="off",
@@ -153,6 +154,29 @@ def _parser() -> argparse.ArgumentParser:
         help="Override $GITM_SCRATCH (local ephemeral run dir; datasets stay in S3).",
     )
     run.add_argument("--report", type=Path, default=None, help="Write report markdown here.")
+    srv = run.add_argument_group(
+        "server mode", "Run gitm as a long-lived server in front of vllm serve: a stable "
+        "engine behind gitm's OpenAI-compatible proxy, with traffic recorded and a "
+        "control API. --scratch sets its working directory.")
+    srv.add_argument("--server", action="store_true", help="Run in server mode.")
+    srv.add_argument("--model", default=None, help="Model to serve (as for vllm serve).")
+    srv.add_argument("--serve-args", default="", metavar="ARGS",
+                     help="Extra vllm serve flags, one quoted string, e.g. "
+                          "\"--max-model-len 8192 --enable-prefix-caching\".")
+    srv.add_argument("--host", default="127.0.0.1",
+                     help="Interface the proxy listens on (default 127.0.0.1).")
+    srv.add_argument("--port", type=int, default=8000, help="Proxy port clients call.")
+    srv.add_argument("--api-port", type=int, default=7070, help="Control API port.")
+    srv.add_argument("--stable-port", type=int, default=8100, help=argparse.SUPPRESS)
+    srv.add_argument("--canary-port", type=int, default=8101, help=argparse.SUPPRESS)
+    srv.add_argument("--stable-gpus", default=None, metavar="IDS",
+                     help="CUDA_VISIBLE_DEVICES for the stable engine.")
+    srv.add_argument("--canary-gpus", default=None, metavar="IDS",
+                     help="CUDA_VISIBLE_DEVICES for the canary engine.")
+    srv.add_argument("--mem-fraction", type=float, default=None,
+                     help="--gpu-memory-utilization per engine, e.g. 0.4 when both "
+                          "share one GPU.")
+    srv.add_argument("--no-record", action="store_true", help="Do not record served traffic.")
     # hft-only data-selection flags (mapped onto the GITM_BENCH_* env the
     # workload factory reads). No-ops for other workloads — using them there errors.
     run.add_argument("--seed", type=int, default=None, help="hft: dataset seed.")
@@ -826,7 +850,18 @@ def main(argv: list[str] | None = None) -> int:
         _parser().print_help()
         return 0
 
+    if args.cmd == "run" and args.server:
+        if not args.model:
+            print("gitm run --server needs --model", file=sys.stderr)
+            return 2
+        from gitm.server.run import config_from_args, run_server
+
+        return run_server(config_from_args(args))
+
     if args.cmd == "run":
+        if not args.workload:
+            print("gitm run needs --workload (or --server)", file=sys.stderr)
+            return 2
         from gitm import optimize
         from gitm.tracer import injection
 
