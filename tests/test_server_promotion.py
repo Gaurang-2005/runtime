@@ -260,3 +260,14 @@ def test_correctness_compares_the_arms_choices_position_by_position():
     ref = [[1, 2, 3, 4], [5, 6]]
     assert agreement(ref, ref) == 1.0              # an arm against itself
     assert agreement([[1, 2, 3, 9], [5, 6]], ref) == pytest.approx(5 / 6)
+
+
+def test_probation_falls_back_to_the_ab_baseline_when_stable_was_quiet(server):
+    ctl, stable, canary, routes, iv = server
+    ctl.proxy_call = lambda method, path, json=None, params=None, timeout=10.0: (
+        {"drained": True} if path == "/admin/upstream" else [])
+    iv.verdict = verdict(base_values=(8.0, 8.0, 8.0))
+    speed, source = ctl._probation_baseline(iv, stable)
+    assert speed == pytest.approx(125.0) and "A/B baseline arm" in source
+    iv.verdict = None
+    assert ctl._probation_baseline(iv, stable)[0] is None

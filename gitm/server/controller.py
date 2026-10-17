@@ -396,10 +396,7 @@ class Controller:
             if failed:
                 raise ValueError(f"promotion rules failed: {failed}")
             old, new = self.engines["stable"], self.engines["canary"]
-            before = [s for s in self.proxy_call("GET", "/admin/stats",
-                                                 params={"since": time.time() - 300})
-                      if s["upstream"] == old.base_url]
-            baseline = promotion.decode_speed(before)
+            baseline, baseline_source = self._probation_baseline(iv, old)
             swap = self.proxy_call("POST", "/admin/upstream", timeout=200.0,
                                    json={"url": new.base_url, "drain_timeout_s": 120.0})
             old.spec.role, new.spec.role = "standby", "stable"
@@ -415,14 +412,50 @@ class Controller:
                 self.audit.record_apply(iv.id, knob=k, value=v, cause=cause)
             iv.status, iv.detail = "promoted", f"in probation for {self.policy['probation_s']:.0f}s"
             self._save(iv)
+            record["probation_baseline"] = {"decode_tok_s": baseline, "source": baseline_source}
             self.probation = {"intervention": iv.id, "started": now,
                               "ends": now + self.policy["probation_s"],
-                              "baseline_decode_tok_s": baseline, "record": record,
+                              "baseline_decode_tok_s": baseline,
+                              "baseline_source": baseline_source, "record": record,
                               "watch": promotion.Probation(baseline, self.policy)}
             self.event("promotion.swapped", id=iv.id, drained=swap.get("drained"),
-                       baseline_decode_tok_s=baseline)
+                       baseline_decode_tok_s=baseline, baseline_source=baseline_source)
         threading.Thread(target=self._watch_probation, name="gitm-probation", daemon=True).start()
         return record
+
+    def _probation_baseline(self, iv: Intervention, old: EngineProcess
+                            ) -> tuple[float | None, str]:
+        """The old engine's per-request decode speed, for probation to compare with.
+
+        Live traffic on the old engine is the right reference, but the A/B is
+        run while stable is quiet (isolated_measurement), so the minutes just
+        before a swap often have none: the first full promotion on the laptop
+        started probation with no speed baseline at all and guarded on errors
+        only. So: the last 5 minutes if they hold enough requests, else the last
+        30; failing both, the verdict's own baseline arm (1000 / mean TPOT), which
+        was measured on the replayed load rather than the live one.
+        """
+        from gitm.server import promotion
+
+        need = self.policy["min_window_requests"]
+        for lookback in (300, 1800):
+            try:
+                before = [s for s in self.proxy_call("GET", "/admin/stats",
+                                                     params={"since": time.time() - lookback})
+                          if s["upstream"] == old.base_url]
+            except Exception:
+                before = []
+            if len(before) >= need:
+                speed = promotion.decode_speed(before)
+                if speed:
+                    return speed, f"live traffic on the old engine, last {lookback // 60} min"
+        metric = self.policy["primary_metric"]["name"]
+        tpots = [r["metrics"][metric] for r in (iv.verdict or {}).get("raw", [])
+                 if r["arm"] == "baseline" and not r.get("warmup")
+                 and r["metrics"].get(metric, 0) > 0]
+        if metric == "mean_tpot_ms" and tpots:
+            return 1000.0 / (sum(tpots) / len(tpots)), "the A/B baseline arm (1000 / mean TPOT)"
+        return None, "none available: probation guards on errors only"
 
     def _watch_probation(self) -> None:
         p = self.probation
