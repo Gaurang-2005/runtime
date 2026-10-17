@@ -116,7 +116,9 @@ def test_a_faster_candidate_is_improved_and_left_on_the_canary(tmp_path):
 def test_a_candidate_that_changes_the_answers_is_invalid_and_rolled_back(tmp_path):
     canary = FakeCanary()
     v = evaluate(_contract(tmp_path), canary, FakeSampler(canary, correct=0.75))
-    assert v.state == "invalid" and v.rollback == "rolled_back"
+    # ABBA with an even count ends on a baseline arm, so the candidate may
+    # already be off: either way the canary is left on stable's flags.
+    assert v.state == "invalid" and v.rollback in ("rolled_back", "not_applied")
     assert canary.args == ["--max-num-batched-tokens", "8192"]
 
 

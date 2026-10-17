@@ -12,8 +12,8 @@ drives, and builds the contract it reads:
 * :class:`CanaryApplicator` — snapshot / apply / restore by relaunching the
   canary ``vllm serve`` with different flags;
 * :class:`ReplaySampler` — one ``vllm bench serve`` replay of the window, plus a
-  correctness probe: fixed prompts at temperature 0, compared with what the
-  baseline arm answered.
+  correctness probe: the candidate is fed the baseline arm's greedy answers to
+  fixed prompts and must rank (nearly) every one of those tokens first.
 
 The verdict — improved, regressed, inconclusive, invalid, failed to execute — is
 the evaluator's, not recomputed here.
@@ -174,16 +174,45 @@ def _post(url: str, body: dict, timeout: float = 60.0) -> dict:
     return json.loads(raw) if raw else {}
 
 
-def probe(engine: EngineProcess) -> list[str]:
-    """The canary's greedy answers to the fixed probe prompts."""
+def reference_tokens(engine: EngineProcess) -> list[tuple[list[int], list[int]]]:
+    """(prompt token ids, greedy continuation token ids) for each probe prompt."""
     model = engine.served_model or engine.spec.model
     out = []
     for prompt in PROBES:
         r = _post(engine.base_url + "/v1/completions",
                   {"model": model, "prompt": prompt, "max_tokens": PROBE_TOKENS,
-                   "temperature": 0.0, "seed": 0})
-        out.append(r["choices"][0]["text"])
+                   "temperature": 0.0, "seed": 0, "return_token_ids": True})
+        choice = r["choices"][0]
+        out.append((list(choice["prompt_token_ids"]), list(choice["token_ids"])))
     return out
+
+
+def token_agreement(engine: EngineProcess, refs: list[tuple[list[int], list[int]]]) -> float:
+    """Fraction of the reference's greedy tokens this engine also ranks first.
+
+    Teacher-forced: the engine is given each reference prompt *plus* the
+    reference continuation, and ``prompt_logprobs`` reports the rank of every
+    token in it. A change that only moves numerics (CUDA graphs, another
+    attention kernel, a different batch shape) keeps nearly every token at rank
+    1 even where free-running greedy output would branch after a near-tie; a
+    model that is actually broken does not. Exact match of free-running text
+    cannot tell those apart: on the first GPU run, CUDA graphs on Qwen2.5-0.5B
+    changed 3 of 4 greedy answers.
+    """
+    model = engine.served_model or engine.spec.model
+    agree = total = 0
+    for prompt_ids, cont in refs:
+        if not cont:
+            continue
+        r = _post(engine.base_url + "/v1/completions",
+                  {"model": model, "prompt": prompt_ids + cont, "max_tokens": 1,
+                   "temperature": 0.0, "prompt_logprobs": 1})
+        ranks = r["choices"][0]["prompt_logprobs"][len(prompt_ids):]
+        for tok, entry in zip(cont, ranks, strict=False):
+            total += 1
+            info = (entry or {}).get(str(tok)) or (entry or {}).get(tok)
+            agree += bool(info and info.get("rank") == 1)
+    return agree / total if total else 0.0
 
 
 class ReplaySampler:
@@ -221,13 +250,10 @@ class ReplaySampler:
             raise RuntimeError(f"replay failed: {run.summary()}; {run.stderr_tail[-400:]}")
         metrics = {k: float(v) for k, v in (run.joined.metrics if run.joined else run.result)
                    .items() if isinstance(v, int | float) and not isinstance(v, bool)}
-        answers = probe(self.engine)
         if arm == "baseline" and self.reference is None:
-            self.reference = answers
-        if self.reference is None:
-            correctness = None
-        else:
-            correctness = sum(a == b for a, b in zip(answers, self.reference, strict=True)) / len(PROBES)
+            self.reference = reference_tokens(self.engine)
+        correctness = (None if self.reference is None
+                       else token_agreement(self.engine, self.reference))
         wall = time.monotonic() - started
         s = Sample(metrics=metrics, wall_s=wall, accelerator_s=wall, correctness=correctness)
         self.on_sample(arm, index, s)
@@ -281,8 +307,9 @@ def build_contract(*, intervention_id: str, knobs: dict[str, Any], stable_args: 
         candidate=ArmConfig(label="candidate", engine_args=cand),
         budget=Budget(max_wall_clock_s=policy["max_wall_clock_s"],
                       max_accelerator_s=policy["max_wall_clock_s"]),
-        correctness_gate=CorrectnessGate(method="exact_match",
-                                         reference="the baseline arm's greedy answers to "
+        correctness_gate=CorrectnessGate(method="token_agreement",
+                                         reference="teacher-forced top-1 agreement with the "
+                                                   "baseline arm's greedy tokens on "
                                                    f"{len(PROBES)} fixed probe prompts",
                                          min_score=policy["min_correctness"]),
         latency_gates=[LatencyGate(metric=g["metric"], max_regression=g["max_regression"])

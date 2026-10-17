@@ -22,13 +22,15 @@ DEFAULT_POLICY: dict[str, Any] = {
         {"metric": "p99_ttft_ms", "max_regression": 0.10},
         {"metric": "p99_itl_ms", "max_regression": 0.10},
     ],
-    # Kept samples per arm, ABBA order, paired.
-    "repetitions": 3,
+    # Kept samples per arm, ABBA order, paired. 4, not 3: the first GPU run's
+    # eager baseline wandered 6.9-9.2 ms/token across 3 samples, and a paired
+    # t-interval on 3 pairs (t=4.3) could not separate a real +21% from that.
+    "repetitions": 4,
     "warmup_reps": 0,
-    # Fraction of the fixed probe prompts that must answer exactly as the
-    # baseline arm did. 1.0: a candidate that changes greedy output is not the
-    # same model, whatever its speed.
-    "min_correctness": 1.0,
+    # Teacher-forced top-1 agreement with the baseline arm's greedy tokens on
+    # the probe prompts. Numerics-only changes score ~0.95-1.0; a broken model
+    # far less. Below this the candidate is not the same model, whatever its speed.
+    "min_correctness": 0.95,
     "max_wall_clock_s": 3600.0,
     # --- the traffic -----------------------------------------------------------
     # A window with fewer requests than this is not a measurement of anything.
