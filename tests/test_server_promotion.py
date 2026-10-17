@@ -47,6 +47,14 @@ def failed(rules):
 KNOBS = {"max_num_batched_tokens": 16384}
 
 
+def test_the_first_real_cuda_graph_win_passes_the_noise_rules():
+    """The RTX 4050 control: +11.0%, CI [+5.5%, +16.4%], baseline spread 3.73%."""
+    v = verdict(lo=0.0555, hi=0.1645, base_values=(7.28, 7.18, 7.36, 6.76))
+    v["effect"] = 0.110
+    rules = {r.name: r for r in promotion.check(KNOBS, v, ctx())}
+    assert rules["clears_noise"].passed and rules["interval_meaningful"].passed
+
+
 def test_a_clean_improvement_passes_every_rule():
     rules = promotion.check(KNOBS, verdict(), ctx())
     assert failed(rules) == [] and promotion.all_pass(rules)
@@ -55,8 +63,8 @@ def test_a_clean_improvement_passes_every_rule():
 
 @pytest.mark.parametrize("make, rule", [
     (lambda: (verdict(state="inconclusive"), ctx()), "verdict_improved"),
-    (lambda: (verdict(lo=0.01), ctx()), "clears_noise"),               # below min_effect
-    (lambda: (verdict(lo=0.05, base_values=(10, 12, 8)), ctx()), "clears_noise"),  # noisy
+    (lambda: (verdict(lo=0.01), ctx()), "interval_meaningful"),        # low end < min_effect
+    (lambda: (verdict(lo=0.03, hi=0.09, base_values=(10, 12, 8)), ctx()), "clears_noise"),
     (lambda: (verdict(), ctx(verdict_finished=time.time() - 99999)), "verdict_recent"),
     (lambda: (verdict(), ctx(live_regime=regime(input_p50=4000, input_p95=5000))),
      "traffic_unchanged"),

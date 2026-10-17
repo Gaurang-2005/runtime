@@ -38,9 +38,10 @@ PROMOTION_DEFAULTS: dict[str, Any] = {
     "auto_promote": True,
     "require_approval": False,
     "promote_min_rounds": 3,
-    # The interval's lower bound must clear max(min_effect, noise_factor x the
-    # baseline arm's own relative spread). The spread is this test's noise floor:
-    # the same configuration measured repeatedly on the same canary.
+    # The effect must clear max(min_effect, noise_factor x the baseline arm's own
+    # relative spread) -- the spread is this test's noise floor: the same
+    # configuration measured repeatedly on the same canary -- and the interval's
+    # low end must clear min_effect.
     "min_effect": 0.02,
     "noise_factor": 2.0,
     "max_verdict_age_s": 7200.0,
@@ -131,12 +132,21 @@ def check(knobs: dict[str, Any], verdict: dict[str, Any], ctx: PromotionContext)
     rule("enough_rounds", n >= p["promote_min_rounds"],
          f"{n} candidate samples, need {p['promote_min_rounds']}")
     interval = verdict.get("interval")
+    effect = verdict.get("effect")
     bar, spread = noise_bar(verdict, p)
     lo = interval[0] if interval else None
-    rule("clears_noise", lo is not None and lo > bar,
-         f"interval low {lo if lo is None else f'{lo:+.2%}'} vs bar {bar:.2%} "
+    # Noise is counted once in each check. The effect (the mean) against this
+    # test's own noise is the batch loop's keep rule (mean delta vs 2x floor);
+    # the interval already subtracts t x SE, so its low end is held only to
+    # min_effect. Holding the low end to 2x spread counted the noise twice: a
+    # clean +11% with CI [+5.5%, +16.4%] could never pass it.
+    rule("clears_noise", effect is not None and effect >= bar,
+         f"effect {'n/a' if effect is None else f'{effect:+.2%}'} vs bar {bar:.2%} "
          f"(min_effect {p['min_effect']:.0%}, baseline spread "
          f"{'n/a' if spread is None else f'{spread:.2%}'} x {p['noise_factor']:g})")
+    rule("interval_meaningful", lo is not None and lo >= p["min_effect"],
+         f"interval low {'n/a' if lo is None else f'{lo:+.2%}'} vs min_effect "
+         f"{p['min_effect']:.0%}")
     corr = verdict.get("correctness") or {}
     rule("correctness", corr.get("status") == "pass", corr.get("detail", "not run"))
     lat = verdict.get("latency") or []
