@@ -234,6 +234,20 @@ def build_apps(state: ProxyState, client=None):
 
         return StreamingResponse(events(), status_code=resp.status_code, headers=headers)
 
+    @public.get("/")
+    async def chat_page():
+        """A minimal chat page, so a phone browser can talk to the served model.
+
+        It calls this proxy's own /v1, so its messages are served by stable and
+        recorded like any other client's. Static: nothing here touches state.
+        """
+        from importlib import resources
+
+        from fastapi.responses import HTMLResponse
+
+        return HTMLResponse(resources.files("gitm.server").joinpath("chat.html").read_text(),
+                            headers={"Cache-Control": "no-store"})
+
     @public.get("/health")
     async def health():
         try:

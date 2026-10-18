@@ -237,3 +237,11 @@ def test_the_api_refuses_a_missing_token(tmp_path):
     assert client.get("/events").status_code == 401
     ok = client.get("/events", headers={"Authorization": f"Bearer {ctl.token}"})
     assert ok.status_code == 200 and ok.json() == []
+
+
+@run_async
+async def test_the_proxy_serves_a_chat_page_that_talks_to_its_own_v1(tmp_path):
+    state, client, _ = make(tmp_path, {"a": fake_vllm("a")})
+    r = await client.get("/")
+    assert r.status_code == 200 and "<title>gitm chat</title>" in r.text
+    assert "/v1/chat/completions" in r.text and ".innerHTML" not in r.text

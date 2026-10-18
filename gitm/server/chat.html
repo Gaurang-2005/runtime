@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>gitm chat</title>
+<style>
+:root { --bg:#f6f7f4; --panel:#fff; --fg:#1d2420; --muted:#66706a; --line:#dfe3dd; --me:#e3efe7; --accent:#2f6f4f; }
+@media (prefers-color-scheme: dark) { :root { --bg:#121614; --panel:#1a201d; --fg:#e4e9e5; --muted:#93a099; --line:#2b332f; --me:#1f3329; --accent:#6fbf94; } }
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 16px/1.45 -apple-system, system-ui, sans-serif;
+  display: flex; flex-direction: column; padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+header { padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 8px; }
+header b { font-size: 15px; } header span { color: var(--muted); font-size: 12px; text-align: right; }
+#log { flex: 1; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.msg { max-width: 88%; padding: 9px 12px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; }
+.me { align-self: flex-end; background: var(--me); }
+.bot { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); }
+.stat { align-self: flex-start; color: var(--muted); font-size: 12px; margin-top: -6px; font-variant-numeric: tabular-nums; }
+form { display: flex; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); background: var(--bg); }
+textarea { flex: 1; min-width: 0; font: inherit; color: var(--fg); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 9px 10px; resize: none; height: 44px; }
+button { font: inherit; border: 0; background: var(--accent); color: var(--panel); border-radius: 10px; padding: 0 16px; }
+button:disabled { opacity: .5; }
+</style>
+</head>
+<body>
+<header><b>gitm chat</b><span id="model">connecting…</span></header>
+<div id="log"></div>
+<form id="f"><textarea id="q" placeholder="Message" aria-label="message"></textarea><button id="send">Send</button></form>
+<script>
+"use strict";
+// Talks to this proxy's own /v1, so every message is served by the stable engine
+// and recorded exactly like any client's request. Text is inserted as text only.
+const log = document.getElementById("log"), q = document.getElementById("q"), send = document.getElementById("send");
+let model = null; const history = [];
+fetch("/v1/models").then(r => r.json()).then(d => {
+  model = d.data[0].id; document.getElementById("model").textContent = model;
+}).catch(e => { document.getElementById("model").textContent = "server unreachable: " + e; });
+
+function bubble(cls, text) {
+  const d = document.createElement("div"); d.className = "msg " + cls; d.textContent = text;
+  log.append(d); log.scrollTop = log.scrollHeight; return d;
+}
+document.getElementById("f").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const text = q.value.trim(); if (!text || !model) return;
+  q.value = ""; send.disabled = true;
+  history.push({ role: "user", content: text }); bubble("me", text);
+  const out = bubble("bot", "…");
+  const t0 = performance.now(); let first = null, tokens = 0, reply = "";
+  try {
+    const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages: history, stream: true, max_tokens: 512 }) });
+    const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+    while (true) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split("\n\n"); buf = parts.pop();
+      for (const p of parts) {
+        const line = p.trim(); if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim(); if (data === "[DONE]") continue;
+        const delta = JSON.parse(data).choices?.[0]?.delta?.content;
+        if (delta) { if (first === null) first = performance.now(); tokens++; reply += delta; out.textContent = reply; log.scrollTop = log.scrollHeight; }
+      }
+    }
+  } catch (e) { out.textContent = "error: " + e; }
+  const end = performance.now();
+  history.push({ role: "assistant", content: reply });
+  const s = document.createElement("div"); s.className = "stat";
+  const decode = first && tokens > 1 ? ((tokens - 1) / ((end - first) / 1000)).toFixed(0) : "–";
+  s.textContent = `first word ${first ? Math.round(first - t0) : "–"} ms · ${decode} tok/s · ${((end - t0) / 1000).toFixed(1)} s total`;
+  log.append(s); log.scrollTop = log.scrollHeight; send.disabled = false; q.focus();
+});
+q.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); document.getElementById("f").requestSubmit(); } });
+</script>
+</body>
+</html>
