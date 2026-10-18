@@ -562,7 +562,11 @@ class Controller:
             iv.status, iv.detail = "promoted", f"in probation for {self.policy['probation_s']:.0f}s"
             self._save(iv)
             record["probation_baseline"] = {"decode_tok_s": baseline, "source": baseline_source}
+            # Stable is now tuned for the traffic this change won on. The old
+            # baseline is kept so a revert puts it back with the old configuration.
+            traffic_before = self.watch.to_state()
             self.probation = {"intervention": iv.id, "started": now,
+                              "traffic_before": traffic_before,
                               "ends": now + self.policy["probation_s"],
                               "baseline_decode_tok_s": baseline,
                               "baseline_source": baseline_source, "record": record,
@@ -646,6 +650,16 @@ class Controller:
                                    json={"url": old.base_url, "drain_timeout_s": 120.0})
             old.spec.role, promoted.spec.role = "stable", "canary"
             self.engines = {"stable": old, "canary": promoted}
+            # The old configuration is back, so is what it was tuned for; if live
+            # traffic differs from that, the watcher reports a change again.
+            self.watch.load_state(p.get("traffic_before"))
+            self.watch.threshold = self.policy["traffic_change_distance"]
+            if self.watch.current and self.watch.tuned:
+                from gitm.server.traffic import distance
+
+                self.watch.last_distance = distance(self.watch.tuned, self.watch.current)
+                self.watch.changed = bool(self.watch.last_distance is not None
+                                          and self.watch.last_distance > self.watch.threshold)
             now = time.time()
             p["record"]["outcome"] = f"reverted: {reason}"
             from gitm.server.promotion import knob_key

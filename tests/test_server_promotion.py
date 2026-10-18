@@ -271,3 +271,20 @@ def test_probation_falls_back_to_the_ab_baseline_when_stable_was_quiet(server):
     assert speed == pytest.approx(125.0) and "A/B baseline arm" in source
     iv.verdict = None
     assert ctl._probation_baseline(iv, stable)[0] is None
+
+
+def test_a_revert_puts_back_the_traffic_baseline_with_the_configuration(server):
+    from gitm.traffic.regime import Regime as R
+
+    ctl, stable, canary, routes, iv = server
+    ctl.policy["probation_interval_s"] = 3600
+    chat = regime().model_dump(mode="json")
+    docs = regime(input_p50=4000, input_p95=5000, io_ratio=25.0).model_dump(mode="json")
+    ctl.watch.observe(R.model_validate(chat), "w1")          # stable tuned for chat
+    ctl.watch.observe(R.model_validate(docs), "w2")          # traffic moves to docs
+    iv.regime = docs
+    ctl.promote(iv, cause="test")
+    assert ctl.watch.tuned["input_p50"] == 4000 and not ctl.watch.changed
+    ctl.revert("slower live", cause="test")
+    assert ctl.watch.tuned["input_p50"] == 900               # the old config's baseline
+    assert ctl.watch.changed                                 # live docs != chat: flagged again
