@@ -35,7 +35,7 @@ from typing import Any
 from gitm.safety.autorevert import AutoRevert
 
 PROMOTION_DEFAULTS: dict[str, Any] = {
-    "auto_promote": True,
+    # Even in autonomous mode, make every win wait for a person.
     "require_approval": False,
     "promote_min_rounds": 3,
     # The effect must clear max(min_effect, noise_factor x the baseline arm's own

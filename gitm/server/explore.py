@@ -1,7 +1,7 @@
 """What to test next when nobody has asked: candidates from gitm's lever catalogue.
 
-With ``auto_explore`` on, the controller asks this module for the next candidate
-whenever the canary is idle (nothing queued or running, no probation, not
+In assisted or autonomous mode (:mod:`gitm.server.autonomy`), the controller asks
+this module for the next candidate whenever the canary is idle (nothing queued or running, no probation, not
 paused) and queues it like any submitted change. Every candidate still goes
 through the whole A/B and every promotion rule; exploring only decides *what*
 is tried, never what is kept.
@@ -36,7 +36,6 @@ from gitm.server.canary import current_value, unchanged_knobs
 from gitm.server.promotion import knob_key
 
 EXPLORE_DEFAULTS: dict[str, Any] = {
-    "auto_explore": False,
     "explore_tiers": ["low_risk", "moderate"],
     "explore_skip_knobs": ["gpu_memory_utilization", "swap_space", "cpu_offload_gb",
                            "max_seq_len_to_capture"],

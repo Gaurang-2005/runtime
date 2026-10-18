@@ -96,7 +96,7 @@ def build_api(ctl: Controller):
             raise HTTPException(status_code=400, detail='body needs "knobs": {knob: value}')
         try:
             iv = ctl.submit(knobs, submitter=str(body.get("submitter", "api")),
-                            note=str(body.get("note", "")))
+                            note=str(body.get("note", "")), front=bool(body.get("front")))
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
         return iv.brief()
@@ -197,6 +197,77 @@ def build_api(ctl: Controller):
         if ident not in sim.runs:
             raise HTTPException(status_code=404, detail="no such traffic run")
         return sim.stop(ident).brief()
+
+    # --- autonomy: who decides what to test and what goes live
+
+    @app.get("/autonomy")
+    def autonomy():
+        return {"mode": ctl.mode,
+                "session": ctl.session.summary(time.time()) if ctl.session else None}
+
+    @app.post("/autonomy/start")
+    def autonomy_start(body: dict):
+        """{"mode": "assisted"|"autonomous", "budget_h"?, "max_tests"?,
+        "schedule"?: [[start_hour, end_hour], ...] (local), "allow_knobs"?,
+        "deny_knobs"?, "tiers"?}"""
+        try:
+            return ctl.start_session(
+                str(body.get("mode", "")), budget_h=body.get("budget_h"),
+                max_tests=body.get("max_tests"), schedule=body.get("schedule"),
+                allow_knobs=body.get("allow_knobs"), deny_knobs=body.get("deny_knobs"),
+                tiers=body.get("tiers"))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+
+    @app.post("/autonomy/stop")
+    def autonomy_stop(body: dict | None = None):
+        """Back to manual. {"cancel_current": true} also cancels a test gitm started."""
+        return ctl.stop_session(cancel_current=bool((body or {}).get("cancel_current")),
+                                reason="stopped by operator")
+
+    @app.get("/explore/preview")
+    def explore_preview(n: int = 5):
+        try:
+            return ctl.explore_preview(n)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    # --- the queue, in run order
+
+    @app.get("/queue")
+    def queue_view():
+        return ctl.queue_view()
+
+    @app.post("/queue/{ident}/move")
+    def queue_move(ident: str, body: dict):
+        try:
+            return ctl.move(ident, int(body.get("position", 0)))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    @app.post("/queue/{ident}/front")
+    def queue_front(ident: str):
+        try:
+            return ctl.move(ident, 0)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    # --- traffic: what stable is tuned for vs what is arriving now
+
+    @app.get("/traffic/watch")
+    def traffic_watch():
+        return ctl.watch.summary()
+
+    @app.post("/traffic/retune")
+    def traffic_retune():
+        """Declare the current traffic as what stable is tuned for (e.g. after a
+        deliberate workload change that needs no re-test)."""
+        if ctl.watch.current is None:
+            raise HTTPException(status_code=409, detail="no traffic observed yet")
+        ctl.watch.retune(ctl.watch.current)
+        ctl._save_state()
+        ctl.event("traffic.retuned")
+        return ctl.watch.summary()
 
     @app.get("/promotions")
     def promotions():

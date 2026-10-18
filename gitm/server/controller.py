@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import secrets
 import socket
 import subprocess
@@ -72,17 +71,23 @@ class Intervention:
     candidate_args: list[str] | None = None
     #: Stable's flags this was tested against: "tried" is per stable configuration.
     stable_args: list[str] | None = None
+    #: The traffic it was measured on (a Regime as a dict, at real speed): "tried"
+    #: is also per kind of traffic.
+    regime: dict[str, Any] | None = None
     progress: list[dict[str, Any]] = field(default_factory=list)
     verdict: dict[str, Any] | None = None
     rules: list[dict[str, Any]] | None = None
 
     def brief(self) -> dict[str, Any]:
         v = self.verdict or {}
+        from gitm.server.traffic import brief
+
+        r = brief(self.regime)
         return {"id": self.id, "knobs": self.knobs, "status": self.status,
                 "submitter": self.submitter, "created": self.created,
                 "finished": self.finished, "detail": self.detail,
                 "effect": v.get("effect"), "interval": v.get("interval"),
-                "samples": len(self.progress)}
+                "samples": len(self.progress), "traffic": r["label"] if r else None}
 
 
 def port_free(port: int, host: str = "127.0.0.1") -> bool:
@@ -115,7 +120,17 @@ class Controller:
         self.events: list[dict[str, Any]] = []
         self.policy = policy_mod.merged(cfg.policy)
         self.interventions: dict[str, Intervention] = {}
-        self._queue: queue.Queue[str] = queue.Queue()
+        # The queue, in the order tests will run. A list rather than a FIFO so
+        # an operator can see it, reorder it and pin a test to the front.
+        self._order: list[str] = []
+        self._qlock = threading.Lock()
+        self._wake = threading.Event()
+        # Assisted / autonomous session (None: manual). See gitm.server.autonomy.
+        self.session = None
+        from gitm.server.traffic import TrafficWatch
+
+        self.watch = TrafficWatch(threshold=self.policy["traffic_change_distance"])
+        self._watcher: threading.Thread | None = None
         self._cancel: dict[str, threading.Event] = {}
         self._worker: threading.Thread | None = None
         self._stopping = threading.Event()
@@ -172,6 +187,7 @@ class Controller:
     def start(self) -> None:
         self.workdir.mkdir(parents=True, exist_ok=True)
         self._load_state()
+        self._load_history()
         token_file = self.workdir / "api-token"
         token_file.write_text(self.token + "\n")
         os.chmod(token_file, 0o600)
@@ -209,6 +225,10 @@ class Controller:
             self._worker = threading.Thread(target=self._work, name="gitm-interventions",
                                             daemon=True)
             self._worker.start()
+        if self.cfg.record:
+            self._watcher = threading.Thread(target=self._watch_traffic, name="gitm-traffic",
+                                             daemon=True)
+            self._watcher.start()
 
     def _start_proxy(self, upstream: str) -> None:
         cmd = [sys.executable, "-m", "gitm.server.proxy", "--host", self.cfg.host,
@@ -283,6 +303,10 @@ class Controller:
             "queued": [i.id for i in self.interventions.values() if i.status == QUEUED],
             "probation": self.probation_summary(),
             "paused": self.policy["paused"],
+            "mode": self.mode,
+            "session": self.session.summary(time.time()) if self.session else None,
+            "queue": self.queue_view(),
+            "traffic": self.watch.summary(),
             "promotions": self.state["promotions"][-5:],
             "workdir": str(self.workdir),
         }
@@ -297,18 +321,50 @@ class Controller:
     # ------------------------------------------------------------------ state file
 
     def _load_state(self) -> None:
+        from gitm.server.autonomy import Session
+
         path = self.workdir / "state.json"
         if path.exists():
             try:
                 self.state.update(json.loads(path.read_text()))
             except (OSError, json.JSONDecodeError):
                 pass
+        self.watch.load_state(self.state.get("traffic"))
+        sess = self.state.get("session")
+        if sess:
+            try:
+                self.session = Session(**sess)
+            except TypeError:
+                self.session = None
 
     def _save_state(self) -> None:
+        self.state["traffic"] = self.watch.to_state()
+        self.state["session"] = asdict(self.session) if self.session else None
         path = self.workdir / "state.json"
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.state, indent=2, default=str))
         tmp.replace(path)
+
+    def _load_history(self) -> None:
+        """Finished interventions from earlier runs of this server, as results memory.
+
+        What was tested, on what traffic, with what outcome, survives a restart,
+        so "already tried for this traffic" still holds. Anything that was queued
+        or running when the controller stopped is marked stopped, not resumed.
+        """
+        d = self.workdir / "interventions"
+        if not d.is_dir():
+            return
+        fields = set(Intervention.__dataclass_fields__)
+        for f in sorted(d.glob("*.json")):
+            try:
+                data = json.loads(f.read_text())
+                iv = Intervention(**{k: v for k, v in data.items() if k in fields})
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
+            if iv.status in (QUEUED, RUNNING):
+                iv.status, iv.detail = STOPPED, "the controller restarted before it finished"
+            self.interventions.setdefault(iv.id, iv)
 
     # ------------------------------------------------------------------ policy
 
@@ -377,12 +433,15 @@ class Controller:
             self.event("promotion.refused", id=iv.id, failed=failed)
             self._restore_canary_async(cause=f"{iv.id} not promoted")
             return
-        if self.policy["require_approval"] or not self.policy["auto_promote"]:
+        from gitm.server.autonomy import promotes_itself
+
+        if self.policy["require_approval"] or not promotes_itself(self.mode):
             iv.status = "awaiting_approval"
-            iv.detail = "every promotion rule passed; waiting for POST /interventions/{id}/promote"
-            self.event("promotion.awaiting_approval", id=iv.id)
+            iv.detail = (f"every promotion rule passed; {self.mode} mode waits for approval "
+                         "(POST /interventions/{id}/promote)")
+            self.event("promotion.awaiting_approval", id=iv.id, mode=self.mode)
             return
-        self.promote(iv, cause="auto: every promotion rule passed")
+        self.promote(iv, cause="auto: autonomous mode, every promotion rule passed")
 
     def promote(self, iv: Intervention, *, cause: str) -> dict[str, Any]:
         """Route traffic to the canary, keep the old engine on standby, start probation."""
@@ -419,6 +478,8 @@ class Controller:
                               "baseline_decode_tok_s": baseline,
                               "baseline_source": baseline_source, "record": record,
                               "watch": promotion.Probation(baseline, self.policy)}
+            self.watch.retune(iv.regime)
+            self._save_state()
             self.event("promotion.swapped", id=iv.id, drained=swap.get("drained"),
                        baseline_decode_tok_s=baseline, baseline_source=baseline_source)
         threading.Thread(target=self._watch_probation, name="gitm-probation", daemon=True).start()
@@ -503,7 +564,8 @@ class Controller:
             iv = self.interventions.get(p["intervention"])
             knobs = iv.knobs if iv else {}
             self.state["reverted"].append({"t": now, "intervention": p["intervention"],
-                                           "knobs": knob_key(knobs), "reason": reason})
+                                           "knobs": knob_key(knobs), "reason": reason,
+                                           "regime": iv.regime if iv else None})
             self.state["last_revert_t"] = now
             self._save_state()
             self.audit.record_revert(p["intervention"], reason=reason, cause=cause)
@@ -566,12 +628,13 @@ class Controller:
     # ------------------------------------------------------------------ interventions
 
     def submit(self, knobs: dict[str, Any], *, submitter: str = "api",
-               note: str = "") -> Intervention:
+               note: str = "", front: bool = False) -> Intervention:
         """Queue an A/B of ``knobs`` against the stable configuration.
 
         Refused up front (ValueError) when there is no canary, or when stable
         already runs every requested value: an A/B of a configuration against
         itself is an A/A, and would be reported as a lever that did nothing.
+        ``front`` puts it at the head of the queue.
         """
         from gitm.server.canary import unchanged_knobs
 
@@ -589,13 +652,22 @@ class Controller:
         self.interventions[iv.id] = iv
         self._cancel[iv.id] = threading.Event()
         self._save(iv)
-        self._queue.put(iv.id)
-        self.event("intervention.queued", id=iv.id, knobs=iv.knobs, submitter=submitter)
+        with self._qlock:
+            if front:
+                self._order.insert(0, iv.id)
+            else:
+                self._order.append(iv.id)
+        self._wake.set()
+        self.event("intervention.queued", id=iv.id, knobs=iv.knobs, submitter=submitter,
+                   front=front)
         return iv
 
     def stop_intervention(self, ident: str) -> Intervention:
         iv = self.interventions[ident]
         self._cancel[ident].set()
+        with self._qlock:
+            if ident in self._order:
+                self._order.remove(ident)
         if iv.status == QUEUED:
             iv.status, iv.finished, iv.detail = STOPPED, time.time(), "stopped before it ran"
             self._save(iv)
@@ -607,22 +679,75 @@ class Controller:
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{iv.id}.json").write_text(json.dumps(asdict(iv), indent=2, default=str))
 
+    # ------------------------------------------------------------------ queue
+
+    def queue_view(self) -> list[dict[str, Any]]:
+        """The queue in run order, with why each item may be waiting."""
+        from gitm.server.autonomy import AUTO_SUBMITTERS, in_schedule
+
+        now = time.time()
+        with self._qlock:
+            order = list(self._order)
+        out = []
+        for pos, ident in enumerate(order):
+            iv = self.interventions.get(ident)
+            if iv is None or iv.status != QUEUED:
+                continue
+            auto = iv.submitter in AUTO_SUBMITTERS
+            waits = None
+            if auto and self.session and not in_schedule(self.session.schedule, now):
+                waits = "outside the session's schedule"
+            out.append({"position": pos, "id": iv.id, "knobs": iv.knobs,
+                        "submitter": iv.submitter, "note": iv.note, "auto": auto,
+                        "waits": waits})
+        return out
+
+    def move(self, ident: str, position: int) -> list[dict[str, Any]]:
+        """Move a queued test to ``position`` (0 = next to run)."""
+        iv = self.interventions.get(ident)
+        if iv is None or iv.status != QUEUED:
+            raise ValueError("only a queued test can be moved")
+        with self._qlock:
+            self._order.remove(ident)
+            self._order.insert(max(0, min(int(position), len(self._order))), ident)
+        self.event("queue.moved", id=ident, position=position)
+        self._wake.set()
+        return self.queue_view()
+
+    def _next_runnable(self) -> Intervention | None:
+        """The first queued test allowed to start now.
+
+        A test someone queued runs when it reaches the front. A test gitm queued
+        itself waits for an active session's schedule, and is skipped over while
+        it waits, so a hand-queued test behind it is not held up.
+        """
+        from gitm.server.autonomy import AUTO_SUBMITTERS, in_schedule
+
+        now = time.time()
+        with self._qlock:
+            self._order = [i for i in self._order
+                           if self.interventions.get(i) and self.interventions[i].status == QUEUED]
+            for ident in self._order:
+                iv = self.interventions[ident]
+                if iv.submitter in AUTO_SUBMITTERS:
+                    if self.session is None or not in_schedule(self.session.schedule, now):
+                        continue
+                self._order.remove(ident)
+                return iv
+        return None
+
     def _work(self) -> None:
         while not self._stopping.is_set():
-            try:
-                ident = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                self._maybe_explore()
-                continue
-            iv = self.interventions[ident]
-            if iv.status != QUEUED:
-                continue
-            # The canary slot is the standby engine while a promotion is in
-            # probation, and paused means paused: wait, keeping queue order.
-            while (self.probation is not None or self.policy["paused"]) \
-                    and not self._stopping.is_set() and not self._cancel[ident].is_set():
-                time.sleep(1.0)
-            if self._stopping.is_set() or iv.status != QUEUED:
+            self._wake.clear()
+            self._end_session_if_over()
+            iv = None
+            if self.probation is None and not self.policy["paused"]:
+                iv = self._next_runnable()
+                if iv is None:
+                    self._maybe_explore()
+                    iv = self._next_runnable()
+            if iv is None:
+                self._wake.wait(1.0)
                 continue
             try:
                 with self._canary_lock:
@@ -650,6 +775,249 @@ class Controller:
                     iv.detail = f"improved; promotion check failed: {type(exc).__name__}: {exc}"
                     self.event("promotion.error", id=iv.id, error=str(exc))
                 self._save(iv)
+
+    # ------------------------------------------------------------------ autonomy
+
+    @property
+    def mode(self) -> str:
+        return self.session.mode if self.session else "manual"
+
+    def start_session(self, mode: str, **limits: Any) -> dict[str, Any]:
+        from gitm.server.autonomy import new_session
+
+        if "canary" not in self.engines:
+            raise ValueError("this server runs without a canary, so it cannot test anything")
+        self.session = new_session(mode, **limits)
+        self._save_state()
+        self.audit.record("session.start", "-", "api", mode=mode, **{
+            k: v for k, v in limits.items() if v is not None})
+        self.event("session.started", mode=mode,
+                   **{k: v for k, v in limits.items() if v is not None})
+        self._wake.set()
+        return self.session.summary(time.time())
+
+    def stop_session(self, *, cancel_current: bool = False, reason: str = "stopped") -> dict:
+        """Back to manual. Stable is left as it is; gitm's own queued picks are dropped."""
+        from gitm.server.autonomy import AUTO_SUBMITTERS
+
+        ended = self.session
+        self.session = None
+        dropped = []
+        for iv in list(self.interventions.values()):
+            if iv.submitter not in AUTO_SUBMITTERS:
+                continue
+            if iv.status == QUEUED:
+                self.stop_intervention(iv.id)
+                dropped.append(iv.id)
+            elif iv.status == RUNNING and cancel_current:
+                self.stop_intervention(iv.id)
+        self._save_state()
+        self.audit.record("session.stop", "-", "api", reason=reason,
+                          cancel_current=cancel_current)
+        self.event("session.stopped", reason=reason, dropped=dropped,
+                   cancel_current=cancel_current,
+                   tests_started=ended.tests_started if ended else 0)
+        return {"mode": "manual", "dropped": dropped, "reason": reason}
+
+    def _end_session_if_over(self) -> None:
+        if self.session is not None:
+            why = self.session.exhausted(time.time())
+            if why:
+                self.stop_session(reason=why)
+
+    def _results(self) -> list[dict[str, Any]]:
+        """Every intervention as a result row, for the traffic-aware memory."""
+        from gitm.server.promotion import knob_key
+
+        return [{"id": i.id, "knob_key": knob_key(i.knobs), "knobs": i.knobs,
+                 "status": i.status, "effect": (i.verdict or {}).get("effect"),
+                 "regime": i.regime, "stable_args": i.stable_args, "finished": i.finished}
+                for i in self.interventions.values()]
+
+    def _auto_submit(self, knobs: dict[str, Any], submitter: str, note: str,
+                     front: bool = False) -> Intervention | None:
+        """Queue a test gitm chose itself, counted against the session's budget.
+
+        Whatever chose it (explorer, re-check, playbook, rediscovery), it must be
+        inside the session's scope: the scope is the set of knobs gitm may touch.
+        """
+        if self.session is None:
+            return None
+        if not self.session.allows(knobs, self.policy):
+            self.event("explore.skipped", knobs=knobs, reason="outside the session's scope")
+            return None
+        if self.session.exhausted(time.time()):
+            return None
+        try:
+            iv = self.submit(knobs, submitter=submitter, note=note, front=front)
+        except ValueError as exc:
+            self.event("explore.skipped", knobs=knobs, reason=str(exc))
+            return None
+        self.session.tests_started += 1
+        self._save_state()
+        return iv
+
+    def explore_preview(self, n: int = 5) -> list[dict[str, Any]]:
+        """What gitm would pick next, in order, without queueing anything."""
+        return self._candidates()[:n]
+
+    def _candidates(self) -> list[dict[str, Any]]:
+        from gitm.server.explore import candidates, model_facts, serve_defaults
+        from gitm.server.promotion import knob_key
+        from gitm.server.traffic import near, tried_for
+
+        if "stable" not in self.engines:
+            return []
+        stable = self.engines["stable"]
+        stable_args = list(stable.spec.serve_args)
+        policy = self.session.scoped_policy(self.policy) if self.session else self.policy
+        threshold = self.policy["traffic_change_distance"]
+        live = self.watch.current
+        results = self._results()
+        # "Tried" is for this stable *and* this kind of traffic; a revert blocks a
+        # change for traffic like the traffic it was reverted on.
+        tried = {r["knob_key"] for r in results
+                 if tried_for(results, r["knob_key"], stable_args, live, threshold)}
+        blocked = {r["knobs"] for r in self.state["reverted"]
+                   if r.get("regime") is None or live is None
+                   or near(r.get("regime"), live, threshold)}
+        facts = model_facts(self.cfg.model, stable_args)
+        if self._serve_defaults is None:
+            self._serve_defaults = serve_defaults(facts["tp"], stable.spec.gpus)
+        todo = candidates(stable_args, tried=tried, blocked=blocked, policy=policy,
+                          resolved=stable.resolved_config(), facts=facts,
+                          defaults=self._serve_defaults)
+        return [c | {"knob_key": knob_key(c["knobs"])} for c in todo]
+
+    def _maybe_explore(self) -> Intervention | None:
+        """In a session, queue the next catalogue candidate when nothing is waiting."""
+        from gitm.server.autonomy import in_schedule, picks_itself
+
+        if (self.session is None or not picks_itself(self.session.mode)
+                or self.policy["paused"] or self.probation is not None
+                or "canary" not in self.engines
+                or not in_schedule(self.session.schedule, time.time())
+                or any(i.status in (QUEUED, RUNNING) for i in self.interventions.values())):
+            return None
+        try:
+            todo = self._candidates()
+        except Exception as exc:  # noqa: BLE001 - a catalogue problem must not stop serving
+            self.event("explore.error", error=str(exc))
+            return None
+        stable_args = list(self.engines["stable"].spec.serve_args)
+        if not todo:
+            key = (tuple(stable_args), self.watch.current_window)
+            if getattr(self, "_explore_done_for", None) != key:
+                self._explore_done_for = key
+                self.event("explore.exhausted", stable_args=stable_args)
+            return None
+        nxt = todo[0]
+        iv = self._auto_submit(nxt["knobs"], "explorer", nxt["note"])
+        if iv is not None:
+            self.event("explore.queued", id=iv.id, lever=nxt["lever"], knobs=nxt["knobs"])
+        return iv
+
+    # ------------------------------------------------------------------ traffic
+
+    def _watch_traffic(self) -> None:
+        """Close windows regularly, read each new one's regime, react to a change."""
+        last_rotate = time.time()
+        last_recorded = 0
+        while not self._stopping.is_set():
+            self._stopping.wait(self.policy["traffic_check_s"])
+            if self._stopping.is_set():
+                return
+            try:
+                state = self.proxy_call("GET", "/admin/state")
+                recorded = state.get("recorded") or 0
+                if (recorded > last_recorded
+                        and time.time() - last_rotate >= self.policy["traffic_window_s"]):
+                    self.proxy_call("POST", "/admin/rotate")
+                    last_rotate, last_recorded = time.time(), recorded
+                windows = [Path(p) for p in self.proxy_call("GET", "/admin/recordings")]
+            except Exception:
+                continue
+            for w in windows:
+                if str(w) in self.watch.seen:
+                    continue
+                self.observe_window(w)
+
+    def observe_window(self, window: Path) -> str | None:
+        """Read one closed window's traffic. Returns the transition, if any."""
+        from gitm.server.traffic import brief, regime_of
+
+        try:
+            regime, n = regime_of(window, self.policy["max_replay_requests"])
+        except Exception:
+            self.watch.seen.append(str(window))
+            return None
+        if n < self.policy["min_window_requests"]:
+            self.watch.seen.append(str(window))
+            return None
+        self.watch.threshold = self.policy["traffic_change_distance"]
+        was = self.watch.tuned
+        change = self.watch.observe(regime, str(window))
+        self._save_state()
+        if change == "changed":
+            self.event("traffic.changed", distance=round(self.watch.last_distance or 0, 3),
+                       tuned_for=brief(was), now=brief(regime), window=str(window))
+            self._react_to_traffic_change(was)
+        elif change == "settled":
+            self.event("traffic.settled", distance=round(self.watch.last_distance or 0, 3))
+        return change
+
+    def _react_to_traffic_change(self, old_regime: dict | None) -> list[str]:
+        """What gitm queues when traffic moves away from what stable was tuned for.
+
+        Manual mode only reports the change. In a session, in this order:
+
+        1. re-check: the last promoted change reversed, to see whether stable's
+           current configuration still beats what it replaced on this traffic;
+        2. playbook: changes already proven on traffic like the new one, best
+           first: the fast path, still verified on the canary;
+        3. rediscover: changes that won or nearly won on the old traffic.
+
+        Everything else becomes untried for the new traffic, so the explorer
+        picks it up after these.
+        """
+        from gitm.server.autonomy import picks_itself
+        from gitm.server.canary import current_value
+        from gitm.server.traffic import promising_under, proven_for
+
+        if self.session is None or not picks_itself(self.session.mode):
+            return []
+        queued: list[str] = []
+        threshold = self.policy["traffic_change_distance"]
+        results = self._results()
+        stable_args = list(self.engines["stable"].spec.serve_args)
+        seen: set[str] = set()
+
+        def add(knobs, submitter, note):
+            from gitm.server.promotion import knob_key
+
+            key = knob_key(knobs)
+            if key in seen:
+                return
+            seen.add(key)
+            iv = self._auto_submit(knobs, submitter, note)
+            if iv is not None:
+                queued.append(iv.id)
+
+        kept = [p for p in self.state["promotions"] if p.get("outcome") == "kept"]
+        if kept:
+            last = kept[-1]
+            back = {k: current_value(last.get("from_args") or [], k) for k in last["knobs"]}
+            back = {k: v for k, v in back.items() if v is not None}
+            if back:
+                add(back, "recheck", f"traffic changed: does {last['knobs']} still beat "
+                                     f"what it replaced?")
+        for r in proven_for(results, self.watch.current, threshold):
+            add(r["knobs"], "playbook", f"proven on traffic like this before ({r['id']})")
+        for r in promising_under(results, old_regime, threshold):
+            if r.get("stable_args") in (None, stable_args):
+                add(r["knobs"], "rediscover", f"won or nearly won on the old traffic ({r['id']})")
+        self.event("traffic.requeued", ids=queued)
+        return queued
 
     def _run(self, iv: Intervention) -> None:
         from gitm.experiment.evaluate import evaluate
@@ -685,6 +1053,12 @@ class Controller:
         iv.window = str(window)
         trace, regime = load_window(window, max_requests=self.policy["max_replay_requests"],
                                     speed=self.policy["replay_speed"])
+        # Keyed at the traffic's real speed: a replay sped up to stress the
+        # canary is still a measurement *about* the traffic that was recorded.
+        from gitm.server.traffic import regime_of
+
+        iv.regime = regime_of(window, self.policy["max_replay_requests"])[0].model_dump(
+            mode="json")
         out = self.workdir / "interventions" / iv.id
         plan = write_plan(trace, out / "replay.jsonl")
         contract = build_contract(intervention_id=iv.id, knobs=iv.knobs,
@@ -734,43 +1108,6 @@ class Controller:
             # Milestone 2: an improved candidate stays on the canary, waiting for
             # promotion. Nothing reaches production without it.
             self.event("canary.holds_candidate", id=iv.id, serve_args=canary.spec.serve_args)
-
-    def _maybe_explore(self) -> Intervention | None:
-        """Queue the next catalogue candidate if exploring is on and the canary is idle."""
-        from gitm.server.explore import candidates, model_facts, serve_defaults
-        from gitm.server.promotion import knob_key
-
-        if (not self.policy["auto_explore"] or self.policy["paused"] or self.probation is not None
-                or "canary" not in self.engines or "stable" not in self.engines
-                or any(i.status in (QUEUED, RUNNING) for i in self.interventions.values())):
-            return None
-        stable_args = list(self.engines["stable"].spec.serve_args)
-        tried = {knob_key(i.knobs) for i in self.interventions.values()
-                 if i.stable_args in (None, stable_args)}
-        blocked = {r["knobs"] for r in self.state["reverted"]}
-        try:
-            facts = model_facts(self.cfg.model, stable_args)
-            if self._serve_defaults is None:
-                self._serve_defaults = serve_defaults(facts["tp"], self.engines["stable"].spec.gpus)
-            todo = candidates(stable_args, tried=tried, blocked=blocked, policy=self.policy,
-                              resolved=self.engines["stable"].resolved_config(),
-                              facts=facts, defaults=self._serve_defaults)
-        except Exception as exc:  # noqa: BLE001 - a catalogue problem must not stop serving
-            self.event("explore.error", error=str(exc))
-            return None
-        if not todo:
-            if not getattr(self, "_explore_done_for", None) == stable_args:
-                self._explore_done_for = stable_args
-                self.event("explore.exhausted", stable_args=stable_args)
-            return None
-        nxt = todo[0]
-        try:
-            iv = self.submit(nxt["knobs"], submitter="explorer", note=nxt["note"])
-        except ValueError as exc:
-            self.event("explore.skipped", knobs=nxt["knobs"], reason=str(exc))
-            return None
-        self.event("explore.queued", id=iv.id, lever=nxt["lever"], knobs=nxt["knobs"])
-        return iv
 
     def _window_for_test(self) -> Path | None:
         """The newest closed recording window big enough to measure with.

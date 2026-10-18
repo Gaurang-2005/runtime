@@ -45,6 +45,17 @@ DEFAULT_POLICY: dict[str, Any] = {
 DEFAULT_POLICY.update(PROMOTION_DEFAULTS)
 # Exploring the catalogue on its own when idle: see gitm.server.explore.
 DEFAULT_POLICY.update(EXPLORE_DEFAULTS)
+# Watching traffic: see gitm.server.traffic.
+DEFAULT_POLICY.update({
+    # log2 units on each regime axis: 1.0 = traffic changed 2x on some axis.
+    # Past this, traffic has changed from what stable was tuned for, and a
+    # result measured on the old traffic no longer counts as "tried".
+    "traffic_change_distance": 1.0,
+    "traffic_check_s": 60.0,
+    # The open recording window is closed this often (if it has new requests),
+    # so the watcher sees fresh traffic without waiting for a full window.
+    "traffic_window_s": 300.0,
+})
 
 
 def merged(overrides: dict[str, Any] | None) -> dict[str, Any]:

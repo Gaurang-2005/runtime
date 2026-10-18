@@ -19,6 +19,8 @@ if (location.hash.length > 1) {
   history.replaceState(null, "", location.pathname);
 }
 let selected = null;
+let chosenMode = null;        // what the operator clicked, before starting a session
+let lastPreview = 0;
 let timer = null;
 const hist = { tps: [], ttft: [], rps: [] };
 const HIST_N = 300; // 10 minutes at 2 s
@@ -83,7 +85,9 @@ async function refresh() {
   try {
     const [status, stats, ivs, promos, events, sims] = await Promise.all([
       api("GET", "/status"), api("GET", "/stats?window_s=30"), api("GET", "/interventions"),
-      api("GET", "/promotions"), api("GET", "/events"), api("GET", "/traffic"),
+      api("GET", "/promotions"), api("GET", "/events"),
+      // Optional panel: a server without a simulator should not blank the page.
+      api("GET", "/traffic").catch(() => []),
     ]);
     $("connstate").textContent = "connected";
     $("connstate").className = "muted";
@@ -94,6 +98,10 @@ async function refresh() {
     renderPromotions(promos);
     renderEvents(events);
     renderSims(sims);
+    renderMode(status);
+    renderTraffic(status.traffic);
+    renderQueue(status.queue || []);
+    if (Date.now() - lastPreview > 10000) { lastPreview = Date.now(); loadPreview(); }
     $("pause").textContent = status.paused ? "Resume" : "Pause";
     $("revert").disabled = !status.probation;
     if (selected) renderDetail(await api("GET", `/interventions/${selected}`));
@@ -141,7 +149,8 @@ function renderInterventions(ivs) {
     el("td", { class: "mono" }, iv.id), el("td", { class: "mono" }, JSON.stringify(iv.knobs)),
     el("td", {}, pillFor(iv.status)), el("td", { class: "num" }, fmt.pct(iv.effect)),
     el("td", { class: "num" }, iv.interval ? `${fmt.pct(iv.interval[0])} … ${fmt.pct(iv.interval[1])}` : "–"),
-    el("td", { class: "num" }, String(iv.samples)))));
+    el("td", { class: "num" }, String(iv.samples)),
+    el("td", { class: "mono muted" }, iv.traffic || "–"))));
 }
 
 function select(id) { selected = id; $("detail").hidden = false; refresh(); }
@@ -183,6 +192,77 @@ function renderSims(sims) {
     el("td", { class: "num" }, String(s.failed)), el("td", {}, pillFor(s.status)),
     el("td", {}, s.status === "running" ? el("button", { class: "ghost",
       onclick: () => api("POST", `/traffic/${s.id}/stop`).then(refresh) }, "Stop") : ""))));
+}
+
+const MODE_TEXT = {
+  manual: "Tests only what you queue. A win waits for your approval.",
+  assisted: "gitm also picks what to test, within the limits below. Every win waits for your approval.",
+  autonomous: "gitm picks, tests and promotes by itself, within the limits below and every promotion rule.",
+};
+
+function renderMode(st) {
+  const mode = st.mode || "manual", sess = st.session;
+  const shown = sess ? mode : (chosenMode || mode);
+  for (const b of document.querySelectorAll("#modeseg button")) b.classList.toggle("on", b.dataset.mode === shown);
+  $("modenow").textContent = sess ? `${mode} · running` : "manual";
+  $("modenow").className = `pill ${sess ? "good" : ""}`;
+  $("modedesc").textContent = MODE_TEXT[shown];
+  $("sessform").hidden = !!sess || shown === "manual";
+  $("s-start").textContent = `Start ${shown}`;
+  $("sessstops").hidden = !sess;
+  if (!sess) { $("sessstat").replaceChildren(); return; }
+  const left = sess.remaining_s == null ? "no time limit" : `${Math.floor(sess.remaining_s / 3600)}h ${Math.floor(sess.remaining_s % 3600 / 60)}m left`;
+  const tests = `${sess.tests_started}${sess.max_tests ? " / " + sess.max_tests : ""} tests started`;
+  const sched = sess.schedule.length ? `tests only ${sess.schedule.map((w) => w.join("–")).join(", ")} h` +
+    (sess.in_schedule ? " (now: inside)" : " (now: outside, waiting)") : "any time";
+  const scope = [sess.allow_knobs.length ? `only ${sess.allow_knobs.join(", ")}` : "",
+                 sess.deny_knobs.length ? `never ${sess.deny_knobs.join(", ")}` : "",
+                 sess.tiers ? `tiers ${sess.tiers.join(", ")}` : ""].filter(Boolean).join(" · ");
+  $("sessstat").replaceChildren(el("div", {}, `${left} · ${tests} · ${sched}`),
+    scope ? el("div", { class: "muted" }, scope) : "");
+}
+
+function renderTraffic(t) {
+  if (!t || !t.current) { return; }
+  const row = (label, k, fmtf = (v) => String(v)) => [el("span", { class: "h" }, label),
+    el("span", {}, t.tuned_for ? fmtf(t.tuned_for[k]) : "–"), el("span", {}, fmtf(t.current[k]))];
+  $("traffickv").replaceChildren(
+    el("span", { class: "h" }, ""), el("span", { class: "h" }, "tuned for"), el("span", { class: "h" }, "now"),
+    ...row("requests / s", "rate_rps", (v) => fmt.n(v, 2)), ...row("prompt p50 (tokens)", "input_p50"),
+    ...row("answer p50 (tokens)", "output_p50"), ...row("prompt : answer", "io_ratio", (v) => fmt.n(v, 1)),
+    ...row("burstiness", "burstiness", (v) => fmt.n(v, 1)));
+  $("trafficbanner").replaceChildren(t.changed ? el("div", { class: "banner" },
+    `Traffic changed at ${fmt.t(t.changed_at)}: results measured on the old traffic no longer count as tried. ` +
+    "In Assisted / Autonomous gitm re-checks the current setup, tries what was proven on traffic like this, then re-tests what did well before.") : "");
+  $("trafficdist").textContent = t.distance == null ? "" :
+    `distance ${fmt.n(t.distance, 2)} (changed above ${fmt.n(t.threshold, 1)}; 1.0 = some axis 2×)`;
+}
+
+function renderQueue(q) {
+  if (!q.length) { fill($("queue"), [el("tr", {}, el("td", { colspan: "6", class: "muted" }, "empty"))]); return; }
+  const act = (label, fn, title) => el("button", { class: "ghost mini", title, onclick: fn }, label);
+  fill($("queue"), q.map((item, i) => el("tr", {},
+    el("td", { class: "num" }, String(i + 1)), el("td", { class: "mono" }, item.id),
+    el("td", { class: "mono" }, JSON.stringify(item.knobs)), el("td", {}, item.submitter),
+    el("td", { class: "muted" }, item.waits || ""),
+    el("td", {}, el("span", { class: "row", style: "margin:0;flex-wrap:nowrap" },
+      act("↑", () => moveTo(item.id, Math.max(0, item.position - 1)), "Move up"),
+      act("↓", () => moveTo(item.id, item.position + 1), "Move down"),
+      act("Run next", () => api("POST", `/queue/${item.id}/front`).then(refresh), "Pin to the front"),
+      act("Remove", () => api("POST", `/interventions/${item.id}/stop`).then(refresh), "Remove from the queue"))))));
+}
+
+async function moveTo(id, position) {
+  await api("POST", `/queue/${id}/move`, { position }).catch(() => {});
+  refresh();
+}
+
+async function loadPreview() {
+  try {
+    const p = await api("GET", "/explore/preview?n=6");
+    $("preview").textContent = p.length ? p.map((c) => JSON.stringify(c.knobs)).join("  ·  ") :
+      "nothing left to try for this setup and traffic";
+  } catch (e) { $("preview").textContent = e.message; }
 }
 
 async function loadPresets() {
@@ -239,6 +319,35 @@ $("revert").addEventListener("click", async () => {
 $("approval").addEventListener("change", async () => {
   await api("PUT", "/policy", { require_approval: $("approval").checked }).catch(() => {});
 });
+for (const b of document.querySelectorAll("#modeseg button")) {
+  b.addEventListener("click", async () => {
+    const st = await api("GET", "/autonomy").catch(() => null);
+    if (st && st.session && b.dataset.mode !== st.mode) {
+      $("modedesc").textContent = b.dataset.mode === "manual" ? "Use Stop below to go back to manual." :
+        `A ${st.mode} session is running. Stop it first to start ${b.dataset.mode}.`;
+      return;
+    }
+    chosenMode = b.dataset.mode;
+    refresh();
+  });
+}
+$("sessform").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("s-err").textContent = "";
+  const num = (id) => ($(id).value.trim() === "" ? null : Number($(id).value));
+  const globs = (id) => $(id).value.split(",").map((x) => x.trim()).filter(Boolean);
+  const from = num("s-from"), to = num("s-to");
+  const tiers = [$("s-low").checked && "low_risk", $("s-mod").checked && "moderate"].filter(Boolean);
+  const body = { mode: chosenMode, budget_h: num("s-hours"), max_tests: num("s-tests"),
+    schedule: from != null && to != null ? [[from, to]] : null,
+    allow_knobs: globs("s-allow"), deny_knobs: globs("s-deny"), tiers };
+  try { await api("POST", "/autonomy/start", body); chosenMode = null; } catch (e) { $("s-err").textContent = e.message; }
+  refresh();
+});
+$("s-stop").addEventListener("click", () => api("POST", "/autonomy/stop", { cancel_current: false }).then(refresh));
+$("s-stopnow").addEventListener("click", () => api("POST", "/autonomy/stop", { cancel_current: true }).then(refresh));
+$("retune").addEventListener("click", () => api("POST", "/traffic/retune").then(refresh).catch(() => {}));
+
 $("dpromote").addEventListener("click", async () => {
   await api("POST", `/interventions/${selected}/promote`, { by: "dashboard" })
     .catch((e) => { $("ddetail").textContent = e.message; });

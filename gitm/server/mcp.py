@@ -119,6 +119,38 @@ def build(client: Client):
         return client.call("POST", "/resume")
 
     @tool()
+    def start_autonomy(mode: str, budget_h: float | None = None, max_tests: int | None = None,
+                       schedule: list | None = None, allow_knobs: list | None = None,
+                       deny_knobs: list | None = None) -> dict:
+        """Start a session. mode "assisted" (gitm picks and tests, wins wait for
+        approval) or "autonomous" (it also promotes). budget_h / max_tests end the
+        session; schedule is [[start_hour, end_hour], ...] local time for gitm's own
+        tests; allow/deny narrow which knobs it may touch."""
+        return client.call("POST", "/autonomy/start", json={
+            "mode": mode, "budget_h": budget_h, "max_tests": max_tests, "schedule": schedule,
+            "allow_knobs": allow_knobs, "deny_knobs": deny_knobs})
+
+    @tool()
+    def stop_autonomy(cancel_current: bool = False) -> dict:
+        """Back to manual mode. Stable is untouched; gitm's queued picks are dropped."""
+        return client.call("POST", "/autonomy/stop", json={"cancel_current": cancel_current})
+
+    @tool()
+    def get_queue() -> list:
+        """Queued tests in run order, and why any are waiting."""
+        return client.call("GET", "/queue")
+
+    @tool()
+    def move_in_queue(intervention_id: str, position: int) -> list:
+        """Move a queued test; position 0 runs next."""
+        return client.call("POST", f"/queue/{intervention_id}/move", json={"position": position})
+
+    @tool()
+    def traffic_status() -> dict:
+        """Live traffic against what stable was tuned for: regime, distance, changed?"""
+        return client.call("GET", "/traffic/watch")
+
+    @tool()
     def get_policy() -> dict:
         """The test and promotion policy in force."""
         return client.call("GET", "/policy")

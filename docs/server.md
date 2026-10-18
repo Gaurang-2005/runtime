@@ -8,7 +8,7 @@ This page covers `gitm run --server`: gitm running beside a real `vllm serve` de
 - The **stable** engine serves every client request.
 - The **canary** engine is where changes are tested.
 
-The proxy records the shape of the traffic it serves: arrival times, token counts and shared prefixes, but never prompt text. A change ("intervention") is an A/B test that runs entirely on the canary. The stable configuration and the candidate take turns on the canary, and each replays the same recorded traffic. If the candidate wins and every promotion rule passes, gitm reroutes traffic to the canary. The old engine stays loaded through a probation period, which makes a revert instant, and is shut down when probation passes. An agent drives all of this through MCP, and a person through the dashboard.
+The proxy records the shape of the traffic it serves: arrival times, token counts and shared prefixes, but never prompt text. A change ("intervention") is an A/B test that runs entirely on the canary. The stable configuration and the candidate take turns on the canary, and each replays the same recorded traffic. If the candidate wins and every promotion rule passes, gitm reroutes traffic to the canary: by itself in autonomous mode, after approval otherwise. The old engine stays loaded through a probation period, which makes a revert instant, and is shut down when probation passes. An agent drives all of this through MCP, and a person through the dashboard.
 
 ```mermaid
 flowchart LR
@@ -75,7 +75,7 @@ The stable engine is never measured by a replay, so production is never disturbe
 
 ## Promotion rules
 
-After an `improved` verdict, the controller evaluates every rule and promotes only if all of them pass. Each rule's result and evidence is stored with the intervention (`GET /interventions/{id}/rules`). Set `require_approval` to make it wait for `POST /interventions/{id}/promote` instead. Approval re-checks every rule; it skips none.
+After an `improved` verdict, the controller evaluates every rule. If all pass, autonomous mode promotes; manual and assisted wait for `POST /interventions/{id}/promote` (as does autonomous with `require_approval`). Each rule's result and evidence is stored with the intervention (`GET /interventions/{id}/rules`). Approval re-checks every rule; it skips none.
 
 | Group | Rule | Passes when |
 |---|---|---|
@@ -114,17 +114,55 @@ stateDiagram-v2
 
 State is kept in `<scratch>/state.json`: promotions, reverts and their timings. Every change is appended to `<scratch>/audit.jsonl`.
 
-## Exploring on its own
+## Modes: who decides what is tested and what goes live
 
-With `auto_explore` set, the controller queues the next candidate from gitm's lever catalogue whenever the canary is idle (`gitm/server/explore.py`). Candidates are filtered:
-- by risk tier;
+The operator chooses (`gitm/server/autonomy.py`):
+
+| Mode | What gitm does |
+|---|---|
+| **manual** (no session) | Tests only what someone queues. A win waits for approval. |
+| **assisted** | Also picks candidates itself. Every win still waits for approval. |
+| **autonomous** | Picks, tests and promotes by itself, within every promotion rule. |
+
+Assisted and autonomous run as a **session**, started with `POST /autonomy/start` or the dashboard's Mode panel. Its limits:
+
+- **Budget:** `budget_h` hours and/or `max_tests` tests gitm may start on its own. When either is spent, the server goes back to manual. Tests a person queues don't count against it.
+- **Schedule:** local `[start_hour, end_hour]` windows in which gitm may *start* its own tests; windows may wrap midnight. Its queued picks wait outside them, and are skipped over, so a hand-queued test behind them still runs.
+- **Scope:** `allow_knobs`, `deny_knobs` and `tiers`. These only narrow the policy.
+
+`POST /autonomy/stop` returns to manual. Stable is left as it is, and gitm's own queued picks are dropped. With `cancel_current`, a test gitm started is cancelled too; otherwise it finishes. `require_approval` in the policy makes even autonomous mode wait for a person.
+
+## The queue
+
+Tests run in queue order: `GET /queue`, `POST /queue/{id}/move` (0 = next), `POST /queue/{id}/front`, and `POST /interventions/{id}/stop` to remove one. `POST /interventions` takes `"front": true` to jump the queue. Each item says if it's waiting, and why.
+
+## Picking candidates
+
+In a session, whenever nothing is queued, the controller takes the next candidate from gitm's lever catalogue (`gitm/server/explore.py`); `GET /explore/preview` shows the order. Candidates are filtered:
+- by risk tier and the session's scope;
 - to serve flags only;
 - with no placement knobs;
 - to levers for something this model actually has, according to its HF config: MoE levers need experts, and multi-GPU levers need TP > 1;
-- to values stable doesn't already run;
-- to changes never tried against this stable configuration and never reverted.
+- to values stable doesn't already run, judged by its flags and by the configuration the engine itself resolved;
+- to changes not yet tried **against this stable configuration on traffic like the current traffic**, and not reverted on traffic like it.
 
-Every explored candidate still goes through the full A/B and every rule.
+Every candidate still goes through the full A/B and every rule.
+
+## Traffic changes
+
+A result is about the traffic it was measured on (`gitm/server/traffic.py`). Every test stores the **regime** of the window it replayed: rate, prompt and answer lengths, prompt-to-answer ratio and burstiness, at real speed.
+
+- **The watcher** closes the open recording window every `traffic_window_s`, reads each new window's regime every `traffic_check_s`, and compares it with the regime stable was tuned for. That's the first traffic seen, then the traffic of each promoted change. Past `traffic_change_distance` (log2 units: 1.0 means some axis changed 2×), traffic has **changed**. `GET /traffic/watch` and the dashboard's Traffic panel show both regimes and the distance.
+- **"Tried" is per traffic.** On new traffic, earlier results no longer count as tried, so changes become candidates again.
+- **On a change, in a session,** gitm queues, in order:
+  1. a **re-check**: the last promoted change reversed, to see whether it still beats what it replaced;
+  2. changes already **proven** on traffic like the new one;
+  3. changes that won or nearly won on the **old** traffic.
+
+  Then the explorer continues. In manual mode the change is only reported.
+- `POST /traffic/retune` accepts the current traffic as the new normal, without re-testing.
+
+The memory survives restarts: finished interventions are reloaded from `<scratch>/interventions/`. The coordinates are those of `gitm.playbook.match.regime_distance`, so a result can become a playbook row unchanged.
 
 ## API
 
@@ -136,13 +174,17 @@ All routes need `Authorization: Bearer <scratch>/api-token`.
 | `POST /interventions`, `GET /interventions[/{id}]`, `POST /interventions/{id}/stop` | tests |
 | `GET /interventions/{id}/rules`, `POST /interventions/{id}/promote`, `POST /revert` | promotion |
 | `POST /pause`, `/resume`, `PUT /policy` | operator |
+| `GET /autonomy`, `POST /autonomy/start`, `POST /autonomy/stop`, `GET /explore/preview` | modes |
+| `GET /queue`, `POST /queue/{id}/move`, `POST /queue/{id}/front` | queue |
+| `GET /traffic/watch`, `POST /traffic/retune` | traffic changes |
 | `GET /traffic/presets`, `POST /traffic/simulate`, `GET /traffic`, `POST /traffic/{id}/stop` | simulated traffic |
 
-`gitm mcp` exposes the same controls as 13 MCP tools. CORS admits only the dashboard's origin (`dashboard_origins`).
+`gitm mcp` exposes the same controls as 18 MCP tools. CORS admits only the dashboard's origin (`dashboard_origins`).
 
 ## Known limits
 
 - **One shared GPU.** With stable and canary on the same GPU, stable's production load competes with the canary's measurement. On an RTX 4050, about 1 request per second of live traffic turned CUDA graphs' +21% into +2% (interval −16% to +21%). `isolated_measurement` refuses such results, so on a shared GPU, tests are only promotable while production is quiet. Give the canary its own GPUs (`--stable-gpus 0,1,2,3 --canary-gpus 4,5,6,7`) to remove the limit.
 - **Replays carry shape, not text.** Lengths, timing and prefix sharing are reproduced; content is not. Speculative decoding depends on content, so it can't be judged on a replay.
 - **Every structural change is a canary relaunch.** That's seconds on a small model and minutes on Kimi.
-- **A controller restart does not adopt running engines.** `state.json` survives, but the restarted controller launches fresh engines.
+- **A controller restart does not adopt running engines.** `state.json` (promotions, reverts, the session, the tuned-for traffic) and the results memory survive, but the restarted controller launches fresh engines, and tests that were queued are marked stopped.
+- **A traffic change is judged on lengths, ratio and burstiness, not request rate:** the playbook's distance leaves rate out on purpose. Load changes are what the latency gates and the noise check see.

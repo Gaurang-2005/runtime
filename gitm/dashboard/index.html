@@ -16,6 +16,7 @@
     --chart1: #6fbf94; --chart2: #e0a24a; --chart3: #8ea8e8; }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }   /* a class's display must not un-hide an element */
 body { margin: 0; background: var(--bg); color: var(--fg);
   font: 14px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif; }
 .wrap { max-width: 1280px; margin: 0 auto; padding: 16px 20px 40px; }
@@ -62,6 +63,21 @@ tr.click { cursor: pointer; } tr.click:hover { background: var(--accent-soft); }
 .engine { border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
 .engine .role { font-weight: 600; text-transform: capitalize; }
 .err { color: var(--bad); }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; background: transparent; color: var(--fg); padding: 6px 14px; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button.on { background: var(--accent); color: var(--panel); }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin: 10px 0; }
+.form-grid label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.form-grid .lbl { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.form-grid input { width: 100%; }
+.form-grid .row input { width: 4em; }
+.form-grid label.inline { flex-direction: row; align-items: center; gap: 4px; }
+.form-grid label.inline input { width: auto; }
+.banner { border: 1px solid var(--warn); color: var(--warn); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
+.kv { display: grid; grid-template-columns: auto 1fr 1fr; gap: 4px 14px; font-variant-numeric: tabular-nums; font-size: 13px; }
+.kv .h { color: var(--muted); font-size: 12px; }
+button.mini { padding: 2px 8px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -111,6 +127,46 @@ tr.click { cursor: pointer; } tr.click:hover { background: var(--accent-soft); }
     </section>
 
     <section class="panel s6">
+      <h2>Mode</h2>
+      <div class="row">
+        <div class="seg" id="modeseg">
+          <button type="button" data-mode="manual">Manual</button>
+          <button type="button" data-mode="assisted">Assisted</button>
+          <button type="button" data-mode="autonomous">Autonomous</button>
+        </div>
+        <span id="modenow" class="pill"></span>
+      </div>
+      <p class="muted" id="modedesc" style="margin:4px 0 0"></p>
+      <form id="sessform" hidden>
+        <div class="form-grid">
+          <label>budget (hours)<input id="s-hours" placeholder="no limit" inputmode="decimal"></label>
+          <label>max tests<input id="s-tests" placeholder="no limit" inputmode="numeric"></label>
+          <div class="lbl">only between (local hours)<span class="row" style="margin:0"><input id="s-from" size="3" placeholder="any" inputmode="numeric" aria-label="from hour"> – <input id="s-to" size="3" placeholder="any" inputmode="numeric" aria-label="to hour"></span></div>
+          <label>only these knobs (globs)<input id="s-allow" placeholder="all, e.g. max_num_*"></label>
+          <label>never these knobs<input id="s-deny" placeholder="none"></label>
+          <div class="lbl">risk tiers<span class="row" style="margin:0"><label class="inline"><input type="checkbox" id="s-low" checked> low</label><label class="inline"><input type="checkbox" id="s-mod" checked> moderate</label></span></div>
+        </div>
+        <button type="submit" id="s-start">Start</button>
+        <span class="err" id="s-err"></span>
+      </form>
+      <div id="sessstat" style="margin-top:8px"></div>
+      <div class="row" id="sessstops" hidden style="margin-top:8px">
+        <button type="button" class="ghost" id="s-stop">Stop (let the current test finish)</button>
+        <button type="button" class="bad" id="s-stopnow">Stop and cancel it</button>
+      </div>
+    </section>
+
+    <section class="panel s6">
+      <h2>Traffic</h2>
+      <div id="trafficbanner"></div>
+      <div class="kv" id="traffickv"><span class="muted">waiting for a recorded window</span></div>
+      <div class="row" style="margin-top:10px">
+        <span class="muted" id="trafficdist"></span>
+        <button type="button" class="ghost mini" id="retune" title="Treat current traffic as what stable is tuned for">Accept as the new normal</button>
+      </div>
+    </section>
+
+    <section class="panel s6">
       <h2>Simulate traffic</h2>
       <form id="simform">
         <div class="row">
@@ -136,8 +192,16 @@ tr.click { cursor: pointer; } tr.click:hover { background: var(--accent-soft); }
         </div>
         <p class="err" id="iverr" style="margin:0"></p>
       </form>
-      <div class="scroll"><table><thead><tr><th>id</th><th>change</th><th>status</th><th>effect</th><th>interval</th><th>samples</th></tr></thead>
+      <div class="scroll"><table><thead><tr><th>id</th><th>change</th><th>status</th><th>effect</th><th>interval</th><th>samples</th><th>traffic</th></tr></thead>
         <tbody id="ivs"></tbody></table></div>
+    </section>
+
+    <section class="panel s12">
+      <h2>Queue</h2>
+      <div class="scroll"><table><thead><tr><th>#</th><th>id</th><th>change</th><th>queued by</th><th>waiting</th><th></th></tr></thead>
+        <tbody id="queue"></tbody></table></div>
+      <p class="muted" style="margin:10px 0 4px">gitm would pick next (Assisted / Autonomous):</p>
+      <div id="preview" class="mono muted">–</div>
     </section>
 
     <section class="panel s12" id="detail" hidden>
