@@ -132,9 +132,18 @@ def build_api(ctl: Controller):
 
     @app.post("/interventions/{ident}/promote")
     def promote(ident: str, body: dict | None = None):
-        """Approve a promotion. The rules are checked again; approval skips none."""
+        """Approve a win. The canary is put back on its flags if needed and every
+        rule is checked again; approval skips none."""
         try:
-            return ctl.promote(_iv(ident), cause=f"approved: {(body or {}).get('by', 'api')}")
+            return ctl.approve(_iv(ident), by=str((body or {}).get("by", "api")))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+
+    @app.post("/interventions/{ident}/decline")
+    def decline(ident: str, body: dict | None = None):
+        try:
+            return ctl.decline(_iv(ident), by=str((body or {}).get("by", "api")),
+                               reason=str((body or {}).get("reason", ""))).brief()
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
 

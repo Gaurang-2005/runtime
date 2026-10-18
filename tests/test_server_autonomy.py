@@ -286,3 +286,75 @@ def test_autonomous_does_not_accept_while_a_retest_is_still_queued(ctl):
     changed_watch(ctl)
     ctl._auto_submit({"max_num_seqs": 128}, "rediscover", "x")
     assert ctl._accept_if_revalidated() is False and ctl.watch.changed
+
+
+class RelaunchEngine(FakeEngine):
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.relaunches = 0
+
+    def stop(self):
+        self.alive = False
+
+    def start(self):
+        self.alive = True
+        self.relaunches += 1
+
+    def wait_healthy(self, timeout_s=0):
+        pass
+
+
+@pytest.fixture
+def approving(ctl, monkeypatch):
+    from gitm.server.controller import Intervention
+
+    ctl.engines["canary"] = RelaunchEngine("canary", 8101, ["--max-num-seqs", "256"])
+    monkeypatch.setattr("gitm.server.canary.warm_up", lambda engine: None)
+    promoted = []
+
+    def promote(iv, cause):
+        promoted.append((iv.id, list(ctl.engines["canary"].spec.serve_args), cause))
+        iv.status = "promoted"
+        return {"promoted": iv.id}
+
+    monkeypatch.setattr(ctl, "promote", promote)
+    iv = Intervention(id="w", knobs={"max_num_seqs": 128}, submitter="t", note="", created=0,
+                      status="awaiting_approval", candidate_args=["--max-num-seqs", "128"])
+    ctl.interventions["w"] = iv
+    return ctl, iv, promoted
+
+
+def test_approving_puts_the_win_back_on_the_canary_before_promoting(approving):
+    ctl, iv, promoted = approving                       # canary has moved on to another test
+    ctl.approve(iv, by="gaurang")
+    assert promoted == [("w", ["--max-num-seqs", "128"], "approved: gaurang")]
+    assert ctl.engines["canary"].relaunches == 1
+
+
+def test_approving_while_a_test_holds_the_canary_waits_for_it(approving):
+    ctl, iv, promoted = approving
+    with ctl._canary_lock:                              # a test is running
+        out = ctl.approve(iv, by="gaurang")
+    assert out["pending"] and iv.status == "approved" and not promoted
+    ctl._carry_out_approvals()                          # the worker, once it is free
+    assert promoted and iv.status == "promoted"
+
+
+def test_failing_rules_on_approval_leave_the_win_waiting_with_the_reason(approving, monkeypatch):
+    ctl, iv, promoted = approving
+
+    def refuse(iv, cause):
+        raise ValueError("promotion rules failed: ['traffic_unchanged']")
+
+    monkeypatch.setattr(ctl, "promote", refuse)
+    with pytest.raises(ValueError):
+        ctl.approve(iv, by="gaurang")
+    assert iv.status == "awaiting_approval" and "traffic_unchanged" in iv.detail
+
+
+def test_declining_changes_nothing_and_cannot_be_approved_after(approving):
+    ctl, iv, promoted = approving
+    ctl.decline(iv, by="gaurang", reason="not during the launch")
+    assert iv.status == "declined" and "not during the launch" in iv.detail and not promoted
+    with pytest.raises(ValueError):
+        ctl.approve(iv, by="gaurang")

@@ -131,7 +131,7 @@ class TrafficWatch:
 # ----------------------------------------------------------------- results memory
 
 #: Verdicts that say the change helped on the traffic it was measured on.
-GOOD = ("improved", "promoted", "kept", "awaiting_approval")
+GOOD = ("improved", "promoted", "kept", "awaiting_approval", "approved")
 
 
 def near(a: dict | None, b: dict | None, threshold: float) -> bool:

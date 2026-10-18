@@ -77,6 +77,8 @@ class Intervention:
     progress: list[dict[str, Any]] = field(default_factory=list)
     verdict: dict[str, Any] | None = None
     rules: list[dict[str, Any]] | None = None
+    #: Who approved (or declined) this win, when someone did.
+    decided_by: str | None = None
 
     def brief(self) -> dict[str, Any]:
         v = self.verdict or {}
@@ -443,6 +445,93 @@ class Controller:
             return
         self.promote(iv, cause="auto: autonomous mode, every promotion rule passed")
 
+    # ------------------------------------------------------------------ approval
+
+    APPROVABLE = ("awaiting_approval", "improved")
+
+    def approve(self, iv: Intervention, *, by: str) -> dict[str, Any]:
+        """A person approves a win. Promote it, putting it back on the canary if needed.
+
+        While a win waits, gitm may test something else, which relaunches the
+        canary with other flags; promoting then failed ``canary_ready`` even
+        though the result was good. So the canary is relaunched with the approved
+        flags first (already proven, ~35 s on a small model), then every rule is
+        checked again. If a test holds the canary right now, the approval is kept
+        and carried out as soon as that test finishes.
+        """
+        if iv.status not in self.APPROVABLE:
+            raise ValueError(f"{iv.id} is {iv.status}; only a win awaiting approval can be "
+                             "promoted")
+        if not iv.candidate_args:
+            raise ValueError(f"{iv.id} has no tested configuration to promote")
+        iv.decided_by = by
+        self.audit.record("approve", iv.id, by)
+        if self._canary_lock.acquire(blocking=False):
+            try:
+                return self._promote_approved(iv)
+            finally:
+                self._canary_lock.release()
+        iv.status = "approved"
+        iv.detail = f"approved by {by}; promotes when the test running on the canary finishes"
+        self._save(iv)
+        self.event("promotion.approved", id=iv.id, by=by, pending=True)
+        self._wake.set()
+        return {"status": "approved", "pending": True, "detail": iv.detail}
+
+    def decline(self, iv: Intervention, *, by: str, reason: str = "") -> Intervention:
+        """A person turns a win down. Nothing changes in production."""
+        if iv.status not in (*self.APPROVABLE, "approved"):
+            raise ValueError(f"{iv.id} is {iv.status}; only a win awaiting approval can be "
+                             "declined")
+        iv.status, iv.decided_by = "declined", by
+        iv.detail = f"declined by {by}" + (f": {reason}" if reason else "")
+        self._save(iv)
+        self.audit.record("decline", iv.id, by, reason=reason)
+        self.event("promotion.declined", id=iv.id, by=by)
+        canary = self.engines.get("canary")
+        if canary is not None and canary.spec.serve_args == iv.candidate_args:
+            self._restore_canary_async(cause=f"{iv.id} declined")
+        return iv
+
+    def _promote_approved(self, iv: Intervention) -> dict[str, Any]:
+        """Put the approved flags on the canary if they are gone, then promote.
+
+        Caller holds the canary lock. Rules failing here (traffic moved, the
+        verdict aged out) leave the win waiting, with the reason.
+        """
+        from gitm.server.canary import warm_up
+
+        canary = self.engines["canary"]
+        if not canary.alive or canary.spec.serve_args != iv.candidate_args:
+            self.event("canary.relaunched", id=iv.id, serve_args=iv.candidate_args,
+                       reason="restoring the approved configuration")
+            canary.stop()
+            canary.spec.serve_args = list(iv.candidate_args)
+            canary.start()
+            canary.wait_healthy(self.cfg.startup_timeout_s)
+            warm_up(canary)
+        try:
+            return self.promote(iv, cause=f"approved: {iv.decided_by or 'api'}")
+        except ValueError as exc:
+            iv.status = "awaiting_approval"
+            iv.detail = f"approved, but not promoted: {exc}"
+            self._save(iv)
+            self.event("promotion.refused", id=iv.id, reason=str(exc))
+            raise
+
+    def _carry_out_approvals(self) -> None:
+        """Worker: promote approvals that were waiting for the canary to be free."""
+        if self.probation is not None:
+            return
+        pending = [i for i in self.interventions.values() if i.status == "approved"]
+        if not pending:
+            return
+        with self._canary_lock:
+            try:
+                self._promote_approved(pending[0])
+            except Exception:  # noqa: BLE001 - the reason is on the intervention
+                pass
+
     def promote(self, iv: Intervention, *, cause: str) -> dict[str, Any]:
         """Route traffic to the canary, keep the old engine on standby, start probation."""
         from gitm.server import promotion
@@ -740,6 +829,7 @@ class Controller:
         while not self._stopping.is_set():
             self._wake.clear()
             self._end_session_if_over()
+            self._carry_out_approvals()
             iv = None
             if self.probation is None and not self.policy["paused"]:
                 iv = self._next_runnable()
@@ -931,7 +1021,7 @@ class Controller:
 
         if not (self.watch.changed and promotes_itself(self.mode)
                 and self.probation is None
-                and not any(i.status in (QUEUED, RUNNING, "awaiting_approval")
+                and not any(i.status in (QUEUED, RUNNING, "awaiting_approval", "approved")
                             for i in self.interventions.values())):
             return False
         self.watch.retune(self.watch.current)

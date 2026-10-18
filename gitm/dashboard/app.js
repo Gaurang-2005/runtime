@@ -56,8 +56,8 @@ const fmt = {
 };
 
 function pillFor(status) {
-  const good = ["improved", "kept", "promoted", "done", "pass"];
-  const bad = ["regressed", "invalid", "failed_to_execute", "reverted", "rejected", "fail"];
+  const good = ["improved", "kept", "promoted", "done", "pass", "approved"];
+  const bad = ["regressed", "invalid", "failed_to_execute", "reverted", "rejected", "fail", "declined"];
   const cls = good.includes(status) ? "good" : bad.includes(status) ? "bad" : "warn";
   return el("span", { class: `pill ${cls}` }, status);
 }
@@ -168,6 +168,7 @@ function renderDetail(iv) {
     el("td", { class: "mono" }, r.name), el("td", {}, pillFor(r.passed ? "pass" : "fail")),
     el("td", { class: "muted" }, r.detail))));
   $("dpromote").disabled = iv.status !== "awaiting_approval";
+  $("ddecline").disabled = !["awaiting_approval", "approved"].includes(iv.status);
   $("dstop").disabled = !["queued", "running"].includes(iv.status);
 }
 
@@ -374,6 +375,11 @@ $("retune").addEventListener("click", () => api("POST", "/traffic/retune").then(
 
 $("dpromote").addEventListener("click", async () => {
   await api("POST", `/interventions/${selected}/promote`, { by: "dashboard" })
+    .catch((e) => { $("ddetail").textContent = e.message; });
+  refresh();
+});
+$("ddecline").addEventListener("click", async () => {
+  await api("POST", `/interventions/${selected}/decline`, { by: "dashboard" })
     .catch((e) => { $("ddetail").textContent = e.message; });
   refresh();
 });

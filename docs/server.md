@@ -78,7 +78,7 @@ The stable engine is never measured by a replay, so production is never disturbe
 
 ## Promotion rules
 
-After an `improved` verdict, the controller evaluates every rule. If all pass, autonomous mode promotes; manual and assisted wait for `POST /interventions/{id}/promote` (as does autonomous with `require_approval`). Each rule's result and evidence is stored with the intervention (`GET /interventions/{id}/rules`). Approval re-checks every rule; it skips none.
+After an `improved` verdict, the controller evaluates every rule. If all pass, autonomous mode promotes; manual and assisted wait for `POST /interventions/{id}/promote` (as does autonomous with `require_approval`). Each rule's result and evidence is stored with the intervention (`GET /interventions/{id}/rules`). Approval re-checks every rule; it skips none. While a win waits, gitm may test something else, which relaunches the canary with other flags, so approving first puts the approved flags back on the canary (a relaunch), then checks the rules and promotes. If a test holds the canary at that moment, the win is marked **approved** and promoted as soon as that test finishes. `POST /interventions/{id}/decline` turns a waiting win down; production is untouched.
 
 | Group | Rule | Passes when |
 |---|---|---|
@@ -185,14 +185,14 @@ All routes need `Authorization: Bearer <scratch>/api-token`.
 |---|---|
 | `GET /status`, `/engines`, `/stats?window_s=`, `/events`, `/recordings`, `/policy`, `/promotions` | read |
 | `POST /interventions`, `GET /interventions[/{id}]`, `POST /interventions/{id}/stop` | tests |
-| `GET /interventions/{id}/rules`, `POST /interventions/{id}/promote`, `POST /revert` | promotion |
+| `GET /interventions/{id}/rules`, `POST /interventions/{id}/promote`, `POST /interventions/{id}/decline`, `POST /revert` | promotion |
 | `POST /pause`, `/resume`, `PUT /policy` | operator |
 | `GET /autonomy`, `POST /autonomy/start`, `POST /autonomy/stop`, `GET /explore/preview` | modes |
 | `GET /queue`, `POST /queue/{id}/move`, `POST /queue/{id}/front` | queue |
 | `GET /traffic/watch`, `POST /traffic/retune` | traffic changes |
 | `GET /traffic/presets`, `POST /traffic/simulate`, `GET /traffic`, `POST /traffic/{id}/stop` | simulated traffic |
 
-`gitm mcp` exposes the same controls as 18 MCP tools. CORS admits only the dashboard's origin (`dashboard_origins`).
+`gitm mcp` exposes the same controls as 19 MCP tools. CORS admits only the dashboard's origin (`dashboard_origins`).
 
 ## Known limits
 

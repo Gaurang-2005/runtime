@@ -104,6 +104,12 @@ def build(client: Client):
                            json={"by": "mcp-agent"})
 
     @tool()
+    def decline(intervention_id: str, reason: str = "") -> dict:
+        """Turn down a win awaiting approval. Production is untouched."""
+        return client.call("POST", f"/interventions/{intervention_id}/decline",
+                           json={"by": "mcp-agent", "reason": reason})
+
+    @tool()
     def revert(reason: str) -> dict:
         """During probation, route traffic back to the previous engine."""
         return client.call("POST", "/revert", json={"reason": reason})
