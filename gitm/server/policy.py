@@ -33,6 +33,13 @@ DEFAULT_POLICY: dict[str, Any] = {
     # far less. Below this the candidate is not the same model, whatever its speed.
     "min_correctness": 0.95,
     "max_wall_clock_s": 3600.0,
+    # Seconds to let the machine settle before each sample. 0 on servers; a
+    # laptop needs ~45 (its CPU throttles hard when run back to back).
+    "settle_s": 0.0,
+    # A verdict is "unstable" when either arm's own samples of the primary
+    # metric spread more than this (stdev / mean): the machine moved, so neither
+    # "improved" nor "regressed" can be trusted.
+    "max_arm_spread": 0.15,
     # --- the traffic -----------------------------------------------------------
     # A window with fewer requests than this is not a measurement of anything.
     "min_window_requests": 20,

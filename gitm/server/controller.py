@@ -920,20 +920,20 @@ class Controller:
     # ------------------------------------------------------------------ traffic
 
     def _watch_traffic(self) -> None:
-        """Close windows regularly, read each new one's regime, react to a change."""
-        last_rotate = time.time()
-        last_recorded = 0
+        """Close windows once they can be judged, read each new one's regime, react."""
         while not self._stopping.is_set():
             self._stopping.wait(self.policy["traffic_check_s"])
             if self._stopping.is_set():
                 return
             try:
                 state = self.proxy_call("GET", "/admin/state")
-                recorded = state.get("recorded") or 0
-                if (recorded > last_recorded
-                        and time.time() - last_rotate >= self.policy["traffic_window_s"]):
+                # Close the open window only once it holds enough requests to
+                # judge. Closing on time alone split 0.6 req/s of long documents
+                # into windows of 7, 19, 13 and 4 requests, each below the
+                # minimum, so the change was never seen.
+                if ((state.get("open_rows") or 0) >= self.policy["min_window_requests"]
+                        and (state.get("open_age_s") or 0) >= self.policy["traffic_window_s"]):
                     self.proxy_call("POST", "/admin/rotate")
-                    last_rotate, last_recorded = time.time(), recorded
                 windows = [Path(p) for p in self.proxy_call("GET", "/admin/recordings")]
             except Exception:
                 continue
@@ -1094,7 +1094,8 @@ class Controller:
         sampler = ReplaySampler(canary, plan, regime, result_dir=out / "bench",
                                 tokenizer=self.cfg.model, cancel=cancel, on_sample=on_sample,
                                 stable_load=stable_load, shared_gpu=shares_gpus(stable, canary),
-                                max_stable_rps=self.policy["max_shared_gpu_stable_rps"])
+                                max_stable_rps=self.policy["max_shared_gpu_stable_rps"],
+                                settle_s=self.policy["settle_s"])
         verdict = evaluate(contract, applicator, sampler,
                            provenance={"window": str(window), "policy": self.policy,
                                        "stable_args": stable_args,
@@ -1104,6 +1105,18 @@ class Controller:
         iv.verdict = verdict.model_dump(mode="json")
         iv.status = STOPPED if cancel.is_set() else verdict.state
         iv.detail = verdict.reason
+        if iv.status in ("improved", "regressed"):
+            from gitm.server.canary import arm_spread
+
+            spread = arm_spread(iv.verdict, self.policy["primary_metric"]["name"])
+            worst = max((v for v in spread.values() if v is not None), default=None)
+            if worst is not None and worst > self.policy["max_arm_spread"]:
+                # The laptop's thermal clamp produced a "regressed" this way:
+                # identical configurations measured 6.3 and 14.6 ms per token.
+                iv.detail = (f"was {iv.status}, but the measurement is unstable: an arm's own "
+                             f"samples spread {worst:.0%} (limit "
+                             f"{self.policy['max_arm_spread']:.0%}); {verdict.reason}")
+                iv.status = "unstable"
         if verdict.rollback == "kept":
             # Milestone 2: an improved candidate stays on the canary, waiting for
             # promotion. Nothing reaches production without it.

@@ -154,4 +154,40 @@ class Recorder:
     def _close(self) -> None:
         if self._fh is not None:
             self._fh.close()
+            if self._path is not None:
+                _sort_by_arrival(self._path)
         self._fh = None
+
+    @property
+    def open_rows(self) -> int:
+        with self._lock:
+            return self._rows if self._fh is not None else 0
+
+    @property
+    def open_age_s(self) -> float:
+        with self._lock:
+            return self._clock() - self._opened_at if self._fh is not None else 0.0
+
+
+def _sort_by_arrival(path: Path) -> None:
+    """Rewrite a closed window in arrival order.
+
+    A row is written when its request *finishes*, but stamped with when it
+    *arrived*, so a long request that arrived first is written after shorter
+    ones that arrived later. The trace reader drops rows that go back in time
+    (``non_monotonic_arrival``): on the laptop that silently lost 21 of 50 chat
+    rows, and 240 of 405 in a chat + long-document window, mostly the long
+    requests, so every replay and every regime was skewed toward short ones.
+    """
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+    def ts(line: str) -> float:
+        try:
+            return float(json.loads(line).get("timestamp", 0))
+        except (ValueError, AttributeError):
+            return 0.0
+
+    lines.sort(key=ts)  # stable: rows with equal stamps keep their order
+    tmp = path.with_suffix(".sorting")
+    tmp.write_text("".join(ln + "\n" for ln in lines), encoding="utf-8")
+    tmp.replace(path)

@@ -48,6 +48,8 @@ Ctrl-C on `gitm run --server` is a clean stop. It stops the proxy first, then ev
 - Each completed request becomes one Mooncake-shaped JSONL row in `<scratch>/recordings/window-*.jsonl`, holding `timestamp`, `input_length`, `output_length` and `hash_ids`. `gitm.traffic.adapters.read_mooncake` reads these back unchanged.
 - **Token counts** come from the engine's own `usage`. For streamed requests the proxy asks for `stream_options.include_usage`, and removes the usage-only chunk when the client didn't ask for it.
 - **Prefix identity** is a chain of hashes over 512-token blocks of the prompt's token ids, taken from the engine's own `/tokenize`. This happens after the response, off the request path. Two requests share a block id only when they share the entire prefix up to and including that block.
+- **Each window is rewritten in arrival order when it closes.** Rows are written as requests finish, so a long request that arrived first would otherwise sit after shorter ones, and the trace reader drops rows that go back in time.
+- **A window closes once it holds `min_window_requests` and is `traffic_window_s` old**, so low-rate traffic still produces windows that can be judged.
 - **No prompt text is stored.** If the tokens can't be read, the request is recorded with private block ids. That under-counts sharing rather than inventing it.
 
 ## Testing a change
@@ -68,8 +70,9 @@ Submit a change with `POST /interventions {"knobs": {"max_num_batched_tokens": 1
    - every arm switch relaunches the canary;
    - each sample starts from an empty prefix cache and is one `vllm bench serve` replay of the window.
 3. **Correctness:** fixed probe sequences (four prompts plus the baseline arm's greedy continuation) are run teacher-forced on each arm. Their top-1 tokens are compared position by position, and must agree on at least `min_correctness` of positions (0.95).
-4. **The verdict** comes from `gitm.experiment.evaluate`: improved, regressed, inconclusive, invalid or failed_to_execute. It applies latency gates on p99 TTFT and p99 inter-token latency (ITL), and uses a paired t-interval on the primary metric.
-5. **Primary metric:** `mean_tpot_ms` (time per output token). A replay offers the load the trace recorded, so below saturation every configuration serves the same tokens per second; only latency tells them apart.
+4. **Stable measurements only.** With `settle_s` > 0, the sampler waits that long before each sample. If either arm's own samples of the primary metric spread more than `max_arm_spread` (15%), an improved or regressed verdict becomes **unstable**: the machine moved, so neither verdict can be trusted, and nothing is promoted.
+5. **The verdict** comes from `gitm.experiment.evaluate`: improved, regressed, inconclusive, invalid or failed_to_execute. It applies latency gates on p99 TTFT and p99 inter-token latency (ITL), and uses a paired t-interval on the primary metric.
+6. **Primary metric:** `mean_tpot_ms` (time per output token). A replay offers the load the trace recorded, so below saturation every configuration serves the same tokens per second; only latency tells them apart.
 
 The stable engine is never measured by a replay, so production is never disturbed.
 
@@ -184,6 +187,7 @@ All routes need `Authorization: Bearer <scratch>/api-token`.
 ## Known limits
 
 - **One shared GPU.** With stable and canary on the same GPU, stable's production load competes with the canary's measurement. On an RTX 4050, about 1 request per second of live traffic turned CUDA graphs' +21% into +2% (interval −16% to +21%). `isolated_measurement` refuses such results, so on a shared GPU, tests are only promotable while production is quiet. Give the canary its own GPUs (`--stable-gpus 0,1,2,3 --canary-gpus 4,5,6,7`) to remove the limit.
+- **Laptop CPUs throttle.** On the RTX 4050 laptop, a replay started straight after another ran 2× slower: the CPU reached 96°C and firmware held it near 450 MHz while the GPU clock never moved. Set `settle_s: 45` on a laptop; the unstable check catches what remains.
 - **Replays carry shape, not text.** Lengths, timing and prefix sharing are reproduced; content is not. Speculative decoding depends on content, so it can't be judged on a replay.
 - **Every structural change is a canary relaunch.** That's seconds on a small model and minutes on Kimi.
 - **A controller restart does not adopt running engines.** `state.json` (promotions, reverts, the session, the tuned-for traffic) and the results memory survive, but the restarted controller launches fresh engines, and tests that were queued are marked stopped.

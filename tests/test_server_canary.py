@@ -178,3 +178,30 @@ def test_on_its_own_gpu_a_busy_stable_is_not_a_reason_to_remeasure(tmp_path):
     s._sample_once = lambda arm, index: Sample(metrics={"stable_rps": 5.0}, wall_s=1,
                                                accelerator_s=1, correctness=1.0)
     assert s.sample("candidate", 1).metrics["remeasured"] == 0.0
+
+
+def test_arm_spread_flags_a_machine_that_moved():
+    from gitm.server.canary import arm_spread
+
+    def raw(arm, vals):
+        return [{"arm": arm, "warmup": False, "metrics": {"mean_tpot_ms": v}} for v in vals]
+
+    steady = {"raw": raw("baseline", [6.27, 6.30, 6.31, 6.30]) + raw("candidate", [6.3] * 4)}
+    hot = {"raw": raw("baseline", [6.27, 6.30, 14.55, 6.30]) + raw("candidate", [6.3] * 4)}
+    assert arm_spread(steady, "mean_tpot_ms")["baseline"] < 0.01
+    assert arm_spread(hot, "mean_tpot_ms")["baseline"] > 0.15
+
+
+def test_the_sampler_settles_before_measuring_and_stops_when_cancelled():
+    import threading
+    import time
+
+    from gitm.server.canary import Cancelled, ReplaySampler
+
+    s = ReplaySampler.__new__(ReplaySampler)
+    s.cancel, s.settle_s = threading.Event(), 5.0
+    threading.Timer(0.05, s.cancel.set).start()
+    t0 = time.monotonic()
+    with pytest.raises(Cancelled):
+        s._sample_once("baseline", 0)
+    assert time.monotonic() - t0 < 1.0          # a stop interrupts the settle

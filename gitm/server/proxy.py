@@ -110,6 +110,8 @@ class ProxyState:
             "uptime_s": round(time.time() - self.started, 1),
             "requests_seen": len(self.stats),
             "recorded": self.recorder.total_rows if self.recorder else None,
+            "open_rows": self.recorder.open_rows if self.recorder else 0,
+            "open_age_s": round(self.recorder.open_age_s, 1) if self.recorder else 0.0,
             "record_failures": self.record_failures,
             "swaps": self.swaps[-10:],
         }

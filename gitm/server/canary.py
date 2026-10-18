@@ -263,7 +263,7 @@ class ReplaySampler:
                  result_dir: Path, tokenizer: str, timeout_s: float = 3600.0,
                  cancel: threading.Event | None = None, on_sample=None, stable_load=None,
                  shared_gpu: bool = False, max_stable_rps: float = 0.1, max_retries: int = 2,
-                 quiet_wait_s: float = 300.0):
+                 quiet_wait_s: float = 300.0, settle_s: float = 0.0):
         self.engine = engine
         self.plan = plan
         self.regime = regime
@@ -277,6 +277,7 @@ class ReplaySampler:
         self.max_stable_rps = max_stable_rps
         self.max_retries = max_retries
         self.quiet_wait_s = quiet_wait_s
+        self.settle_s = settle_s
         self.sequences: list[list[int]] | None = None
         self.reference: list[list[int]] | None = None
 
@@ -313,6 +314,13 @@ class ReplaySampler:
     def _sample_once(self, arm: str, index: int) -> Sample:
         if self.cancel.is_set():
             raise Cancelled("stopped between samples")
+        if self.settle_s > 0:
+            # Let the machine settle before measuring. On the laptop a replay
+            # started straight after another ran 2x slower: the CPU hit 96 C and
+            # firmware held it near 450 MHz, while the GPU clock never moved.
+            self.cancel.wait(self.settle_s)
+            if self.cancel.is_set():
+                raise Cancelled("stopped between samples")
         # Every sample starts from an empty prefix cache, so the second sample on
         # an engine is not credited with the first one's cached prefixes. Needs
         # VLLM_SERVER_DEV_MODE=1 on the canary; without it the reset is skipped.
@@ -406,6 +414,24 @@ def build_contract(*, intervention_id: str, knobs: dict[str, Any], stable_args: 
         protocol=Protocol(repetitions=policy["repetitions"], warmup_reps=policy["warmup_reps"],
                           comparison_order="ABBA", pairing="paired"),
     )
+
+
+def arm_spread(verdict: dict[str, Any], metric: str) -> dict[str, float | None]:
+    """Relative spread (stdev / mean) of ``metric`` within each arm's kept samples.
+
+    Both arms of one configuration should measure alike. When one arm's own
+    samples disagree by more than the effect being judged, the verdict is about
+    the machine, not the change.
+    """
+    import statistics
+
+    out: dict[str, float | None] = {}
+    for arm in ("baseline", "candidate"):
+        vals = [r["metrics"][metric] for r in verdict.get("raw", [])
+                if r["arm"] == arm and not r.get("warmup") and metric in r.get("metrics", {})]
+        out[arm] = (statistics.stdev(vals) / statistics.fmean(vals)
+                    if len(vals) >= 2 and statistics.fmean(vals) > 0 else None)
+    return out
 
 
 def write_plan(trace: Trace, out: Path) -> ReplayPlan:

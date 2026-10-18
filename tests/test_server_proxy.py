@@ -245,3 +245,18 @@ async def test_the_proxy_serves_a_chat_page_that_talks_to_its_own_v1(tmp_path):
     r = await client.get("/")
     assert r.status_code == 200 and "<title>gitm chat</title>" in r.text
     assert "/v1/chat/completions" in r.text and ".innerHTML" not in r.text
+
+
+def test_a_closed_window_keeps_every_request_in_arrival_order(tmp_path):
+    """Rows are written as requests finish; a long early request finishes last.
+    Unsorted, the trace reader dropped such rows as non-monotonic."""
+    from gitm.server.recorder import RecordedRequest
+
+    rec = Recorder(tmp_path)
+    for arrival, n_in in [(10.0, 5000), (11.0, 100), (12.0, 100), (10.5, 3000)]:  # finish order
+        rec.write(RecordedRequest(arrival, n_in, 50, (int(arrival * 10),)))
+    rec.close()
+    path = rec.windows()[0]
+    trace = read_mooncake(path)
+    assert len(trace.requests) == 4 and not trace.meta.drops
+    assert [r.input_tokens for r in trace.requests] == [5000, 3000, 100, 100]
