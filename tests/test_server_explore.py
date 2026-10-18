@@ -85,3 +85,20 @@ def test_relative_levers_use_vllms_own_default_for_this_gpu():
             "max_num_batched_tokens=8192"} <= set(got)
     assert "max_num_batched_tokens=16384" not in got     # not built off the catalogue's 8192
     assert any("vLLM's default for this GPU (2048)" in x["note"] for x in c)
+
+
+def test_a_failed_engine_start_reports_vllms_own_reason(tmp_path):
+    from gitm.server.supervisor import EngineProcess, EngineSpec
+
+    e = EngineProcess(EngineSpec("canary", "m", 8101, []), tmp_path)
+    e.log_path.write_text(
+        "(EngineCore pid=1) ERROR [core.py:1366] ValueError: To serve at least one request "
+        "with the model's max seq len (8192), (0.05 GiB KV cache is needed, which is larger "
+        "than the available KV cache memory (0.0 GiB).\n"
+        "(APIServer pid=2) RuntimeError: Engine core initialization failed. See root cause "
+        "above. Failed core proc(s): {}\n")
+    assert e.root_cause().startswith("ValueError: To serve at least one request")
+    # a later launch is judged on its own lines only
+    with e.log_path.open("a") as fh:
+        fh.write("=== gitm launch: canary 2026-10-18 --x\nINFO all good\n")
+    assert e.root_cause() is None

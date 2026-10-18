@@ -26,6 +26,8 @@ from typing import Any
 
 from gitm.serve.vllm import _arg_of, apply_tracing_env, served_model_name, shutdown, wait_healthy
 
+LAUNCH_MARKER = "=== gitm launch:"
+
 
 def _vllm_executable() -> str:
     """The ``vllm`` beside this interpreter, so an un-activated venv still finds it."""
@@ -109,6 +111,11 @@ class EngineProcess:
             raise RuntimeError(f"{self.spec.role} engine already running (pid {self.proc.pid})")
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log = self.log_path.open("ab")
+        # One log per slot holds every relaunch; the marker scopes root_cause()
+        # to this launch, so an old failure is never reported for a new one.
+        log.write(f"\n{LAUNCH_MARKER} {self.spec.role} {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                  f"{' '.join(self.spec.serve_args)}\n".encode())
+        log.flush()
         # Own session: the engine is a process tree (EngineCore plus a worker per
         # rank), and shutdown() signals the whole group. It also means a crash of
         # the controller does not take a serving engine with it.
@@ -121,13 +128,39 @@ class EngineProcess:
     def wait_healthy(self, timeout_s: float = 1800.0) -> None:
         if self.proc is None:
             raise RuntimeError("engine was never started")
-        wait_healthy(self.base_url, self.proc, timeout_s, self.log_path)
+        try:
+            wait_healthy(self.base_url, self.proc, timeout_s, self.log_path)
+        except RuntimeError as exc:
+            cause = self.root_cause()
+            if cause:
+                raise RuntimeError(f"vllm serve did not start: {cause} (log: {self.log_path})"
+                                   ) from exc
+            raise
         self.healthy_at = time.time()
         self.served_model = served_model_name(self.base_url, self.spec.model)
 
     def stop(self) -> None:
         if self.proc is not None:
             shutdown(self.proc)
+
+    def root_cause(self) -> str | None:
+        """The engine's own reason for dying, from its log, or None.
+
+        vLLM ends a failed start with a generic "Engine core initialization
+        failed. See root cause above"; the reason (e.g. "0.0 GiB KV cache
+        available") is an earlier EngineCore error line. Reported instead of the
+        log's last lines, which only ever showed the generic traceback.
+        """
+        import re
+
+        try:
+            text = self.log_path.read_text(errors="replace")
+        except OSError:
+            return None
+        text = text[text.rfind(LAUNCH_MARKER):] if LAUNCH_MARKER in text else text[-500_000:]
+        hits = re.findall(r"\b((?:[A-Z][A-Za-z]*Error|torch\.OutOfMemoryError): .+)", text)
+        hits = [h for h in hits if "Engine core initialization failed" not in h]
+        return hits[-1].strip()[:500] if hits else None
 
     def resolved_config(self) -> dict[str, str]:
         """The configuration vLLM actually resolved, from this engine's own log.
