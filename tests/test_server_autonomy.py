@@ -155,16 +155,42 @@ def test_only_autonomous_mode_promotes_by_itself(ctl, monkeypatch, mode, expect)
 
 # ----------------------------------------------------------------- traffic
 
+BURST = regime(input_p50=150, input_p95=300, io_ratio=0.5,
+               burstiness=16.0).model_dump(mode="json")
+
+
 def test_the_watch_flags_a_change_and_a_return():
-    w = TrafficWatch(threshold=1.0)
-    assert w.observe(Regime.model_validate(CHAT), "w1") is None     # first sight: tuned
+    w = TrafficWatch(threshold=1.0, steady_windows=3)
+    assert w.observe(Regime.model_validate(CHAT), "w1") is None     # first sight
+    assert "not yet tested" in w.validated_how
     assert w.observe(Regime.model_validate(CHAT), "w2") is None
     assert w.observe(Regime.model_validate(DOCS), "w3") == "changed"
     assert w.observe(Regime.model_validate(DOCS), "w4") is None     # reported once
     assert w.observe(Regime.model_validate(CHAT), "w5") == "settled"
     w.observe(Regime.model_validate(DOCS), "w6")
-    w.retune(DOCS)
-    assert not w.changed and w.last_distance == 0.0
+    w.validate(DOCS, how="test")
+    assert not w.changed and w.last_distance == 0.0 and w.validated_how == "test"
+
+
+def test_detection_rearms_on_steady_new_traffic_without_validating_it():
+    """No one has to declare a new normal: the next change is still caught."""
+    w = TrafficWatch(threshold=1.0, steady_windows=3)
+    w.observe(Regime.model_validate(CHAT), "w1")
+    assert w.observe(Regime.model_validate(DOCS), "w2") == "changed"
+    assert w.observe(Regime.model_validate(DOCS), "w3") is None     # steady 2 of 3
+    assert w.observe(Regime.model_validate(DOCS), "w4") == "rearmed"
+    assert w.reference["input_p50"] == 4000                         # changes measured from docs
+    assert w.validated["input_p50"] == 900                          # but validated on chat only
+    assert w.observe(Regime.model_validate(BURST), "w5") == "changed"   # the next change
+
+
+def test_a_flapping_change_does_not_rearm():
+    w = TrafficWatch(threshold=1.0, steady_windows=3)
+    w.observe(Regime.model_validate(CHAT), "w1")
+    w.observe(Regime.model_validate(DOCS), "w2")
+    w.observe(Regime.model_validate(BURST), "w3")                    # not steady: restart count
+    w.observe(Regime.model_validate(BURST), "w4")
+    assert w.changed and w.reference["input_p50"] == 900
 
 
 def row(knob_key, status, regime_, effect=None, stable=("--x",)):
@@ -269,16 +295,17 @@ def changed_watch(ctl):
     assert ctl.watch.changed
 
 
-@pytest.mark.parametrize("mode, accepts", [("autonomous", True), ("assisted", False),
+@pytest.mark.parametrize("mode, accepts", [("autonomous", True), ("assisted", True),
                                            (None, False)])
-def test_only_autonomous_accepts_new_traffic_itself_once_retested(ctl, mode, accepts):
+def test_a_session_validates_stable_on_new_traffic_once_retested(ctl, mode, accepts):
     if mode:
         ctl.session = new_session(mode)
     changed_watch(ctl)
     assert ctl._accept_if_revalidated() is accepts
     assert ctl.watch.changed is (not accepts)
     if accepts:
-        assert ctl.watch.tuned["input_p50"] == 4000          # stable now tuned for docs
+        assert ctl.watch.validated["input_p50"] == 4000      # stable now validated on docs
+        assert "nothing beat stable" in ctl.watch.validated_how
 
 
 def test_autonomous_does_not_accept_while_a_retest_is_still_queued(ctl):

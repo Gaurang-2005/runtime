@@ -228,21 +228,24 @@ function renderMode(st) {
 function renderTraffic(t) {
   if (!t || !t.current) { return; }
   const row = (label, k, fmtf = (v) => String(v)) => [el("span", { class: "h" }, label),
-    el("span", {}, t.tuned_for ? fmtf(t.tuned_for[k]) : "–"), el("span", {}, fmtf(t.current[k]))];
+    el("span", {}, t.validated_on ? fmtf(t.validated_on[k]) : "–"), el("span", {}, fmtf(t.current[k]))];
   $("traffickv").replaceChildren(
-    el("span", { class: "h" }, ""), el("span", { class: "h" }, "tuned for"), el("span", { class: "h" }, "now"),
+    el("span", { class: "h" }, ""), el("span", { class: "h" }, "stable validated on"), el("span", { class: "h" }, "now"),
     ...row("requests / s", "rate_rps", (v) => fmt.n(v, 2)), ...row("prompt p50 (tokens)", "input_p50"),
     ...row("answer p50 (tokens)", "output_p50"), ...row("prompt : answer", "io_ratio", (v) => fmt.n(v, 1)),
     ...row("burstiness", "burstiness", (v) => fmt.n(v, 1)));
-  const auto = currentMode === "autonomous";
-  $("retune").hidden = auto;
+  const session = currentMode !== "manual";
+  const settle = t.settling ? ` Watching for it to hold steady (${t.settling.windows} of ${t.settling.of} windows).` : "";
   $("trafficbanner").replaceChildren(t.changed ? el("div", { class: "banner" },
     `Traffic changed at ${fmt.t(t.changed_at)}: results measured on the old traffic no longer count as tried. ` +
-    (auto ? "gitm is re-testing for the new traffic. It promotes anything better, or accepts the new traffic itself once nothing beats the current setup."
-          : currentMode === "assisted" ? "gitm re-checks the current setup, then tries what was proven on traffic like this and what did well before. Accept it as the new normal when you're satisfied."
-          : "Start Assisted or Autonomous to re-test, or accept it as the new normal.")) : "");
+    (session ? "gitm is re-testing for the new traffic: it promotes anything better, or marks stable as validated on it once nothing beats it."
+             : "Start Assisted or Autonomous to re-test stable on it.") + settle) : "");
   $("trafficdist").textContent = t.distance == null ? "" :
-    `distance ${fmt.n(t.distance, 2)} (changed above ${fmt.n(t.threshold, 1)}; 1.0 = some axis 2×)`;
+    `change detection: distance ${fmt.n(t.distance, 2)} from the reference (a change above ${fmt.n(t.threshold, 1)}; 1.0 = some axis 2×)`;
+  const vd = t.validated_distance;
+  $("trafficvalid").textContent = t.validated_how ?
+    `Stable validated: ${t.validated_how}, ${fmt.t(t.validated_at)}` +
+    (vd != null && vd > t.threshold ? ` · current traffic differs from it (distance ${fmt.n(vd, 2)}): not yet validated` : "") : "";
 }
 
 function renderQueue(q) {
@@ -371,7 +374,6 @@ $("testform").addEventListener("submit", async (ev) => {
     showTestSettings(p);
   } catch (e) { $("t-err").textContent = e.message; }
 });
-$("retune").addEventListener("click", () => api("POST", "/traffic/retune").then(refresh).catch(() => {}));
 
 $("dpromote").addEventListener("click", async () => {
   await api("POST", `/interventions/${selected}/promote`, { by: "dashboard" })

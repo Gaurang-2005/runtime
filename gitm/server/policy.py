@@ -59,6 +59,9 @@ DEFAULT_POLICY.update({
     # result measured on the old traffic no longer counts as "tried".
     "traffic_change_distance": 1.0,
     "traffic_check_s": 60.0,
+    # After a change, once this many windows in a row show the same new
+    # traffic, changes are measured from it (so the next change is caught).
+    "traffic_steady_windows": 3,
     # The open recording window is closed this often (if it has new requests),
     # so the watcher sees fresh traffic without waiting for a full window.
     "traffic_window_s": 300.0,

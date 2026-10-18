@@ -284,7 +284,9 @@ def test_a_revert_puts_back_the_traffic_baseline_with_the_configuration(server):
     ctl.watch.observe(R.model_validate(docs), "w2")          # traffic moves to docs
     iv.regime = docs
     ctl.promote(iv, cause="test")
-    assert ctl.watch.tuned["input_p50"] == 4000 and not ctl.watch.changed
+    assert ctl.watch.validated["input_p50"] == 4000 and not ctl.watch.changed
+    assert ctl.watch.validated_how.startswith("promoted")
     ctl.revert("slower live", cause="test")
-    assert ctl.watch.tuned["input_p50"] == 900               # the old config's baseline
+    assert ctl.watch.validated["input_p50"] == 900           # the old config's baseline
+    assert ctl.watch.reference["input_p50"] == 900
     assert ctl.watch.changed                                 # live docs != chat: flagged again

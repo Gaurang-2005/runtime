@@ -68,64 +68,110 @@ def brief(r: dict | Regime | None) -> dict[str, Any] | None:
 
 @dataclass
 class TrafficWatch:
-    """Live traffic against the traffic stable was tuned for."""
+    """Live traffic, against two references kept apart on purpose.
+
+    * ``validated`` — the traffic stable's configuration was last *proven* on:
+      a promoted change's test traffic, or traffic a session re-tested and found
+      nothing better for. Only evidence moves it (and a revert restores it).
+      Before any test it is simply the first traffic seen, and says so.
+    * ``reference`` — what changes are measured *from*. When traffic moves away
+      from it, that is a change (reported once). Once the new traffic has held
+      steady for ``steady_windows`` windows, the reference re-arms to it, so the
+      next change is caught too, without anyone declaring a "new normal" and
+      without claiming stable was validated on it.
+    """
 
     threshold: float = 1.0
-    tuned: dict[str, Any] | None = None      # Regime as a dict
-    tuned_at: float | None = None
+    steady_windows: int = 3
+    reference: dict[str, Any] | None = None
+    validated: dict[str, Any] | None = None
+    validated_at: float | None = None
+    validated_how: str | None = None
     current: dict[str, Any] | None = None
     current_window: str | None = None
     current_at: float | None = None
     changed: bool = False
     changed_at: float | None = None
-    last_distance: float | None = None
+    last_distance: float | None = None      # current vs reference
+    _pending: dict[str, Any] | None = None  # the new traffic, while it settles
+    _steady: int = 0
     seen: list[str] = field(default_factory=list)
 
     def observe(self, regime: Regime, window: str, now: float | None = None) -> str | None:
-        """Take in a window's regime. Returns "changed" or "settled" on a transition."""
+        """Take in a window's regime. Returns "changed", "settled" or "rearmed" on a transition."""
         now = time.time() if now is None else now
         d = regime.model_dump(mode="json")
         self.current, self.current_window, self.current_at = d, window, now
         self.seen = (self.seen + [window])[-200:]
-        if self.tuned is None:
-            self.tuned, self.tuned_at = d, now
+        if self.reference is None:
+            self.reference = d
+            if self.validated is None:
+                self.validated, self.validated_at = d, now
+                self.validated_how = "first traffic seen (not yet tested)"
             self.last_distance = 0.0
             return None
-        self.last_distance = distance(self.tuned, d)
+        self.last_distance = distance(self.reference, d)
         if self.last_distance is None:
             return None
-        if self.last_distance > self.threshold and not self.changed:
-            self.changed, self.changed_at = True, now
-            return "changed"
-        if self.last_distance <= self.threshold and self.changed:
-            self.changed, self.changed_at = False, None
+        if not self.changed:
+            if self.last_distance > self.threshold:
+                self.changed, self.changed_at = True, now
+                self._pending, self._steady = d, 1
+                return "changed"
+            return None
+        if self.last_distance <= self.threshold:
+            self.changed, self.changed_at, self._pending, self._steady = False, None, None, 0
             return "settled"
+        if near(self._pending, d, self.threshold):
+            self._steady += 1
+        else:
+            self._pending, self._steady = d, 1
+        if self._steady >= self.steady_windows:
+            self.reference = d
+            self.changed, self.changed_at, self._pending, self._steady = False, None, None, 0
+            self.last_distance = 0.0
+            return "rearmed"
         return None
 
-    def retune(self, regime: dict[str, Any] | Regime | None, now: float | None = None) -> None:
-        """Stable is now tuned for ``regime`` (a promotion tested on it)."""
+    def validate(self, regime: dict[str, Any] | Regime | None, how: str,
+                 now: float | None = None) -> None:
+        """Stable's configuration is now proven on ``regime``; measure changes from it."""
         if regime is None:
             return
-        r = as_regime(regime)
-        self.tuned, self.tuned_at = r.model_dump(mode="json"), time.time() if now is None else now
-        self.changed, self.changed_at = False, None
-        self.last_distance = distance(self.tuned, self.current) if self.current else 0.0
+        r = as_regime(regime).model_dump(mode="json")
+        now = time.time() if now is None else now
+        self.validated, self.validated_at, self.validated_how = r, now, how
+        self.reference = r
+        self.changed, self.changed_at, self._pending, self._steady = False, None, None, 0
+        self.last_distance = distance(r, self.current) if self.current else 0.0
 
     def summary(self) -> dict[str, Any]:
-        return {"threshold": self.threshold, "tuned_for": brief(self.tuned),
-                "tuned_at": self.tuned_at, "current": brief(self.current),
+        return {"threshold": self.threshold, "steady_windows": self.steady_windows,
+                "validated_on": brief(self.validated), "validated_at": self.validated_at,
+                "validated_how": self.validated_how,
+                "validated_distance": distance(self.validated, self.current),
+                "reference": brief(self.reference), "current": brief(self.current),
                 "current_window": self.current_window, "current_at": self.current_at,
                 "distance": self.last_distance, "changed": self.changed,
-                "changed_at": self.changed_at}
+                "changed_at": self.changed_at,
+                "settling": {"windows": self._steady, "of": self.steady_windows}
+                if self.changed else None}
 
     def to_state(self) -> dict[str, Any]:
-        return {"tuned": self.tuned, "tuned_at": self.tuned_at, "changed": self.changed,
-                "changed_at": self.changed_at}
+        return {"reference": self.reference, "validated": self.validated,
+                "validated_at": self.validated_at, "validated_how": self.validated_how,
+                "changed": self.changed, "changed_at": self.changed_at}
 
     def load_state(self, d: dict[str, Any] | None) -> None:
-        if d:
-            self.tuned, self.tuned_at = d.get("tuned"), d.get("tuned_at")
-            self.changed, self.changed_at = d.get("changed", False), d.get("changed_at")
+        if not d:
+            return
+        # state.json from before the split kept one regime, "tuned".
+        self.reference = d.get("reference", d.get("tuned"))
+        self.validated = d.get("validated", d.get("tuned"))
+        self.validated_at = d.get("validated_at", d.get("tuned_at"))
+        self.validated_how = d.get("validated_how")
+        self.changed, self.changed_at = d.get("changed", False), d.get("changed_at")
+        self._pending, self._steady = None, 0
 
 
 # ----------------------------------------------------------------- results memory

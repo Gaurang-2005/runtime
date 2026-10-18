@@ -273,17 +273,6 @@ def build_api(ctl: Controller):
     def traffic_watch():
         return ctl.watch.summary()
 
-    @app.post("/traffic/retune")
-    def traffic_retune():
-        """Declare the current traffic as what stable is tuned for (e.g. after a
-        deliberate workload change that needs no re-test)."""
-        if ctl.watch.current is None:
-            raise HTTPException(status_code=409, detail="no traffic observed yet")
-        ctl.watch.retune(ctl.watch.current)
-        ctl._save_state()
-        ctl.event("traffic.retuned")
-        return ctl.watch.summary()
-
     @app.get("/promotions")
     def promotions():
         return {"promotions": ctl.state["promotions"], "reverted": ctl.state["reverted"],

@@ -131,7 +131,8 @@ class Controller:
         self.session = None
         from gitm.server.traffic import TrafficWatch
 
-        self.watch = TrafficWatch(threshold=self.policy["traffic_change_distance"])
+        self.watch = TrafficWatch(threshold=self.policy["traffic_change_distance"],
+                                  steady_windows=self.policy["traffic_steady_windows"])
         self._watcher: threading.Thread | None = None
         self._cancel: dict[str, threading.Event] = {}
         self._worker: threading.Thread | None = None
@@ -571,7 +572,7 @@ class Controller:
                               "baseline_decode_tok_s": baseline,
                               "baseline_source": baseline_source, "record": record,
                               "watch": promotion.Probation(baseline, self.policy)}
-            self.watch.retune(iv.regime)
+            self.watch.validate(iv.regime, how=f"promoted {iv.id} {iv.knobs}")
             self._save_state()
             self.event("promotion.swapped", id=iv.id, drained=swap.get("drained"),
                        baseline_decode_tok_s=baseline, baseline_source=baseline_source)
@@ -650,14 +651,14 @@ class Controller:
                                    json={"url": old.base_url, "drain_timeout_s": 120.0})
             old.spec.role, promoted.spec.role = "stable", "canary"
             self.engines = {"stable": old, "canary": promoted}
-            # The old configuration is back, so is what it was tuned for; if live
-            # traffic differs from that, the watcher reports a change again.
+            # The old configuration is back, and so is the traffic it was validated
+            # on; if live traffic differs from that, the watcher reports a change.
             self.watch.load_state(p.get("traffic_before"))
             self.watch.threshold = self.policy["traffic_change_distance"]
-            if self.watch.current and self.watch.tuned:
+            if self.watch.current and self.watch.reference:
                 from gitm.server.traffic import distance
 
-                self.watch.last_distance = distance(self.watch.tuned, self.watch.current)
+                self.watch.last_distance = distance(self.watch.reference, self.watch.current)
                 self.watch.changed = bool(self.watch.last_distance is not None
                                           and self.watch.last_distance > self.watch.threshold)
             now = time.time()
@@ -1023,26 +1024,28 @@ class Controller:
         return iv
 
     def _accept_if_revalidated(self) -> bool:
-        """Autonomous: after a traffic change, accept the new traffic once re-tested.
+        """In a session: after a traffic change, stable is re-validated once re-tested.
 
-        A promotion already re-tunes to the traffic it was tested on. When the
-        re-tests find nothing better, stable has just been re-validated for the
-        new traffic, so gitm accepts it itself, rather than staying in "traffic
-        changed" until a person clicks. Manual and assisted leave that call to the
-        operator: only a person knows whether a change is a one-off.
+        A promotion already validates the traffic it was tested on. When a
+        session's re-tests find nothing better, that is evidence stable is right
+        for the new traffic, so gitm records it as validated itself. A win still
+        waiting for approval keeps it open until a person decides. Manual mode
+        runs no re-tests, so nothing is validated; the watcher still re-arms on
+        steady new traffic, so later changes are caught.
         """
-        from gitm.server.autonomy import promotes_itself
+        from gitm.server.autonomy import picks_itself
 
-        if not (self.watch.changed and promotes_itself(self.mode)
+        if not (self.watch.changed and picks_itself(self.mode)
                 and self.probation is None
                 and not any(i.status in (QUEUED, RUNNING, "awaiting_approval", "approved")
                             for i in self.interventions.values())):
             return False
-        self.watch.retune(self.watch.current)
+        self.watch.validate(self.watch.current,
+                            how=f"re-tested in a {self.mode} session; nothing beat stable")
         self._save_state()
-        self.audit.record("traffic.accept", "-", "autonomous",
+        self.audit.record("traffic.validated", "-", self.mode,
                           reason="re-tested on the new traffic; stable stays")
-        self.event("traffic.accepted", reason="autonomous: re-tested everything worth "
+        self.event("traffic.validated", reason=f"{self.mode}: re-tested everything worth "
                    "trying on the new traffic; stable's configuration stays")
         return True
 
@@ -1084,15 +1087,20 @@ class Controller:
             self.watch.seen.append(str(window))
             return None
         self.watch.threshold = self.policy["traffic_change_distance"]
-        was = self.watch.tuned
+        self.watch.steady_windows = self.policy["traffic_steady_windows"]
+        was = self.watch.reference
         change = self.watch.observe(regime, str(window))
         self._save_state()
         if change == "changed":
             self.event("traffic.changed", distance=round(self.watch.last_distance or 0, 3),
-                       tuned_for=brief(was), now=brief(regime), window=str(window))
+                       measured_from=brief(was), now=brief(regime), window=str(window))
             self._react_to_traffic_change(was)
         elif change == "settled":
             self.event("traffic.settled", distance=round(self.watch.last_distance or 0, 3))
+        elif change == "rearmed":
+            # Detection re-arms on the new traffic; validation does not move.
+            self.event("traffic.rearmed", now=brief(regime),
+                       validated_on=brief(self.watch.validated))
         return change
 
     def _react_to_traffic_change(self, old_regime: dict | None) -> list[str]:

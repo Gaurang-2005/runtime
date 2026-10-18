@@ -165,7 +165,11 @@ Every candidate still goes through the full A/B and every rule.
 
 A result is about the traffic it was measured on (`gitm/server/traffic.py`). Every test stores the **regime** of the window it replayed: rate, prompt and answer lengths, prompt-to-answer ratio and burstiness, at real speed.
 
-- **The watcher** closes the open recording window every `traffic_window_s`, reads each new window's regime every `traffic_check_s`, and compares it with the regime stable was tuned for. That's the first traffic seen, then the traffic of each promoted change. Past `traffic_change_distance` (log2 units: 1.0 means some axis changed 2×), traffic has **changed**. `GET /traffic/watch` and the dashboard's Traffic panel show both regimes and the distance.
+- **The watcher** reads each closed window's regime every `traffic_check_s` and keeps two references apart:
+  - **validated:** the traffic stable's configuration was last *proven* on. That's a promoted change's test traffic, or traffic a session re-tested and found nothing better for. Before any test it's the first traffic seen, labelled "not yet tested". Only evidence moves it, and a revert restores it.
+  - **reference:** what changes are measured from. Past `traffic_change_distance` (log2 units: 1.0 means some axis changed 2×), traffic has **changed**, and that's reported once. When the new traffic has held steady for `traffic_steady_windows` (3) windows in a row, the reference **re-arms** to it, so the next change is caught too. Validation doesn't move with it.
+
+  `GET /traffic/watch` and the dashboard's Traffic panel show "stable validated on" against "now", how and when stable was validated, and whether the current traffic is validated yet.
 - **"Tried" is per traffic.** On new traffic, earlier results no longer count as tried, so changes become candidates again.
 - **On a change, in a session,** gitm queues, in order:
   1. a **re-check**: the last promoted change reversed, to see whether it still beats what it replaced;
@@ -173,7 +177,10 @@ A result is about the traffic it was measured on (`gitm/server/traffic.py`). Eve
   3. changes that won or nearly won on the **old** traffic.
 
   Then the explorer continues. In manual mode the change is only reported.
-- **Accepting the new traffic.** A promotion re-tunes to the traffic it was tested on. In **autonomous** mode, once everything worth trying for the new traffic has been re-tested and nothing beat stable, gitm accepts the new traffic itself ("stable re-validated"), and the dashboard hides the button. In manual and assisted, `POST /traffic/retune` (the dashboard's **Accept as the new normal**) is the operator's call, because only a person knows whether a change is a one-off.
+- **Nobody declares a "new normal".**
+  - A promotion validates the traffic its test ran on.
+  - In a session (assisted or autonomous), once everything worth trying for the new traffic has been re-tested and nothing beat stable, gitm records stable as validated on it. A win still awaiting approval keeps that open.
+  - In manual mode nothing is re-tested, so nothing is validated, but detection still re-arms on steady traffic.
 
 The memory survives restarts: finished interventions are reloaded from `<scratch>/interventions/`. The coordinates are those of `gitm.playbook.match.regime_distance`, so a result can become a playbook row unchanged.
 
@@ -189,7 +196,7 @@ All routes need `Authorization: Bearer <scratch>/api-token`.
 | `POST /pause`, `/resume`, `PUT /policy` | operator |
 | `GET /autonomy`, `POST /autonomy/start`, `POST /autonomy/stop`, `GET /explore/preview` | modes |
 | `GET /queue`, `POST /queue/{id}/move`, `POST /queue/{id}/front` | queue |
-| `GET /traffic/watch`, `POST /traffic/retune` | traffic changes |
+| `GET /traffic/watch` | traffic changes |
 | `GET /traffic/presets`, `POST /traffic/simulate`, `GET /traffic`, `POST /traffic/{id}/stop` | simulated traffic |
 
 `gitm mcp` exposes the same controls as 19 MCP tools. CORS admits only the dashboard's origin (`dashboard_origins`).
