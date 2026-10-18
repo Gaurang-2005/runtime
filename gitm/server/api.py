@@ -160,8 +160,14 @@ def build_api(ctl: Controller):
     def put_policy(body: dict):
         try:
             return ctl.set_policy(body)
-        except KeyError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from None
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc).strip('"')) from None
+
+    @app.get("/policy/warnings")
+    def policy_warnings():
+        from gitm.server.policy import warnings_for
+
+        return warnings_for(ctl.policy)
 
     def _sim():
         if ctl.simulator is None:

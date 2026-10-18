@@ -135,6 +135,16 @@ Assisted and autonomous run as a **session**, started with `POST /autonomy/start
 
 `POST /autonomy/stop` returns to manual. Stable is left as it is, and gitm's own queued picks are dropped. With `cancel_current`, a test gitm started is cancelled too; otherwise it finishes. `require_approval` in the policy makes even autonomous mode wait for a person.
 
+## Test settings
+
+Three settings trade speed against certainty. Each is checked against its range when set (`PUT /policy`, or the dashboard's Test settings box):
+
+| Setting | Range | Effect |
+|---|---|---|
+| `repetitions` | 2–20 (default 4) | Samples per arm. More detect smaller effects; fewer are faster. Below `promote_min_rounds` (3), a test can reject a change but never promote one; `GET /policy/warnings` says so. |
+| `settle_s` | 0–600 (default 0) | Wait before each sample. About 30–45 on a laptop that throttles. |
+| `replay_speed` | 0.1–64 (default 1) | Replay recorded traffic faster: quicker tests, at a higher load than was recorded. |
+
 ## The queue
 
 Tests run in queue order: `GET /queue`, `POST /queue/{id}/move` (0 = next), `POST /queue/{id}/front`, and `POST /interventions/{id}/stop` to remove one. `POST /interventions` takes `"front": true` to jump the queue. Each item says if it's waiting, and why.
@@ -163,7 +173,7 @@ A result is about the traffic it was measured on (`gitm/server/traffic.py`). Eve
   3. changes that won or nearly won on the **old** traffic.
 
   Then the explorer continues. In manual mode the change is only reported.
-- `POST /traffic/retune` accepts the current traffic as the new normal, without re-testing.
+- **Accepting the new traffic.** A promotion re-tunes to the traffic it was tested on. In **autonomous** mode, once everything worth trying for the new traffic has been re-tested and nothing beat stable, gitm accepts the new traffic itself ("stable re-validated"), and the dashboard hides the button. In manual and assisted, `POST /traffic/retune` (the dashboard's **Accept as the new normal**) is the operator's call, because only a person knows whether a change is a one-off.
 
 The memory survives restarts: finished interventions are reloaded from `<scratch>/interventions/`. The coordinates are those of `gitm.playbook.match.regime_distance`, so a result can become a playbook row unchanged.
 

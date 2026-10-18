@@ -124,6 +124,18 @@ button.mini { padding: 2px 8px; font-size: 12px; }
       </div>
       <div class="row"><label><input type="checkbox" id="approval"> require approval before promoting</label></div>
       <p class="muted" id="ctlnote" style="margin:6px 0 0">Pause stops new tests and promotions. Revert works during probation.</p>
+      <form id="testform" style="margin-top:12px">
+        <div class="muted" style="font-size:12px;margin-bottom:4px">Test settings</div>
+        <div class="form-grid" style="margin:0 0 8px">
+          <label>samples per arm<input id="t-reps" inputmode="numeric" title="2–20. More samples detect smaller effects but take longer."></label>
+          <label>settle before each (s)<input id="t-settle" inputmode="decimal" title="0 on servers; ~30–45 on a laptop"></label>
+          <label>replay speed (×)<input id="t-speed" inputmode="decimal" title="Above 1 replays recorded traffic faster: quicker tests, higher load"></label>
+        </div>
+        <button type="submit" class="ghost">Save</button>
+        <span class="muted" id="t-est"></span>
+        <div class="err" id="t-err"></div>
+        <div id="t-warn" style="color:var(--warn);font-size:12.5px"></div>
+      </form>
     </section>
 
     <section class="panel s6">

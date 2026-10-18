@@ -910,12 +910,37 @@ class Controller:
             if getattr(self, "_explore_done_for", None) != key:
                 self._explore_done_for = key
                 self.event("explore.exhausted", stable_args=stable_args)
+            self._accept_if_revalidated()
             return None
         nxt = todo[0]
         iv = self._auto_submit(nxt["knobs"], "explorer", nxt["note"])
         if iv is not None:
             self.event("explore.queued", id=iv.id, lever=nxt["lever"], knobs=nxt["knobs"])
         return iv
+
+    def _accept_if_revalidated(self) -> bool:
+        """Autonomous: after a traffic change, accept the new traffic once re-tested.
+
+        A promotion already re-tunes to the traffic it was tested on. When the
+        re-tests find nothing better, stable has just been re-validated for the
+        new traffic, so gitm accepts it itself, rather than staying in "traffic
+        changed" until a person clicks. Manual and assisted leave that call to the
+        operator: only a person knows whether a change is a one-off.
+        """
+        from gitm.server.autonomy import promotes_itself
+
+        if not (self.watch.changed and promotes_itself(self.mode)
+                and self.probation is None
+                and not any(i.status in (QUEUED, RUNNING, "awaiting_approval")
+                            for i in self.interventions.values())):
+            return False
+        self.watch.retune(self.watch.current)
+        self._save_state()
+        self.audit.record("traffic.accept", "-", "autonomous",
+                          reason="re-tested on the new traffic; stable stays")
+        self.event("traffic.accepted", reason="autonomous: re-tested everything worth "
+                   "trying on the new traffic; stable's configuration stays")
+        return True
 
     # ------------------------------------------------------------------ traffic
 

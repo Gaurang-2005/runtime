@@ -20,6 +20,7 @@ if (location.hash.length > 1) {
 }
 let selected = null;
 let chosenMode = null;        // what the operator clicked, before starting a session
+let currentMode = "manual";   // what the server is in
 let lastPreview = 0;
 let timer = null;
 const hist = { tps: [], ttft: [], rps: [] };
@@ -202,6 +203,7 @@ const MODE_TEXT = {
 
 function renderMode(st) {
   const mode = st.mode || "manual", sess = st.session;
+  currentMode = mode;
   const shown = sess ? mode : (chosenMode || mode);
   for (const b of document.querySelectorAll("#modeseg button")) b.classList.toggle("on", b.dataset.mode === shown);
   $("modenow").textContent = sess ? `${mode} · running` : "manual";
@@ -231,9 +233,13 @@ function renderTraffic(t) {
     ...row("requests / s", "rate_rps", (v) => fmt.n(v, 2)), ...row("prompt p50 (tokens)", "input_p50"),
     ...row("answer p50 (tokens)", "output_p50"), ...row("prompt : answer", "io_ratio", (v) => fmt.n(v, 1)),
     ...row("burstiness", "burstiness", (v) => fmt.n(v, 1)));
+  const auto = currentMode === "autonomous";
+  $("retune").hidden = auto;
   $("trafficbanner").replaceChildren(t.changed ? el("div", { class: "banner" },
     `Traffic changed at ${fmt.t(t.changed_at)}: results measured on the old traffic no longer count as tried. ` +
-    "In Assisted / Autonomous gitm re-checks the current setup, tries what was proven on traffic like this, then re-tests what did well before.") : "");
+    (auto ? "gitm is re-testing for the new traffic. It promotes anything better, or accepts the new traffic itself once nothing beats the current setup."
+          : currentMode === "assisted" ? "gitm re-checks the current setup, then tries what was proven on traffic like this and what did well before. Accept it as the new normal when you're satisfied."
+          : "Start Assisted or Autonomous to re-test, or accept it as the new normal.")) : "");
   $("trafficdist").textContent = t.distance == null ? "" :
     `distance ${fmt.n(t.distance, 2)} (changed above ${fmt.n(t.threshold, 1)}; 1.0 = some axis 2×)`;
 }
@@ -263,6 +269,15 @@ async function loadPreview() {
     $("preview").textContent = p.length ? p.map((c) => JSON.stringify(c.knobs)).join("  ·  ") :
       "nothing left to try for this setup and traffic";
   } catch (e) { $("preview").textContent = e.message; }
+}
+
+function showTestSettings(p) {
+  $("t-reps").value = p.repetitions; $("t-settle").value = p.settle_s; $("t-speed").value = p.replay_speed;
+  // One test: 2 arms x samples, each = settle + replay (assume ~40 s of recorded
+  // traffic at real speed) + ~3 s probe, plus ~5 canary restarts of ~35 s.
+  const per = p.settle_s + 40 / p.replay_speed + 3;
+  $("t-est").textContent = `≈ ${Math.round((2 * p.repetitions * per + 5 * 35) / 60)} min per test on a ~40 s recording`;
+  api("GET", "/policy/warnings").then((w) => { $("t-warn").textContent = w.join(" "); }).catch(() => {});
 }
 
 async function loadPresets() {
@@ -346,6 +361,15 @@ $("sessform").addEventListener("submit", async (ev) => {
 });
 $("s-stop").addEventListener("click", () => api("POST", "/autonomy/stop", { cancel_current: false }).then(refresh));
 $("s-stopnow").addEventListener("click", () => api("POST", "/autonomy/stop", { cancel_current: true }).then(refresh));
+$("testform").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("t-err").textContent = "";
+  try {
+    const p = await api("PUT", "/policy", { repetitions: Number($("t-reps").value),
+      settle_s: Number($("t-settle").value), replay_speed: Number($("t-speed").value) });
+    showTestSettings(p);
+  } catch (e) { $("t-err").textContent = e.message; }
+});
 $("retune").addEventListener("click", () => api("POST", "/traffic/retune").then(refresh).catch(() => {}));
 
 $("dpromote").addEventListener("click", async () => {
@@ -365,6 +389,7 @@ async function start() {
     await loadPresets();
     const policy = await api("GET", "/policy");
     $("approval").checked = !!policy.require_approval;
+    showTestSettings(policy);
   } catch { /* refresh() reports the connection state */ }
   clearInterval(timer);
   refresh();

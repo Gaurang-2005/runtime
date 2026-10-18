@@ -65,11 +65,42 @@ DEFAULT_POLICY.update({
 })
 
 
+#: Bounds for the settings an operator tunes most: (type, low, high).
+#: repetitions >= 2 because the paired interval needs two pairs per arm.
+BOUNDS: dict[str, tuple[type, float, float]] = {
+    "repetitions": (int, 2, 20),
+    "settle_s": (float, 0.0, 600.0),
+    "replay_speed": (float, 0.1, 64.0),
+}
+
+
 def merged(overrides: dict[str, Any] | None) -> dict[str, Any]:
-    """The default policy with ``overrides`` applied; unknown keys are refused."""
+    """The default policy with ``overrides`` applied.
+
+    Unknown keys raise KeyError; a bounded setting outside its range, or of the
+    wrong type, raises ValueError, before anything runs with it.
+    """
     out = copy.deepcopy(DEFAULT_POLICY)
     for key, value in (overrides or {}).items():
         if key not in out:
             raise KeyError(f"unknown policy key {key!r}; known: {sorted(out)}")
+        if key in BOUNDS:
+            kind, low, high = BOUNDS[key]
+            if isinstance(value, bool) or not isinstance(value, int | float) \
+                    or (kind is int and float(value) != int(value)):
+                raise ValueError(f"{key} must be a{'n integer' if kind is int else ' number'}, "
+                                 f"got {value!r}")
+            value = kind(value)
+            if not low <= value <= high:
+                raise ValueError(f"{key} must be between {low:g} and {high:g}, got {value:g}")
         out[key] = value
+    return out
+
+
+def warnings_for(policy: dict[str, Any]) -> list[str]:
+    """Settings that are allowed but have a consequence worth saying out loud."""
+    out = []
+    if policy["repetitions"] < policy["promote_min_rounds"]:
+        out.append(f"{policy['repetitions']} samples per arm can reject a change but never "
+                   f"promote one: promotion needs {policy['promote_min_rounds']}")
     return out

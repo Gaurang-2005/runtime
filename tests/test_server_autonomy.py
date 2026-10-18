@@ -243,3 +243,46 @@ def test_a_sessions_scope_applies_to_every_pick_not_only_the_explorers(ctl):
     ctl.watch.observe(Regime.model_validate(DOCS), "w2")
     assert ctl._react_to_traffic_change(CHAT) == []          # proven, but out of scope
     assert ctl._auto_submit({"enforce_eager": False}, "explorer", "x") is not None
+
+
+@pytest.mark.parametrize("change", [{"repetitions": 1}, {"repetitions": 2.5},
+                                    {"repetitions": True}, {"settle_s": -1},
+                                    {"replay_speed": 0}, {"replay_speed": "fast"}])
+def test_test_settings_outside_their_range_are_refused(change):
+    from gitm.server.policy import merged
+
+    with pytest.raises(ValueError):
+        merged(change)
+
+
+def test_two_samples_are_allowed_but_say_they_cannot_promote():
+    from gitm.server.policy import merged, warnings_for
+
+    assert merged({"repetitions": 2})["repetitions"] == 2
+    assert "never promote" in warnings_for(merged({"repetitions": 2}))[0]
+    assert warnings_for(merged({"repetitions": 4})) == []
+
+
+def changed_watch(ctl):
+    ctl.watch.observe(Regime.model_validate(CHAT), "w1")
+    ctl.watch.observe(Regime.model_validate(DOCS), "w2")
+    assert ctl.watch.changed
+
+
+@pytest.mark.parametrize("mode, accepts", [("autonomous", True), ("assisted", False),
+                                           (None, False)])
+def test_only_autonomous_accepts_new_traffic_itself_once_retested(ctl, mode, accepts):
+    if mode:
+        ctl.session = new_session(mode)
+    changed_watch(ctl)
+    assert ctl._accept_if_revalidated() is accepts
+    assert ctl.watch.changed is (not accepts)
+    if accepts:
+        assert ctl.watch.tuned["input_p50"] == 4000          # stable now tuned for docs
+
+
+def test_autonomous_does_not_accept_while_a_retest_is_still_queued(ctl):
+    ctl.session = new_session("autonomous")
+    changed_watch(ctl)
+    ctl._auto_submit({"max_num_seqs": 128}, "rediscover", "x")
+    assert ctl._accept_if_revalidated() is False and ctl.watch.changed
