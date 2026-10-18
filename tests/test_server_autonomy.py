@@ -385,3 +385,49 @@ def test_declining_changes_nothing_and_cannot_be_approved_after(approving):
     assert iv.status == "declined" and "not during the launch" in iv.detail and not promoted
     with pytest.raises(ValueError):
         ctl.approve(iv, by="gaurang")
+
+
+def test_burstiness_from_a_small_window_does_not_make_traffic_new():
+    from gitm.server.traffic import distance
+
+    small_a = regime(requests=50, burstiness=1.94, io_ratio=26.8).model_dump(mode="json")
+    small_b = regime(requests=50, burstiness=0.82, io_ratio=16.6).model_dump(mode="json")
+    assert distance(small_a, small_b) < 1.0                   # same traffic, noisy windows
+    big_a = regime(requests=500, burstiness=1.0).model_dump(mode="json")
+    big_b = regime(requests=500, burstiness=16.0).model_dump(mode="json")
+    assert distance(big_a, big_b) > 1.0                       # measurable: a real change
+
+
+def test_stopping_a_test_never_blocks_the_canarys_own_restore():
+    import threading
+
+    from gitm.server.canary import CanaryApplicator, Cancelled
+
+    class E:
+        def __init__(self):
+            from gitm.server.supervisor import EngineSpec
+
+            self.spec, self.alive = EngineSpec("canary", "m", 1, ["--x"]), True
+
+        def stop(self):
+            pass
+
+        def start(self):
+            pass
+
+        def wait_healthy(self, t=0):
+            pass
+
+    cancel = threading.Event()
+    cancel.set()
+    a = CanaryApplicator(E(), cancel=cancel)
+    a.engine.spec.serve_args = ["--candidate"]
+    import gitm.server.canary as c
+    orig, c.warm_up = c.warm_up, lambda e: None
+    try:
+        a.restore(["--stable"])                               # not refused
+        assert a.engine.spec.serve_args == ["--stable"]
+        with pytest.raises(Cancelled):
+            a.apply(type("S", (), {"knob_values": {"max_num_seqs": 1}})())
+    finally:
+        c.warm_up = orig

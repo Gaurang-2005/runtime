@@ -158,13 +158,15 @@ class CanaryApplicator:
         self._relaunch(candidate_args(self.engine.spec.serve_args, spec.knob_values))
 
     def restore(self, snapshot: list[str]) -> None:
-        self._relaunch(list(snapshot))
+        # Never refused for a stop: a stop cancels the test, not its clean-up.
+        # Refusing it left "restore failed" and the canary on the candidate.
+        self._relaunch(list(snapshot), cancellable=False)
 
     def measure(self, spec: InterventionSpec) -> float | None:
         return None  # the evaluator measures through the sampler
 
-    def _relaunch(self, serve_args: list[str]) -> None:
-        if self.cancel.is_set():
+    def _relaunch(self, serve_args: list[str], cancellable: bool = True) -> None:
+        if cancellable and self.cancel.is_set():
             raise Cancelled("stopped before relaunching the canary")
         self.engine.stop()
         self.engine.spec.serve_args = serve_args

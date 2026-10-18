@@ -46,14 +46,29 @@ def as_regime(d: dict[str, Any] | Regime | None) -> Regime | None:
     return Regime.model_validate(d)
 
 
+#: Burstiness (variance / mean of arrivals per bin) is only measurable from
+#: enough requests. From 30-60 it is mostly noise: two windows of the same
+#: simulated chat traffic read 1.94 and 0.82, a "2x change" that made gitm
+#: re-test block_size=16 four times as if the traffic were new each time.
+BURSTINESS_MIN_REQUESTS = 300
+
+
 def distance(a: dict | Regime | None, b: dict | Regime | None) -> float | None:
-    """L-inf regime distance in log2 units, or None when either side is unknown."""
-    from gitm.playbook.match import regime_distance
+    """L-inf regime distance in log2 units, or None when either side is unknown.
+
+    Lengths and the prompt:answer ratio always count. Burstiness counts only
+    when both regimes come from at least BURSTINESS_MIN_REQUESTS requests.
+    """
+    from gitm.playbook.match import DEFAULT_AXES, UNCALIBRATED_POLICY, regime_distance
 
     ra, rb = as_regime(a), as_regime(b)
     if ra is None or rb is None:
         return None
-    return float(regime_distance(ra, rb).linf)
+    axes = DEFAULT_AXES
+    if min(ra.requests, rb.requests) < BURSTINESS_MIN_REQUESTS:
+        axes = tuple(x for x in DEFAULT_AXES if x != "burstiness")
+    policy = UNCALIBRATED_POLICY.model_copy(update={"axes": axes})
+    return float(regime_distance(ra, rb, policy).linf)
 
 
 def brief(r: dict | Regime | None) -> dict[str, Any] | None:
