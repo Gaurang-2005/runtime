@@ -94,18 +94,20 @@ experts   nvfp4: 0.5625 B/weight stored (11.1% scales) -> marlin, bf16 MACs, 0.5
 
 The case's figures are from `analysis/derive.py` and the design note, with B200 at TP4, 32 x 8,192 and a bf16 cache.
 
+The 13.56 / 13.38 ms reconciliation below and the B200 rows of "What moved across the catalogue" use 8 TB/s for B200, the case's figure and the catalogue's value at #127. The catalogue's B200 is now 7.7 TB/s (HGX B200 per-GPU datasheet figure; `context.py` cites it), which adds about 3.9% to every memory-bound B200 term in a live `gitm plan`; the two rows below that depend on it give both figures.
+
 | Figure | Case | This code | Verdict |
 |---|---:|---:|---|
 | Bytes per expert (3 x 7,168 x 2,048 at 0.5625) | 24.77 MB | 24,772,608 B | reproduced |
 | Distinct experts per layer, 32 x top-8 of 384 | 188.2 | 188.23 | reproduced |
 | Routed bytes per layer per rank | 1,165.7 MB | 1,165.7 MB (+0.1% activations) | reproduced |
-| Routed-expert time, 60 layers | 8.74 ms | 8.751 ms | reproduced |
+| Routed-expert time, 60 layers | 8.74 ms | 8.751 ms at the case's 8 TB/s (9.092 at the catalogue's 7.7) | reproduced |
 | KV bytes per token, bf16 | 70,272 | 70,272 | reproduced |
 | KV bytes per token, fp8 | 39,040 | 35,136 | **case wrong** |
 | Cache dtype NVIDIA's command serves | bf16 (claim 1.5) | fp8 | **case wrong** |
 | KV room at TP4 after weights | 10.9 GB | 7.0 GB with 4.5 GB workspace (at the case's precision; the catalogue entry leaves 7.3 GB, see Workspace below) | **case inconsistent** |
 | Footprint vs 595.15 GB | -0.03% (planner) | -0.16%, the gap being the 0.94 GB vision tower | **match was two errors cancelling** |
-| Ridges bf16 / fp8 / fp4 | 281 / 562 / 1,125 | 281 / 562 / 1,125 | reproduced |
+| Ridges bf16 / fp8 / fp4 | 281 / 562 / 1,125 | 281 / 562 / 1,125 at 8 TB/s (292 / 584 / 1,169 at 7.7) | reproduced |
 
 The four discrepancies:
 
@@ -129,7 +131,7 @@ The case note explained the gap as "the planner pricing collectives as bandwidth
 | `lm_head`, layer-0 MLP, logits all-gather, attention core | 2.409 | 2.411 | +0.002 | |
 | **Total** | **13.381** | **13.564** | **+0.183** | The planner column's rounded terms sum to 13.565. |
 
-With both input errors fixed (router bf16 per the engine, or fp32 at B200's real 75 TF/s; shared expert back to bf16), this branch prices the same configuration at 13.335 ms. That includes the 60 W4A4 activation-quant launches the case did not model.
+With both input errors fixed (router bf16 per the engine; shared expert back to bf16), the same configuration prices at 13.314 ms at the case's 8 TB/s, and 13.771 ms at the catalogue's 7.7 TB/s (`gitm plan kimi-k2.6 --gpu B200 --batch 32 --kv-len 8192 --tp 4 --kv-cache-dtype bf16` on this branch). Keeping the fp32 router but pricing it at B200's real 75 TF/s gives 13.335 ms at 8 TB/s (13.792 ms at 7.7). All include the 60 W4A4 activation-quant launches the case did not model.
 
 ## Reproduction 2: GLM-5.2 on 8xH200, TP8/EP8, FP8
 
@@ -146,7 +148,7 @@ With both input errors fixed (router bf16 per the engine, or fp32 at B200's real
 - **bf16 footprint.** The +0.08% was the dense FFN double-count: three dense layers, 1.36 GB.
 - **act_quant.** Block fp8 quantises activations with one fp32 scale per 128 channels, 48 scales per row at hidden 6,144 (`quantization/fp8.py:317`). The old node charged one scale per row.
 
-On B200 the GLM entries now price 0.2% to 2.2% faster, because the fp32 router runs at B200's 75 TF/s CUDA-core rate (HGX B200: 600 TFLOPS FP32 across eight GPUs) instead of A100's.
+On B200 at the 8 TB/s of #127 the GLM entries priced 0.2% to 2.2% faster than before #127, because the fp32 router runs at B200's 75 TF/s CUDA-core rate (HGX B200: 600 TFLOPS FP32 across eight GPUs) instead of A100's. At the catalogue's 7.7 TB/s the same entries price 0.6% to 3.7% slower than before #127 (`glm-5.2` 126.861 / 18.605 ms and `glm-5.2-fp8` 64.641 / 10.764 ms at TP1 / TP8, against 122.387 / 18.220 and 62.517 / 10.697 before), because the bandwidth change outweighs the router's.
 
 ## What moved across the catalogue
 
