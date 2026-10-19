@@ -205,3 +205,24 @@ def test_the_sampler_settles_before_measuring_and_stops_when_cancelled():
     with pytest.raises(Cancelled):
         s._sample_once("baseline", 0)
     assert time.monotonic() - t0 < 1.0          # a stop interrupts the settle
+
+
+def test_a_model_an_engine_already_loaded_relaunches_with_the_hub_offline(tmp_path, monkeypatch):
+    import gitm.server.supervisor as sup
+
+    monkeypatch.setattr(sup.EngineProcess, "loaded_models", set())
+    monkeypatch.setattr(sup, "wait_healthy", lambda *a, **k: None)
+    monkeypatch.setattr(sup, "served_model_name", lambda url, model: model)
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+
+    def engine(role):
+        return sup.EngineProcess(sup.EngineSpec(role=role, model="m", port=1), tmp_path)
+
+    first = engine("stable")
+    assert "HF_HUB_OFFLINE" not in first.environment()   # may still need a download
+    first.proc = object()
+    first.wait_healthy()
+    assert engine("canary").environment()["HF_HUB_OFFLINE"] == "1"
+
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")           # the operator's choice wins
+    assert engine("canary").environment()["HF_HUB_OFFLINE"] == "0"

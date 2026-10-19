@@ -69,6 +69,14 @@ class EngineSpec:
 class EngineProcess:
     """One ``vllm serve`` process: start, wait for health, stop."""
 
+    #: Models an engine has come up healthy on in this process. Every file vLLM
+    #: reads for them is then in the local cache, yet each relaunch still asks
+    #: the Hub for the repo's file list, and a DNS blip there kills the start
+    #: ("Temporary failure in name resolution"). That was a canary relaunch on
+    #: a laptop on flaky Wi-Fi; on a revert it would leave nothing serving.
+    #: Later launches of these models run with the Hub offline.
+    loaded_models: set[str] = set()
+
     def __init__(self, spec: EngineSpec, log_dir: str | Path):
         self.spec = spec
         self.log_dir = Path(log_dir)
@@ -98,6 +106,8 @@ class EngineProcess:
         bindir = str(Path(sys.executable).parent)
         if bindir not in env.get("PATH", "").split(os.pathsep):
             env["PATH"] = os.pathsep.join(filter(None, [bindir, env.get("PATH")]))
+        if self.spec.model in EngineProcess.loaded_models and "HF_HUB_OFFLINE" not in env:
+            env["HF_HUB_OFFLINE"] = "1"
         env.update(self.spec.env)
         # Untraced: the injection variables are read once, at CUDA init, from
         # whatever the child inherits, so they are removed rather than left unset.
@@ -137,6 +147,7 @@ class EngineProcess:
                                    ) from exc
             raise
         self.healthy_at = time.time()
+        EngineProcess.loaded_models.add(self.spec.model)
         self.served_model = served_model_name(self.base_url, self.spec.model)
 
     def stop(self) -> None:
