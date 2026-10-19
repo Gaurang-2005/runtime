@@ -102,7 +102,7 @@ async function refresh() {
     renderMode(status);
     renderTraffic(status.traffic);
     renderQueue(status.queue || []);
-    if (Date.now() - lastPreview > 10000) { lastPreview = Date.now(); loadPreview(); }
+    if (Date.now() - lastPreview > 10000) { lastPreview = Date.now(); loadPreview(); loadProfile(); }
     $("pause").textContent = status.paused ? "Resume" : "Pause";
     $("revert").disabled = !status.probation;
     if (selected) renderDetail(await api("GET", `/interventions/${selected}`));
@@ -274,6 +274,47 @@ async function loadPreview() {
       "nothing left to try for this setup and traffic";
   } catch (e) { $("preview").textContent = e.message; }
 }
+
+async function loadProfile() {
+  let v;
+  try { v = await api("GET", "/profile"); } catch (e) { $("profstate").textContent = e.message; return; }
+  const p = v.profile, a = p && p.analysis;
+  const last = v.last_attempt;
+  let state = "no profile yet";
+  if (v.running) state = `profiling now (${v.running}): the canary is traced, tests wait`;
+  else if (v.requested) state = `profile requested: runs before the next test`;
+  else if (p) state = `profiled ${fmt.t(p.finished)} · ${a.kernels.toLocaleString()} kernels · ` +
+    (v.stale ? `not in use: ${v.stale}` : "in use: the explorer ranks by it");
+  if (last && last.status === "failed" && !v.running) state += ` · last attempt failed: ${last.detail}`;
+  $("profstate").textContent = state;
+  $("profnow").disabled = Boolean(v.running || v.requested);
+  if (!a) {
+    $("profops").replaceChildren(); $("profbasis").textContent = ""; $("profcauses").textContent = "–";
+  } else {
+    const top = a.ops.slice(0, 8), max = Math.max(...top.map((o) => o.share), 0.0001);
+    $("profops").replaceChildren(...top.flatMap((o) => [
+      el("span", { class: "mono" }, o.name),
+      el("span", { class: "track" }, el("span", { class: "fill", style: `width:${(100 * o.share / max).toFixed(1)}%;display:block` })),
+      el("span", { class: "v" }, `${(o.share * 100).toFixed(1)}%`)]));
+    const g = a.graph;
+    $("profbasis").textContent = `${(a.labelled_share * 100).toFixed(0)}% of GPU time named by layer · batch ${g.batch} (${g.batch_source}) · ` +
+      (g.floors_priced ? `floors priced for ${g.hardware}` : `floors not priced: ${g.not_priced_because}, so nothing is ruled out for being at its floor`);
+    $("profcauses").replaceChildren(...(a.causes.length ? a.causes.map((c) =>
+      el("div", { style: "margin-bottom:4px" }, el("span", { class: "pill warn" }, c.signal), " ", c.note))
+      : [document.createTextNode("no scheduler pressure in the window")]));
+  }
+  fill($("profnext"), (v.next || []).filter((c) => c.knobs).map((c, i) => el("tr", {},
+    el("td", { class: "num" }, String(i + 1)), el("td", { class: "mono" }, JSON.stringify(c.knobs)),
+    el("td", { class: "muted" }, c.why || (a && !v.stale ? "not ranked by the profile; catalogue order" : "catalogue order")))));
+  fill($("profout"), (v.ruled_out || []).map((c) => el("tr", {},
+    el("td", { class: "mono" }, JSON.stringify(c.knobs)), el("td", { class: "muted" }, c.reason))));
+}
+
+$("profnow").addEventListener("click", async () => {
+  $("profnow").disabled = true;
+  try { await api("POST", "/profile"); } catch (e) { $("profstate").textContent = e.message; }
+  loadProfile();
+});
 
 function showTestSettings(p) {
   $("t-reps").value = p.repetitions; $("t-settle").value = p.settle_s; $("t-speed").value = p.replay_speed;

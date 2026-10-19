@@ -26,8 +26,11 @@ def test_every_control_is_a_tool_and_calls_its_route():
     server = build(client)
     names = {t.name for t in asyncio.run(server.list_tools())}
     assert {"status", "start_intervention", "stop_intervention", "promotion_rules", "promote",
-            "revert", "pause", "resume", "get_policy", "set_policy", "live_stats"} <= names
+            "revert", "pause", "resume", "get_policy", "set_policy", "live_stats",
+            "get_profile", "profile"} <= names
     asyncio.run(server.call_tool("start_intervention", {"knobs": {"max_num_seqs": 128}}))
     method, path, kw = client.calls[-1]
     assert (method, path) == ("POST", "/interventions")
+    asyncio.run(server.call_tool("profile", {}))
+    assert client.calls[-1][:2] == ("POST", "/profile")
     assert kw["json"]["knobs"] == {"max_num_seqs": 128} and kw["json"]["submitter"] == "mcp-agent"

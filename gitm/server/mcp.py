@@ -24,6 +24,10 @@ its status is final -> promotion_rules(id) to see why it was or was not promoted
 Promotion is automatic when every rule passes (unless the policy requires
 approval); revert works only during probation. Knobs are vLLM engine argument
 names, e.g. {"max_num_batched_tokens": 16384} or {"enforce_eager": false}.
+
+get_profile shows where stable's GPU time goes (kernel trace by op, scheduler
+causes) and the order gitm would try changes in because of it; profile asks for
+a fresh one (it relaunches the canary traced for a few minutes).
 """
 
 
@@ -155,6 +159,16 @@ def build(client: Client):
     def traffic_status() -> dict:
         """Live traffic against what stable was tuned for: regime, distance, changed?"""
         return client.call("GET", "/traffic/watch")
+
+    @tool()
+    def get_profile() -> dict:
+        """Where stable's time goes (ops, causes), the ranking built on it, and what it rules out."""
+        return client.call("GET", "/profile")
+
+    @tool()
+    def profile() -> dict:
+        """Trace stable's configuration on the canary over recorded traffic, and re-rank."""
+        return client.call("POST", "/profile")
 
     @tool()
     def get_policy() -> dict:

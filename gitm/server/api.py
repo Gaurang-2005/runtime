@@ -247,6 +247,19 @@ def build_api(ctl: Controller):
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=409, detail=str(exc)) from None
 
+    # --- where stable's time goes, and what the explorer ranks by
+
+    @app.get("/profile")
+    def profile():
+        return ctl.profile_view()
+
+    @app.post("/profile", status_code=202)
+    def request_profile():
+        try:
+            return ctl.request_profile(by="api")
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+
     # --- the queue, in run order
 
     @app.get("/queue")

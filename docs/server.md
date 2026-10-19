@@ -161,6 +161,26 @@ In a session, whenever nothing is queued, the controller takes the next candidat
 
 Every candidate still goes through the full A/B and every rule.
 
+## Ranking by where the time goes
+
+Without a profile, candidates come in catalogue order. With one, they are ranked the way the batch loop (`gitm run`) ranks them, from a kernel trace of stable's own configuration (`gitm/server/profile.py`).
+
+**Taking a profile.** `POST /profile` (or "Profile now" on the dashboard) asks for one. In a session, gitm also takes one by itself before exploring whenever the last one is stale: no profile yet, stable's flags changed (a promotion or revert), or traffic moved past `traffic_change_distance` since. A failed profile is not retried for the same stable within `profile_retry_s`. A profile:
+1. relaunches the canary on stable's flags, **traced**: the injected CUPTI collector, `--enforce-eager`, `--enable-layerwise-nvtx-tracing` and vLLM's V1 model runner, which is the only one that pushes layer ranges. This matches the batch loop's traced engine;
+2. replays the newest recorded window at its real speed, collecting kernels for `profile_window_s` (8 s) after `profile_skip_s` (10 s) of ramp-up, while sampling the canary's `/metrics`;
+3. relaunches the canary untraced on stable's flags, whatever happened;
+4. analyses the capture in a subprocess, then deletes the shards.
+
+Tracing never touches a measurement. Every keep or reject is still an A/B of untraced engines.
+
+**What the analysis computes.** Everything comes from the batch loop's own functions, so the two cannot rank one trace differently:
+- **GPU time by op.** Each kernel is named by its NVTX layer range (97% of time on the laptop) or else by its name.
+- **The predicted graph** for this model, priced with the engine's resolved dtype and context length, and the batch it actually ran (`/metrics` running count). Per op, it gives the seconds spent above its floor. A lever aimed at an op already at its floor is ruled out.
+- **Scheduler causes** from the same window: queue depth, under-filled batches, KV-cache pressure, preemptions. A lever a cause argues for ranks first.
+- `select_interventions` then orders the catalogue. Levers it rejects (not applicable to this GPU or dtype, or no recoverable time) are ruled out with the reason.
+
+`GET /profile` shows the result, whether it is in use, the next candidates with why, and what is ruled out. Floors need the GPU's peak figures. gitm has them for datacenter parts (A100, H100, H200, B200, MI300X, MI355X and so on), not for laptop GPUs. On a laptop, nothing is ruled out for being at its floor, and the profile says so.
+
 ## Traffic changes
 
 A result is about the traffic it was measured on (`gitm/server/traffic.py`). Every test stores the **regime** of the window it replayed: rate, prompt and answer lengths, prompt-to-answer ratio and burstiness, at real speed.
@@ -197,9 +217,10 @@ All routes need `Authorization: Bearer <scratch>/api-token`.
 | `GET /autonomy`, `POST /autonomy/start`, `POST /autonomy/stop`, `GET /explore/preview` | modes |
 | `GET /queue`, `POST /queue/{id}/move`, `POST /queue/{id}/front` | queue |
 | `GET /traffic/watch` | traffic changes |
+| `GET /profile`, `POST /profile` | where stable's time goes, and the ranking built on it |
 | `GET /traffic/presets`, `POST /traffic/simulate`, `GET /traffic`, `POST /traffic/{id}/stop` | simulated traffic |
 
-`gitm mcp` exposes the same controls as 19 MCP tools. CORS admits only the dashboard's origin (`dashboard_origins`).
+`gitm mcp` exposes the same controls as 21 MCP tools. CORS admits only the dashboard's origin (`dashboard_origins`).
 
 ## Known limits
 
@@ -208,4 +229,5 @@ All routes need `Authorization: Bearer <scratch>/api-token`.
 - **Replays carry shape, not text.** Lengths, timing and prefix sharing are reproduced; content is not. Speculative decoding depends on content, so it can't be judged on a replay.
 - **Every structural change is a canary relaunch.** That's seconds on a small model and minutes on Kimi.
 - **A controller restart does not adopt running engines.** `state.json` (promotions, reverts, the session, the tuned-for traffic) and the results memory survive, but the restarted controller launches fresh engines, and tests that were queued are marked stopped.
+- **A profile costs memory in proportion to kernels per second.** A merged trace peaks at about 9× its shards (1.1 GB of shards from 15 s of a 0.5B model took 9 GB). The analysis refuses shards larger than a tenth of free memory rather than risk the OOM killer; lower `profile_window_s` if it does.
 - **A traffic change is judged on lengths, ratio and burstiness, not request rate:** the playbook's distance leaves rate out on purpose. Load changes are what the latency gates and the noise check see.

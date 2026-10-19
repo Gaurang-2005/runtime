@@ -149,6 +149,12 @@ class Controller:
         # and a restore never relaunch it under each other.
         self._canary_lock = threading.Lock()
         self._audit = None
+        # The latest kernel profile of stable's configuration (gitm.server.profile),
+        # what the explorer ranks by while it is fresh.
+        self.profile: dict[str, Any] | None = None
+        self._profile_requested: str | None = None
+        self._profiling: str | None = None      # id of the profile being taken
+        self._ruled_out: list[dict[str, Any]] = []
 
     @property
     def audit(self):
@@ -201,6 +207,7 @@ class Controller:
         self.workdir.mkdir(parents=True, exist_ok=True)
         self._load_state()
         self._load_history()
+        self._load_profile()
         token_file = self.workdir / "api-token"
         token_file.write_text(self.token + "\n")
         os.chmod(token_file, 0o600)
@@ -321,6 +328,7 @@ class Controller:
             "queue": self.queue_view(),
             "traffic": self.watch.summary(),
             "promotions": self.state["promotions"][-5:],
+            "profile": self.profile_brief(),
             "workdir": str(self.workdir),
         }
 
@@ -857,6 +865,8 @@ class Controller:
             self._carry_out_approvals()
             iv = None
             if self.probation is None and not self.policy["paused"]:
+                if self._maybe_profile():
+                    continue
                 iv = self._next_runnable()
                 if iv is None:
                     self._maybe_explore()
@@ -977,7 +987,7 @@ class Controller:
         return self._candidates()[:n]
 
     def _candidates(self) -> list[dict[str, Any]]:
-        from gitm.server.explore import candidates, model_facts, serve_defaults
+        from gitm.server.explore import candidates, model_facts
         from gitm.server.promotion import knob_key
         from gitm.server.traffic import near, tried_for
 
@@ -997,12 +1007,26 @@ class Controller:
                    if r.get("regime") is None or live is None
                    or near(r.get("regime"), live, threshold)}
         facts = model_facts(self.cfg.model, stable_args)
-        if self._serve_defaults is None:
-            self._serve_defaults = serve_defaults(facts["tp"], stable.spec.gpus)
         todo = candidates(stable_args, tried=tried, blocked=blocked, policy=policy,
                           resolved=stable.resolved_config(), facts=facts,
-                          defaults=self._serve_defaults)
+                          defaults=self.serve_defaults())
+        from gitm.server.profile import order
+
+        # Ranked by where stable's time goes, while the profile describes this
+        # stable on this traffic; catalogue order otherwise.
+        fresh = self.profile if self.profile_stale() is None else None
+        todo, self._ruled_out = order(todo, (fresh or {}).get("analysis"))
         return [c | {"knob_key": knob_key(c["knobs"])} for c in todo]
+
+    def serve_defaults(self) -> dict[str, int]:
+        """The batch limits vLLM picks for stable's GPU when its flags leave them unset."""
+        from gitm.server.explore import model_facts, serve_defaults
+
+        if self._serve_defaults is None:
+            stable = self.engines["stable"]
+            tp = model_facts(self.cfg.model, list(stable.spec.serve_args))["tp"]
+            self._serve_defaults = serve_defaults(tp, stable.spec.gpus)
+        return self._serve_defaults
 
     def _maybe_explore(self) -> Intervention | None:
         """In a session, queue the next catalogue candidate when nothing is waiting."""
@@ -1058,6 +1082,169 @@ class Controller:
         self.event("traffic.validated", reason=f"{self.mode}: re-tested everything worth "
                    "trying on the new traffic; stable's configuration stays")
         return True
+
+    # ------------------------------------------------------------------ profiling
+
+    @property
+    def profile_dir(self) -> Path:
+        return self.workdir / "profiles"
+
+    def _load_profile(self) -> None:
+        """The newest finished profile from an earlier run, so a restart keeps its ranking."""
+        done = []
+        for f in self.profile_dir.glob("*/profile.json"):
+            try:
+                p = json.loads(f.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if p.get("status") == "running":
+                # Its controller died mid-profile; nothing will finish it.
+                p["status"], p["detail"] = "interrupted", "the controller stopped before it finished"
+                f.write_text(json.dumps(p, indent=2, default=str))
+            if p.get("status") == "done":
+                done.append(p)
+        if done:
+            self.profile = max(done, key=lambda p: p.get("finished") or 0)
+
+    def profile_stale(self, profile: dict[str, Any] | None = None) -> str | None:
+        """Why the profile no longer describes stable on the traffic arriving, or None.
+
+        A profile is of one stable configuration on one kind of traffic, as a
+        verdict is. A promotion or revert changes the first; the traffic watcher
+        says when the second has moved.
+        """
+        from gitm.server.traffic import distance
+
+        p = profile if profile is not None else self.profile
+        if p is None or p.get("status") != "done":
+            return "no profile of stable yet"
+        stable = self.engines.get("stable")
+        if stable is not None and p.get("stable_args") != list(stable.spec.serve_args):
+            return "stable's configuration changed since it was profiled"
+        d = distance(p.get("regime"), self.watch.current)
+        if d is not None and d > self.policy["traffic_change_distance"]:
+            return f"traffic moved {d:.2f} (limit {self.policy['traffic_change_distance']:g}) " \
+                   "since it was profiled"
+        return None
+
+    def profile_brief(self) -> dict[str, Any] | None:
+        p = self.profile
+        if p is None:
+            return None
+        a = p.get("analysis") or {}
+        return {"id": p["id"], "status": p["status"], "finished": p.get("finished"),
+                "running": self._profiling, "requested": self._profile_requested,
+                "kernels": a.get("kernels"), "stale": self.profile_stale(),
+                "top_ops": (a.get("ops") or [])[:4], "causes": [c["signal"] for c in
+                                                                a.get("causes") or []]}
+
+    def profile_view(self) -> dict[str, Any]:
+        """The latest profile in full, whether it is still in use, and what it rules out."""
+        try:
+            nxt = self._candidates()[:8]
+        except Exception as exc:  # noqa: BLE001 - the view must not fail on a catalogue problem
+            nxt = [{"error": str(exc)}]
+        return {"profile": self.profile, "stale": self.profile_stale(),
+                "running": self._profiling, "requested": self._profile_requested,
+                "last_attempt": self.profile_last_attempt, "next": nxt,
+                "ruled_out": self._ruled_out}
+
+    def request_profile(self, *, by: str = "api") -> dict[str, Any]:
+        if "canary" not in self.engines:
+            raise ValueError("this server runs without a canary, so it cannot profile")
+        if self._profile_requested is None:
+            self._profile_requested = f"requested by {by}"
+        self.event("profile.requested", by=by)
+        self._wake.set()
+        return {"requested": self._profile_requested}
+
+    def _maybe_profile(self) -> bool:
+        """Take a profile when one is asked for, or before a session explores on a stale one.
+
+        Asked for, it runs before the next queued test. On its own, only when a
+        session would otherwise explore (nothing queued or running) and the
+        profile no longer describes stable on this traffic; a failure is not
+        retried for the same stable and traffic within ``profile_retry_s``.
+        """
+        from gitm.server.autonomy import in_schedule, picks_itself
+
+        reason = self._profile_requested
+        if reason is None:
+            if (not self.policy["profile"] or "canary" not in self.engines
+                    or self.session is None or not picks_itself(self.session.mode)
+                    or not in_schedule(self.session.schedule, time.time())
+                    or any(i.status in (QUEUED, RUNNING) for i in self.interventions.values())):
+                return False
+            reason = self.profile_stale()
+            if reason is None:
+                return False
+            p = self.profile_last_attempt
+            if (p and p.get("status") == "failed"
+                    and p.get("stable_args") == list(self.engines["stable"].spec.serve_args)
+                    and time.time() - (p.get("finished") or 0) < self.policy["profile_retry_s"]):
+                return False
+        window = self._window_for_test()
+        if window is None:
+            if self._profile_requested is not None:
+                self._profile_requested = None
+                self.event("profile.failed", reason="no recorded traffic to profile on yet")
+            return False
+        with self._canary_lock:
+            self._run_profile(window, reason)
+        return True
+
+    profile_last_attempt: dict[str, Any] | None = None
+
+    def _run_profile(self, window: Path, reason: str) -> dict[str, Any]:
+        from gitm.server.canary import current_value
+        from gitm.server.profile import run_analysis, take_profile
+        from gitm.server.traffic import regime_of
+
+        stable, canary = self.engines["stable"], self.engines["canary"]
+        stable_args = list(stable.spec.serve_args)
+        pid = uuid.uuid4().hex[:10]
+        out = self.profile_dir / pid
+        out.mkdir(parents=True, exist_ok=True)
+        rec: dict[str, Any] = {"id": pid, "status": "running", "reason": reason,
+                               "started": time.time(), "finished": None,
+                               "stable_args": stable_args, "window": str(window),
+                               "regime": regime_of(window, self.policy["max_replay_requests"])[0]
+                               .model_dump(mode="json")}
+        self._profile_requested, self._profiling = None, pid
+        self.event("profile.started", id=pid, reason=reason)
+        (out / "profile.json").write_text(json.dumps(rec, indent=2, default=str))
+        try:
+            # Occupancy is running / max_num_seqs; without the cap no
+            # under-filled batch can be seen.
+            seqs = (current_value(stable_args, "max_num_seqs")
+                    or self.serve_defaults().get("max_num_seqs"))
+            cap = take_profile(
+                canary=canary, stable_args=stable_args, window=window, out=out,
+                policy=self.policy, tokenizer=self.cfg.model,
+                startup_timeout_s=self.cfg.startup_timeout_s,
+                max_num_seqs=int(seqs) if seqs else None,
+                on_change=lambda args: self.event("canary.relaunched", id=pid,
+                                                  serve_args=args))
+            rec["capture"] = cap
+            rec["analysis"] = run_analysis(cap, model=self.cfg.model,
+                                           out=out / "ranking.json", gpus=stable.spec.gpus)
+            rec["status"] = "done"
+        except Exception as exc:  # noqa: BLE001 - recorded on the profile, never raised
+            rec["status"], rec["detail"] = "failed", f"{type(exc).__name__}: {exc}"
+        rec["finished"], self._profiling = time.time(), None
+        (out / "profile.json").write_text(json.dumps(rec, indent=2, default=str))
+        self.profile_last_attempt = rec
+        if rec["status"] == "done":
+            self.profile = rec
+            a = rec["analysis"]
+            self.event("profile.finished", id=pid, kernels=a["kernels"],
+                       top_ops=[o["name"] for o in a["ops"][:3]],
+                       causes=[c["signal"] for c in a["causes"]])
+        else:
+            self.event("profile.failed", id=pid, reason=rec["detail"])
+        self.audit.record("profile", pid, "gitm", status=rec["status"], reason=reason,
+                          detail=rec.get("detail", ""))
+        return rec
 
     # ------------------------------------------------------------------ traffic
 

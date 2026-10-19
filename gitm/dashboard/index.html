@@ -57,6 +57,10 @@ tr.click { cursor: pointer; } tr.click:hover { background: var(--accent-soft); }
 .pill.warn { color: var(--warn); border-color: var(--warn); }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
 .muted { color: var(--muted); }
+.bars { display: grid; grid-template-columns: minmax(0, 11em) 1fr 3.5em; gap: 4px 10px; align-items: center; font-size: 12.5px; }
+.bars .track { height: 10px; background: var(--accent-soft); border-radius: 3px; overflow: hidden; }
+.bars .fill { height: 100%; background: var(--accent); }
+.bars .v { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
 .scroll { overflow-x: auto; }
 .log { max-height: 260px; overflow-y: auto; }
 .engines { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
@@ -212,6 +216,29 @@ button.mini { padding: 2px 8px; font-size: 12px; }
         <tbody id="queue"></tbody></table></div>
       <p class="muted" style="margin:10px 0 4px">gitm would pick next (Assisted / Autonomous):</p>
       <div id="preview" class="mono muted">–</div>
+    </section>
+
+    <section class="panel s12">
+      <h2>Where stable's time goes</h2>
+      <div class="row">
+        <span id="profstate" class="muted">no profile yet</span>
+        <button type="button" class="ghost" id="profnow" title="Relaunches the canary traced on stable's configuration and replays recorded traffic (a few minutes). Nothing is measured from it.">Profile now</button>
+      </div>
+      <div class="grid" style="margin-top:8px">
+        <div style="grid-column: span 6; min-width:0">
+          <p class="muted" style="margin:0 0 6px">GPU time by op (kernel trace)</p>
+          <div class="bars" id="profops"></div>
+          <p class="muted" id="profbasis" style="margin:8px 0 0;font-size:12px"></p>
+          <p class="muted" style="margin:10px 0 4px">What the engine showed</p>
+          <div id="profcauses" class="muted">–</div>
+        </div>
+        <div style="grid-column: span 6; min-width:0">
+          <p class="muted" style="margin:0 0 6px">Next, in this order</p>
+          <div class="scroll"><table><thead><tr><th>#</th><th>change</th><th>why</th></tr></thead><tbody id="profnext"></tbody></table></div>
+          <p class="muted" style="margin:10px 0 4px">Ruled out by the profile</p>
+          <div class="scroll"><table><tbody id="profout"></tbody></table></div>
+        </div>
+      </div>
     </section>
 
     <section class="panel s12" id="detail" hidden>

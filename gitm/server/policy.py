@@ -66,6 +66,20 @@ DEFAULT_POLICY.update({
     # so the watcher sees fresh traffic without waiting for a full window.
     "traffic_window_s": 300.0,
 })
+# Ranking by where the time goes: see gitm.server.profile.
+DEFAULT_POLICY.update({
+    # Before a session explores, profile stable on the canary whenever the last
+    # profile no longer describes it (promotion, revert, traffic change).
+    "profile": True,
+    # A failed profile is not retried for the same stable configuration sooner.
+    "profile_retry_s": 3600.0,
+    # Kernels are collected for this long, after this much ramp-up, of the
+    # replay. Bounds what a profile writes whatever the traffic: a full window
+    # of long chat answers wrote 4.8 GB of shards on a 0.5B model, and 15 s
+    # wrote 1.1 GB (245k kernels), which took 9 GB to analyse.
+    "profile_window_s": 8.0,
+    "profile_skip_s": 10.0,
+})
 
 
 #: Bounds for the settings an operator tunes most: (type, low, high).
