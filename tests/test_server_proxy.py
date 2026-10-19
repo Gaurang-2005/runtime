@@ -260,3 +260,14 @@ def test_a_closed_window_keeps_every_request_in_arrival_order(tmp_path):
     trace = read_mooncake(path)
     assert len(trace.requests) == 4 and not trace.meta.drops
     assert [r.input_tokens for r in trace.requests] == [5000, 3000, 100, 100]
+
+
+def test_a_deep_workdir_still_gets_a_proxy_socket_it_can_bind(tmp_path):
+    from gitm.server.controller import Controller, ServerConfig
+
+    deep = tmp_path / ("x" * 120)
+    sock = Controller(ServerConfig(model="m", workdir=deep)).admin_socket
+    assert len(str(sock).encode()) <= 100
+    assert sock == Controller(ServerConfig(model="m", workdir=deep)).admin_socket
+    short = Controller(ServerConfig(model="m", workdir=tmp_path)).admin_socket
+    assert short.parent == tmp_path or len(str(tmp_path)) > 80

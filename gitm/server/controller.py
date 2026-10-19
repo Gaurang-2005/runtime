@@ -163,7 +163,17 @@ class Controller:
 
     @property
     def admin_socket(self) -> Path:
-        return self.workdir / "proxy-admin.sock"
+        path = self.workdir / "proxy-admin.sock"
+        # A Unix socket path is capped at 108 bytes; a deep --scratch went past
+        # it and the proxy died at bind ("AF_UNIX path too long"). Too long, it
+        # moves to the temp dir under a name unique to this workdir.
+        if len(str(path).encode()) <= 100:
+            return path
+        import hashlib
+        import tempfile
+
+        key = hashlib.sha256(str(self.workdir.resolve()).encode()).hexdigest()[:16]
+        return Path(tempfile.gettempdir()) / f"gitm-proxy-{key}.sock"
 
     @property
     def record_dir(self) -> Path:
