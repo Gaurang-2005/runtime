@@ -52,6 +52,12 @@ class EngineSpec:
     gpus: str | None = None       # CUDA_VISIBLE_DEVICES for this engine
     mem_fraction: float | None = None
     env: dict[str, str] = field(default_factory=dict)
+    #: Where the collector writes this engine's kernel trace shards, or None
+    #: for an untraced engine. Read once, at CUDA init: set it before start().
+    trace_out: Path | None = None
+    #: Also collect NVTX ranges (needs the engine to push them:
+    #: ``--enable-layerwise-nvtx-tracing``), which name each kernel's layer and op.
+    trace_nvtx: bool = False
 
     def argv(self) -> list[str]:
         cmd = [_vllm_executable(), "serve", self.model, *self.serve_args,
@@ -109,9 +115,11 @@ class EngineProcess:
         if self.spec.model in EngineProcess.loaded_models and "HF_HUB_OFFLINE" not in env:
             env["HF_HUB_OFFLINE"] = "1"
         env.update(self.spec.env)
-        # Untraced: the injection variables are read once, at CUDA init, from
-        # whatever the child inherits, so they are removed rather than left unset.
-        apply_tracing_env(env, None, nvtx=False, no_trace=True)
+        # The injection variables are read once, at CUDA init, from whatever the
+        # child inherits. An untraced engine has them removed rather than left
+        # unset, so one exported in this shell never traces it by accident.
+        apply_tracing_env(env, self.spec.trace_out, nvtx=self.spec.trace_nvtx,
+                          no_trace=self.spec.trace_out is None)
         if self.spec.gpus is not None:
             env["CUDA_VISIBLE_DEVICES"] = self.spec.gpus
         return env
@@ -120,6 +128,11 @@ class EngineProcess:
         if self.alive:
             raise RuntimeError(f"{self.spec.role} engine already running (pid {self.proc.pid})")
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        if self.spec.trace_out is not None:
+            # The collector opens its shard at CUDA init and, if the directory
+            # is missing, turns itself off without a word: the engine serves,
+            # and the trace comes back empty.
+            Path(self.spec.trace_out).parent.mkdir(parents=True, exist_ok=True)
         log = self.log_path.open("ab")
         # One log per slot holds every relaunch; the marker scopes root_cause()
         # to this launch, so an old failure is never reported for a new one.
