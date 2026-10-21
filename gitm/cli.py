@@ -239,12 +239,47 @@ def _parser() -> argparse.ArgumentParser:
     ))
 
 
+    inv = sub.add_parser(
+        "inventory",
+        help="Pinned checkpoint inventory: add, sync, and check for revision/artifact drift.",
+        add_help=False,
+    )
+    inv.add_argument("inventory_args", nargs=argparse.REMAINDER)
+
     add_deviate_arguments(sub.add_parser(
         "deviate",
         help="Subtract a predicted graph from a captured trace.",
         epilog="Streams the trace, so a multi-GB capture is fine.",
     ))
 
+    qrun = sub.add_parser(
+        "qualify-run",
+        help="Capture-integrity verdict for a run (qualified / invalid_run / not_established).",
+        epilog="Distinct from the commercial floor gate in gitm.optimizer.qualification.",
+    )
+    qrun.add_argument(
+        "--artifacts",
+        type=Path,
+        required=True,
+        help="Capture directory, run directory, or a trace.jsonl path.",
+    )
+    qrun.add_argument(
+        "--deployment-spec",
+        type=Path,
+        required=True,
+        help="Declared deployment JSON (model, engine, topology).",
+    )
+    qrun.add_argument(
+        "--signal-contract",
+        type=Path,
+        default=None,
+        help="Signal contract JSON (default: provisional v0).",
+    )
+    qrun.add_argument(
+        "--signal-contract-version",
+        default=None,
+        help="Pass 'v0' to force the built-in provisional contract.",
+    )
     prop = sub.add_parser(
         "propose",
         help="Emit the next batch of experiments from a baseline capture.",
@@ -786,6 +821,13 @@ def main(argv: list[str] | None = None) -> int:
         i = argv.index("--")
         argv, serve_argv = argv[:i], argv[i + 1:]
 
+    # `inventory` owns its own parser. argparse's REMAINDER cannot start with a
+    # flag, so `gitm inventory --file X check` would be rejected as unrecognised.
+    if argv[:1] == ["inventory"]:
+        from gitm.planner.inventory import main as inventory_main
+
+        return inventory_main(argv[1:])
+
     args = _parser().parse_args(argv)
 
     if args.version:
@@ -907,6 +949,19 @@ def main(argv: list[str] | None = None) -> int:
             if val is not None:
                 dev_argv += [flag, str(val)]
         return deviate_main(dev_argv)
+
+    if args.cmd == "qualify-run":
+        from gitm.optimizer.qualify_run import main as qualify_run_main
+
+        q_argv = [
+            "--artifacts", str(args.artifacts),
+            "--deployment-spec", str(args.deployment_spec),
+        ]
+        if args.signal_contract is not None:
+            q_argv += ["--signal-contract", str(args.signal_contract)]
+        if args.signal_contract_version is not None:
+            q_argv += ["--signal-contract-version", args.signal_contract_version]
+        return qualify_run_main(q_argv)
 
     if args.cmd == "plan":
         from gitm.planner.registry import main as plan_main
