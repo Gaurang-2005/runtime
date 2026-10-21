@@ -291,7 +291,7 @@ class ReplaySampler:
         laptop one such sample (stable at 0.54 req/s) turned a no-effect change
         into "+6.6%, CI -14%..+28%". It is thrown away, the sampler waits for
         stable to go quiet, and measures again, up to ``max_retries`` times; the
-        last attempt is kept either way, and isolated_measurement judges it.
+        last attempt is kept either way, and the `undisturbed` promotion check judges it.
         """
         attempts = 0
         while True:
@@ -343,7 +343,7 @@ class ReplaySampler:
         if self.stable_load is not None:
             # Production load on the stable engine while this sample ran. On a
             # shared GPU it competes with the measurement; the promotion rules
-            # read it (isolated_measurement).
+            # read it (the undisturbed check).
             metrics["stable_rps"] = float(self.stable_load(t0, time.time()))
         # Correctness: both arms are scored the same way, on the same tokens —
         # teacher-forced top-1 choices compared arm to arm. Comparing a prefill
@@ -411,8 +411,11 @@ def build_contract(*, intervention_id: str, knobs: dict[str, Any], stable_args: 
                                                    "baseline arm, position by position, on "
                                                    f"{len(PROBES)} fixed probe prompts",
                                          min_score=policy["min_correctness"]),
-        latency_gates=[LatencyGate(metric=g["metric"], max_regression=g["max_regression"])
+        latency_gates=[LatencyGate(metric=g["metric"], max_regression=g["max_regression"],
+                                   target=policy["latency_targets"].get(g["metric"]))
                        for g in policy["latency_gates"]],
+        min_effect=policy["min_effect"],
+        max_failed_requests=0,
         protocol=Protocol(repetitions=policy["repetitions"], warmup_reps=policy["warmup_reps"],
                           comparison_order="ABBA", pairing="paired"),
     )

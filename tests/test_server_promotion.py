@@ -44,52 +44,64 @@ def failed(rules):
     return [r.name for r in rules if not r.passed]
 
 
+def failed_checks(rules):
+    return {c["name"] for r in rules for c in r.checks if not c["passed"]}
+
+
 KNOBS = {"max_num_batched_tokens": 16384}
 
 
-def test_the_first_real_cuda_graph_win_passes_the_noise_rules():
-    """The RTX 4050 control: +11.0%, CI [+5.5%, +16.4%], baseline spread 3.73%."""
-    v = verdict(lo=0.0555, hi=0.1645, base_values=(7.28, 7.18, 7.36, 6.76))
-    v["effect"] = 0.110
-    rules = {r.name: r for r in promotion.check(KNOBS, v, ctx())}
-    assert rules["clears_noise"].passed and rules["interval_meaningful"].passed
-
-
-def test_a_clean_improvement_passes_every_rule():
+def test_a_clean_improvement_answers_all_four_questions():
     rules = promotion.check(KNOBS, verdict(), ctx())
+    assert [r.name for r in rules] == ["verdict", "evidence_current", "canary_ready",
+                                       "allowed_now"]
     assert failed(rules) == [] and promotion.all_pass(rules)
-    assert len(rules) >= 15   # every rule reported, not just the failures
+    # every check is kept as evidence, not just the failures
+    assert sum(len(r.checks) for r in rules) == 12
 
 
-@pytest.mark.parametrize("make, rule", [
-    (lambda: (verdict(state="inconclusive"), ctx()), "verdict_improved"),
-    (lambda: (verdict(lo=0.01), ctx()), "interval_meaningful"),        # low end < min_effect
-    (lambda: (verdict(lo=0.03, hi=0.09, base_values=(10, 12, 8)), ctx()), "clears_noise"),
-    (lambda: (verdict(), ctx(verdict_finished=time.time() - 99999)), "verdict_recent"),
+def test_promotion_takes_the_tests_verdict_as_it_is():
+    """No second judgement of the effect: an improved verdict with a small
+    interval or a noisy baseline is the test's call (its min_effect), not
+    promotion's. The 18 rules re-judged it with thresholds of their own."""
+    small = verdict(lo=0.021, hi=0.04, base_values=(10, 12, 8))
+    assert promotion.all_pass(promotion.check(KNOBS, small, ctx()))
+    rules = promotion.check(KNOBS, verdict(state="inconclusive"), ctx())
+    assert failed(rules) == ["verdict"] and rules[0].detail.startswith("inconclusive")
+
+
+@pytest.mark.parametrize("make, question, check", [
+    (lambda: (verdict(), ctx(verdict_finished=time.time() - 99999)), "evidence_current",
+     "recent"),
     (lambda: (verdict(), ctx(live_regime=regime(input_p50=4000, input_p95=5000))),
-     "traffic_unchanged"),
+     "evidence_current", "same_traffic"),
     (lambda: (verdict(), ctx(canary_placement={"gpus_count": None, "mem_fraction": 0.3})),
-     "same_capacity"),
-    (lambda: (verdict(), ctx(canary_runs_candidate=False)), "canary_ready"),
-    (lambda: (verdict(), ctx(policy=merged({"paused": True}))), "not_paused"),
-    (lambda: (verdict(), ctx(policy=merged({"deny_knobs": ["max_num_*"]}))), "knobs_allowed"),
+     "canary_ready", "same_capacity"),
+    (lambda: (verdict(), ctx(canary_runs_candidate=False)), "canary_ready", "runs_candidate"),
+    (lambda: (verdict(), ctx(policy=merged({"paused": True}))), "allowed_now", "not_paused"),
+    (lambda: (verdict(), ctx(policy=merged({"deny_knobs": ["max_num_*"]}))), "allowed_now",
+     "knob_allowed"),
     (lambda: (verdict(), ctx(policy=merged({"allow_knobs": ["enforce_eager"]}))),
-     "knobs_allowed"),
+     "allowed_now", "knob_allowed"),
     (lambda: (verdict(), ctx(reverted=[{"knobs": promotion.knob_key(KNOBS), "reason": "slow"}])),
-     "not_reverted_before"),
-    (lambda: (verdict(), ctx(last_promotion_t=time.time() - 60)), "promotion_interval"),
-    (lambda: (verdict(), ctx(last_revert_t=time.time() - 60)), "revert_cooldown"),
+     "allowed_now", "not_reverted_before"),
+    (lambda: (verdict(), ctx(last_promotion_t=time.time() - 60)), "allowed_now",
+     "promotion_interval"),
+    (lambda: (verdict(), ctx(last_revert_t=time.time() - 60)), "allowed_now",
+     "revert_cooldown"),
 ])
-def test_each_rule_can_stop_a_promotion(make, rule):
+def test_each_check_can_stop_a_promotion_and_names_itself(make, question, check):
     v, c = make()
-    assert rule in failed(promotion.check(KNOBS, v, c))
+    rules = promotion.check(KNOBS, v, c)
+    assert failed(rules) == [question] and failed_checks(rules) == {check}
+    assert next(r for r in rules if r.name == question).detail.startswith(check)
 
 
 def test_a_freeze_window_stops_promotion_in_its_hours():
     hour = time.gmtime().tm_hour
     rules = promotion.check(KNOBS, verdict(), ctx(policy=merged(
         {"freeze_hours_utc": [[hour, (hour + 1) % 24]]})))
-    assert "not_frozen" in failed(rules)
+    assert failed_checks(rules) == {"not_frozen"}
     assert promotion._in_window(23, [22, 2]) and promotion._in_window(1, [22, 2])
     assert not promotion._in_window(12, [22, 2])
 
@@ -234,13 +246,13 @@ def with_load(v, rps):
 
 def test_a_shared_gpu_measurement_under_production_load_is_not_promoted():
     rules = promotion.check(KNOBS, with_load(verdict(), 1.0), ctx(shared_gpu=True))
-    assert "isolated_measurement" in failed(rules)
+    assert "undisturbed" in failed_checks(rules)
     quiet = promotion.check(KNOBS, with_load(verdict(), 0.0), ctx(shared_gpu=True))
-    assert "isolated_measurement" not in failed(quiet)
+    assert "undisturbed" not in failed_checks(quiet)
     unknown = promotion.check(KNOBS, verdict(), ctx(shared_gpu=True))
-    assert "isolated_measurement" in failed(unknown)
+    assert "undisturbed" in failed_checks(unknown)
     own_gpus = promotion.check(KNOBS, with_load(verdict(), 5.0), ctx(shared_gpu=False))
-    assert "isolated_measurement" not in failed(own_gpus)
+    assert "undisturbed" not in failed_checks(own_gpus)
 
 
 def test_engines_share_a_gpu_unless_both_are_pinned_apart():

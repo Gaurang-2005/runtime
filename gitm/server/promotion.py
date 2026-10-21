@@ -1,23 +1,27 @@
 """When a tested candidate may replace the stable engine, and how that is watched.
 
-Promotion is automatic, so the rules are strict and every one is reported. A
-candidate is promoted only when **all** of them pass; the list, with each rule's
-evidence, is stored with the promotion (or the refusal), so "why did gitm change
-production?" always has an answer.
+Whether a change is *good* is the test's decision, made once, by
+:func:`gitm.experiment.evaluate.evaluate`: the effect clears ``min_effect``,
+the answers match, no request failed, and latency meets the operator's targets
+(``latency_targets``). Promotion does not judge the change again. It asks the
+questions a verdict cannot answer, because they are about *after* the test:
 
-The rules, in four groups:
+1. **verdict** — the test said ``improved``;
+2. **evidence_current** — the verdict still describes production: traffic like
+   the tested window, a recent verdict, a measurement production load did not
+   disturb;
+3. **canary_ready** — the canary runs exactly the candidate, on stable's GPU
+   count and memory budget, so it can carry all of stable's load;
+4. **allowed_now** — the operator's change controls: not paused or frozen, an
+   allowed knob, not reverted before, and not too soon after the last
+   promotion or revert.
 
-* **the evidence** — the verdict is ``improved``; enough paired rounds; the
-  interval clears a bar set by this test's own noise; correctness and every
-  latency gate passed; no replay request failed; the verdict is recent;
-* **the traffic** — the window it was tested on still looks like the traffic
-  arriving now (regime distance), so a result from last night's traffic is not
-  applied to this morning's;
-* **the hardware** — the canary has the same GPUs and memory budget as stable,
-  so it can carry all of stable's load once promoted;
-* **the operator** — not paused, not inside a freeze window, the knobs allowed,
-  not a change that was reverted before, and not too soon after the last
-  promotion or revert.
+Each answer keeps its individual checks as evidence, stored with the promotion
+or the refusal, so "why did gitm change production, or not?" has an answer.
+
+This replaced 18 rules, seven of which re-judged the verdict with thresholds of
+their own: two places deciding one fact, and the relative latency limit among
+them refused a change that met every latency objective.
 
 After a swap, :class:`Probation` watches live traffic. The old engine stays
 loaded until probation passes, so a revert is a routing change, not a rebuild.
@@ -37,13 +41,6 @@ from gitm.safety.autorevert import AutoRevert
 PROMOTION_DEFAULTS: dict[str, Any] = {
     # Even in autonomous mode, make every win wait for a person.
     "require_approval": False,
-    "promote_min_rounds": 3,
-    # The effect must clear max(min_effect, noise_factor x the baseline arm's own
-    # relative spread) -- the spread is this test's noise floor: the same
-    # configuration measured repeatedly on the same canary -- and the interval's
-    # low end must clear min_effect.
-    "min_effect": 0.02,
-    "noise_factor": 2.0,
     "max_verdict_age_s": 7200.0,
     # log2 units on each regime axis (1.0 = traffic changed 2x on some axis).
     "max_regime_distance": 1.0,
@@ -75,6 +72,8 @@ class Rule:
     name: str
     passed: bool
     detail: str
+    #: The individual checks behind it: [{"name", "passed", "detail"}].
+    checks: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -100,124 +99,90 @@ def knob_key(knobs: dict[str, Any]) -> str:
     return ",".join(f"{k}={knobs[k]}" for k in sorted(knobs))
 
 
-def noise_bar(verdict: dict[str, Any], policy: dict[str, Any]) -> tuple[float, float | None]:
-    """(bar, relative spread of the baseline arm's primary metric)."""
-    metric = None
-    raws = [r for r in verdict.get("raw", []) if not r.get("warmup")]
-    base = [r["metrics"] for r in raws if r["arm"] == "baseline"]
-    if base:
-        # The primary metric is the one every sample carries that the contract
-        # named; the verdict does not repeat it, so it is passed in the policy.
-        metric = policy["primary_metric"]["name"]
-    values = [m[metric] for m in base if metric in m] if metric else []
-    spread = None
-    if len(values) >= 2 and statistics.fmean(values) > 0:
-        spread = statistics.stdev(values) / statistics.fmean(values)
-    bar = max(policy["min_effect"], policy["noise_factor"] * (spread or 0.0))
-    return bar, spread
+def _rule(name: str, checks: list[tuple[str, bool, str]]) -> Rule:
+    """One question, answered by its checks; the failing ones lead the detail."""
+    bad = [d if len(checks) == 1 else f"{n}: {d}" for n, ok, d in checks if not ok]
+    detail = "; ".join(bad) if bad else "; ".join(d for _, _, d in checks)
+    return Rule(name, not bad, detail,
+                [{"name": n, "passed": bool(ok), "detail": d} for n, ok, d in checks])
 
 
 def check(knobs: dict[str, Any], verdict: dict[str, Any], ctx: PromotionContext) -> list[Rule]:
-    """Every promotion rule, evaluated. Promote only if all pass."""
+    """The four promotion questions, each with its evidence. Promote only if all pass."""
     p = ctx.policy
-    rules: list[Rule] = []
 
-    def rule(name: str, ok: bool, detail: str) -> None:
-        rules.append(Rule(name, bool(ok), detail))
-
-    # --- evidence
+    # 1. The test's own decision, not re-judged here.
     state = verdict.get("state")
-    rule("verdict_improved", state == "improved", f"verdict is {state!r}")
-    n = verdict.get("n_candidate", 0)
-    rule("enough_rounds", n >= p["promote_min_rounds"],
-         f"{n} candidate samples, need {p['promote_min_rounds']}")
-    interval = verdict.get("interval")
-    effect = verdict.get("effect")
-    bar, spread = noise_bar(verdict, p)
-    lo = interval[0] if interval else None
-    # Noise is counted once in each check. The effect (the mean) against this
-    # test's own noise is the batch loop's keep rule (mean delta vs 2x floor);
-    # the interval already subtracts t x SE, so its low end is held only to
-    # min_effect. Holding the low end to 2x spread counted the noise twice: a
-    # clean +11% with CI [+5.5%, +16.4%] could never pass it.
-    rule("clears_noise", effect is not None and effect >= bar,
-         f"effect {'n/a' if effect is None else f'{effect:+.2%}'} vs bar {bar:.2%} "
-         f"(min_effect {p['min_effect']:.0%}, baseline spread "
-         f"{'n/a' if spread is None else f'{spread:.2%}'} x {p['noise_factor']:g})")
-    rule("interval_meaningful", lo is not None and lo >= p["min_effect"],
-         f"interval low {'n/a' if lo is None else f'{lo:+.2%}'} vs min_effect "
-         f"{p['min_effect']:.0%}")
-    corr = verdict.get("correctness") or {}
-    rule("correctness", corr.get("status") == "pass", corr.get("detail", "not run"))
-    lat = verdict.get("latency") or []
-    bad = [g["name"] for g in lat if g.get("status") != "pass"]
-    rule("latency_gates", not bad and bool(lat),
-         "all passed" if lat and not bad else f"not passed: {bad or 'none run'}")
-    failed = [r["order_index"] for r in verdict.get("raw", [])
-              if (r.get("metrics") or {}).get("failed", 0) > 0]
-    rule("no_failed_requests", not failed,
-         "every replay request completed" if not failed else f"failures in samples {failed}")
+    effect, interval = verdict.get("effect"), verdict.get("interval")
+    shown = ("" if effect is None or not interval else
+             f" (effect {effect:+.1%}, interval {interval[0]:+.1%}..{interval[1]:+.1%})")
+    rules = [_rule("verdict", [("improved", state == "improved",
+                                f"{state}: {verdict.get('reason', '')}{shown}")])]
+
+    # 2. Is the verdict still about production as it is now?
     age = None if ctx.verdict_finished is None else ctx.now - ctx.verdict_finished
-    rule("verdict_recent", age is not None and age <= p["max_verdict_age_s"],
-         f"verdict age {'unknown' if age is None else f'{age:.0f}s'}, "
-         f"limit {p['max_verdict_age_s']:.0f}s")
-
-    loads = [(r["metrics"] or {}).get("stable_rps") for r in verdict.get("raw", [])]
-    loads = [x for x in loads if x is not None]
-    if not ctx.shared_gpu:
-        rule("isolated_measurement", True, "canary has its own GPUs")
-    elif not loads or any(math.isnan(x) for x in loads):
-        rule("isolated_measurement", False,
-             "canary shares stable's GPU and stable's load during the test is unknown")
-    else:
-        worst = max(loads)
-        rule("isolated_measurement", worst <= p["max_shared_gpu_stable_rps"],
-             f"canary shares stable's GPU; stable served up to {worst:.2f} req/s during a "
-             f"sample, limit {p['max_shared_gpu_stable_rps']:g}")
-
-    # --- traffic
+    current = [("recent", age is not None and age <= p["max_verdict_age_s"],
+                f"verdict age {'unknown' if age is None else f'{age:.0f}s'}, "
+                f"limit {p['max_verdict_age_s']:.0f}s")]
     if ctx.live_regime is None:
-        rule("traffic_unchanged", True, "no newer traffic recorded since the test")
+        current.append(("same_traffic", True, "no newer traffic recorded since the test"))
     else:
         from gitm.playbook.match import regime_distance
 
         d = regime_distance(ctx.tested_regime, ctx.live_regime)
-        rule("traffic_unchanged", d.linf <= p["max_regime_distance"],
-             f"tested vs live regime: {d.render()}, limit {p['max_regime_distance']:g}")
+        current.append(("same_traffic", d.linf <= p["max_regime_distance"],
+                        f"tested vs live traffic: {d.render()}, limit "
+                        f"{p['max_regime_distance']:g}"))
+    loads = [(r.get("metrics") or {}).get("stable_rps") for r in verdict.get("raw", [])]
+    loads = [x for x in loads if x is not None]
+    if not ctx.shared_gpu:
+        current.append(("undisturbed", True, "canary has its own GPUs"))
+    elif not loads or any(math.isnan(x) for x in loads):
+        current.append(("undisturbed", False, "canary shares stable's GPU and stable's load "
+                                              "during the test is unknown"))
+    else:
+        worst = max(loads)
+        current.append(("undisturbed", worst <= p["max_shared_gpu_stable_rps"],
+                        f"canary shares stable's GPU; stable served up to {worst:.2f} req/s "
+                        f"during a sample, limit {p['max_shared_gpu_stable_rps']:g}"))
+    rules.append(_rule("evidence_current", current))
 
-    # --- hardware
+    # 3. Can the canary take over as it stands?
     same = (ctx.stable_placement.get("gpus_count") == ctx.canary_placement.get("gpus_count")
-            and ctx.stable_placement.get("mem_fraction") == ctx.canary_placement.get("mem_fraction"))
-    rule("same_capacity", same,
-         f"stable {ctx.stable_placement}, canary {ctx.canary_placement}")
-    rule("canary_ready", ctx.canary_alive and ctx.canary_runs_candidate,
-         "canary is up and running the candidate" if ctx.canary_alive and ctx.canary_runs_candidate
-         else f"canary alive={ctx.canary_alive}, runs candidate={ctx.canary_runs_candidate}")
+            and ctx.stable_placement.get("mem_fraction")
+            == ctx.canary_placement.get("mem_fraction"))
+    rules.append(_rule("canary_ready", [
+        ("runs_candidate", ctx.canary_alive and ctx.canary_runs_candidate,
+         "canary is up and running the candidate" if ctx.canary_alive
+         and ctx.canary_runs_candidate
+         else f"canary alive={ctx.canary_alive}, runs candidate={ctx.canary_runs_candidate}"),
+        ("same_capacity", same, f"stable {ctx.stable_placement}, canary {ctx.canary_placement}"),
+    ]))
 
-    # --- operator
-    rule("not_paused", not p["paused"], "paused by operator" if p["paused"] else "running")
+    # 4. The operator's change controls.
     hour = time.gmtime(ctx.now).tm_hour
     frozen = [w for w in p["freeze_hours_utc"] if _in_window(hour, w)]
-    rule("not_frozen", not frozen,
-         f"inside freeze window {frozen[0]} (UTC hour {hour})" if frozen else f"UTC hour {hour}")
     denied = [k for k in knobs if any(fnmatch.fnmatch(k, g) for g in p["deny_knobs"])]
     unlisted = ([k for k in knobs if not any(fnmatch.fnmatch(k, g) for g in p["allow_knobs"])]
                 if p["allow_knobs"] else [])
-    rule("knobs_allowed", not denied and not unlisted,
-         "allowed" if not (denied or unlisted) else f"denied {denied}, not allowed {unlisted}")
-    key = knob_key(knobs)
-    before = [r for r in ctx.reverted if r.get("knobs") == key]
-    rule("not_reverted_before", not before,
-         "never reverted" if not before else f"reverted {len(before)}x before: "
-         f"{before[-1].get('reason', '')}")
+    before = [r for r in ctx.reverted if r.get("knobs") == knob_key(knobs)]
     since_promo = None if ctx.last_promotion_t is None else ctx.now - ctx.last_promotion_t
-    rule("promotion_interval", since_promo is None or since_promo >= p["min_interval_s"],
-         "no earlier promotion" if since_promo is None
-         else f"{since_promo:.0f}s since the last promotion, need {p['min_interval_s']:.0f}s")
     since_revert = None if ctx.last_revert_t is None else ctx.now - ctx.last_revert_t
-    rule("revert_cooldown", since_revert is None or since_revert >= p["revert_cooldown_s"],
-         "no earlier revert" if since_revert is None
-         else f"{since_revert:.0f}s since the last revert, need {p['revert_cooldown_s']:.0f}s")
+    rules.append(_rule("allowed_now", [
+        ("not_paused", not p["paused"], "paused by operator" if p["paused"] else "running"),
+        ("not_frozen", not frozen, f"inside freeze window {frozen[0]} (UTC hour {hour})"
+         if frozen else f"UTC hour {hour}, no freeze"),
+        ("knob_allowed", not denied and not unlisted, "knobs allowed" if not (denied or unlisted)
+         else f"denied {denied}, not allowed {unlisted}"),
+        ("not_reverted_before", not before, "never reverted" if not before else
+         f"reverted {len(before)}x before: {before[-1].get('reason', '')}"),
+        ("promotion_interval", since_promo is None or since_promo >= p["min_interval_s"],
+         "no earlier promotion" if since_promo is None else
+         f"{since_promo:.0f}s since the last promotion, need {p['min_interval_s']:.0f}s"),
+        ("revert_cooldown", since_revert is None or since_revert >= p["revert_cooldown_s"],
+         "no earlier revert" if since_revert is None else
+         f"{since_revert:.0f}s since the last revert, need {p['revert_cooldown_s']:.0f}s"),
+    ]))
     return rules
 
 

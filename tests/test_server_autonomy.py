@@ -281,12 +281,14 @@ def test_test_settings_outside_their_range_are_refused(change):
         merged(change)
 
 
-def test_two_samples_are_allowed_but_say_they_cannot_promote():
+def test_two_samples_are_allowed_but_say_the_interval_is_wide():
     from gitm.server.policy import merged, warnings_for
 
     assert merged({"repetitions": 2})["repetitions"] == 2
-    assert "never promote" in warnings_for(merged({"repetitions": 2}))[0]
+    assert "very wide interval" in warnings_for(merged({"repetitions": 2}))[0]
     assert warnings_for(merged({"repetitions": 4})) == []
+    odd = warnings_for(merged({"latency_targets": {"p50_ttft_ms": 100.0}}))
+    assert any("no latency gate" in w for w in odd)
 
 
 def changed_watch(ctl):

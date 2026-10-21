@@ -602,7 +602,7 @@ class Controller:
         """The old engine's per-request decode speed, for probation to compare with.
 
         Live traffic on the old engine is the right reference, but the A/B is
-        run while stable is quiet (isolated_measurement), so the minutes just
+        run while stable is quiet (the undisturbed check), so the minutes just
         before a swap often have none: the first full promotion on the laptop
         started probation with no speed baseline at all and guarded on errors
         only. So: the last 5 minutes if they hold enough requests, else the last
@@ -885,7 +885,7 @@ class Controller:
                        effect=(iv.verdict or {}).get("effect"))
             if iv.verdict is not None and iv.status != "improved":
                 # Not a promotion candidate, but the rules still say what a win
-                # would have run into (e.g. isolated_measurement), so "why not?"
+                # would have run into (e.g. the undisturbed check), so "why not?"
                 # has an answer on every outcome.
                 from gitm.server.promotion import as_dicts
 

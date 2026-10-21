@@ -71,31 +71,28 @@ Submit a change with `POST /interventions {"knobs": {"max_num_batched_tokens": 1
    - each sample starts from an empty prefix cache and is one `vllm bench serve` replay of the window.
 3. **Correctness:** fixed probe sequences (four prompts plus the baseline arm's greedy continuation) are run teacher-forced on each arm. Their top-1 tokens are compared position by position, and must agree on at least `min_correctness` of positions (0.95).
 4. **Stable measurements only.** With `settle_s` > 0, the sampler waits that long before each sample. If either arm's own samples of the primary metric spread more than `max_arm_spread` (15%), an improved or regressed verdict becomes **unstable**: the machine moved, so neither verdict can be trusted, and nothing is promoted.
-5. **The verdict** comes from `gitm.experiment.evaluate`: improved, regressed, inconclusive, invalid or failed_to_execute. It applies latency gates on p99 TTFT and p99 inter-token latency (ITL), and uses a paired t-interval on the primary metric.
+5. **The verdict** comes from `gitm.experiment.evaluate`: improved, regressed, inconclusive, invalid or failed_to_execute. It is the only judgement of whether the change is good:
+   - **latency targets:** p99 TTFT and p99 inter-token latency (ITL) must meet `latency_targets` (default 1000 ms and 50 ms, gitm's serving SLOs), or be no worse than stable's. A gate without a target falls back to `max_regression` relative to stable;
+   - **worth a change:** the paired t-interval of the primary metric must lie at or above `min_effect` (2%). A real effect below it is inconclusive, and the reason says so;
+   - **no failed requests:** a candidate sample with any is regressed. A baseline sample with any, or with no count, makes the test invalid.
 6. **Primary metric:** `mean_tpot_ms` (time per output token). A replay offers the load the trace recorded, so below saturation every configuration serves the same tokens per second; only latency tells them apart.
 
 The stable engine is never measured by a replay, so production is never disturbed.
 
-## Promotion rules
+## Promotion
 
-After an `improved` verdict, the controller evaluates every rule. If all pass, autonomous mode promotes; manual and assisted wait for `POST /interventions/{id}/promote` (as does autonomous with `require_approval`). Each rule's result and evidence is stored with the intervention (`GET /interventions/{id}/rules`). Approval re-checks every rule; it skips none. While a win waits, gitm may test something else, which relaunches the canary with other flags, so approving first puts the approved flags back on the canary (a relaunch), then checks the rules and promotes. If a test holds the canary at that moment, the win is marked **approved** and promoted as soon as that test finishes. `POST /interventions/{id}/decline` turns a waiting win down; production is untouched.
+Promotion does not judge the change again; the verdict did that. It answers the four questions a verdict cannot, because they are about after the test (`gitm/server/promotion.py`):
 
-| Group | Rule | Passes when |
-|---|---|---|
-| evidence | `verdict_improved` | the verdict is `improved` |
-| | `enough_rounds` | at least `promote_min_rounds` candidate samples |
-| | `clears_noise` | the interval's lower bound is above max(`min_effect`, `noise_factor` × the baseline arm's own relative spread) |
-| | `correctness`, `latency_gates` | both passed in the verdict |
-| | `no_failed_requests` | every replay request completed |
-| | `verdict_recent` | the verdict is younger than `max_verdict_age_s` |
-| | `isolated_measurement` | the canary has its own GPUs, or stable served ≤ `max_shared_gpu_stable_rps` during every sample |
-| traffic | `traffic_unchanged` | the tested window's regime is within `max_regime_distance` (log2 units) of the newest window's |
-| hardware | `same_capacity` | the canary has stable's GPU count and memory fraction |
-| | `canary_ready` | the canary is up and running the candidate |
-| operator | `not_paused`, `not_frozen` | not paused; not inside a `freeze_hours_utc` window |
-| | `knobs_allowed` | passes the `allow_knobs` and `deny_knobs` globs |
-| | `not_reverted_before` | this exact change was never reverted |
-| | `promotion_interval`, `revert_cooldown` | enough time has passed since the last promotion and since the last revert |
+| Question | Passes when |
+|---|---|
+| `verdict` | the test said `improved` |
+| `evidence_current` | **recent:** the verdict is younger than `max_verdict_age_s` · **same_traffic:** the tested window's regime is within `max_regime_distance` (log2 units) of the newest window's · **undisturbed:** the canary has its own GPUs, or stable served ≤ `max_shared_gpu_stable_rps` during every sample |
+| `canary_ready` | **runs_candidate:** the canary is up and running exactly the candidate · **same_capacity:** it has stable's GPU count and memory fraction |
+| `allowed_now` | the operator's change controls: **not_paused**, **not_frozen** (`freeze_hours_utc`), **knob_allowed** (`allow_knobs`, `deny_knobs`), **not_reverted_before**, **promotion_interval** (`min_interval_s`), **revert_cooldown** (`revert_cooldown_s`) |
+
+If all four pass, autonomous mode promotes; manual and assisted wait for `POST /interventions/{id}/promote` (as does autonomous with `require_approval`). Each answer is stored with its individual checks as evidence (`GET /interventions/{id}/rules`). Approval re-checks all four. While a win waits, gitm may test something else, which relaunches the canary with other flags, so approving first puts the approved flags back on the canary (a relaunch), then checks and promotes. If a test holds the canary at that moment, the win is marked **approved** and promoted as soon as that test finishes. `POST /interventions/{id}/decline` turns a waiting win down; production is untouched.
+
+**Why four, not the eighteen rules this replaced.** Seven of them re-judged the verdict with thresholds of their own (rounds, a 2× noise bar, the interval, correctness, latency, failures): two places deciding one fact. Their relative latency limit refused CUDA graphs on the laptop, 18% faster, for taking p99 ITL from 17 to 23 ms: +35%, yet far inside any latency objective. With the decision in the test and the targets above, the same samples re-judge as improved; every other test that night kept its verdict.
 
 ## Swap, probation, revert
 
@@ -141,7 +138,7 @@ Three settings trade speed against certainty. Each is checked against its range 
 
 | Setting | Range | Effect |
 |---|---|---|
-| `repetitions` | 2–20 (default 4) | Samples per arm. More detect smaller effects; fewer are faster. Below `promote_min_rounds` (3), a test can reject a change but never promote one; `GET /policy/warnings` says so. |
+| `repetitions` | 2–20 (default 4) | Samples per arm. More detect smaller effects; fewer are faster. With 2, the interval is so wide that only a large change can be shown to help; `GET /policy/warnings` says so. |
 | `settle_s` | 0–600 (default 0) | Wait before each sample. About 30–45 on a laptop that throttles. |
 | `replay_speed` | 0.1–64 (default 1) | Replay recorded traffic faster: quicker tests, at a higher load than was recorded. |
 
@@ -224,7 +221,7 @@ All routes need `Authorization: Bearer <scratch>/api-token`.
 
 ## Known limits
 
-- **One shared GPU.** With stable and canary on the same GPU, stable's production load competes with the canary's measurement. On an RTX 4050, about 1 request per second of live traffic turned CUDA graphs' +21% into +2% (interval −16% to +21%). `isolated_measurement` refuses such results, so on a shared GPU, tests are only promotable while production is quiet. Give the canary its own GPUs (`--stable-gpus 0,1,2,3 --canary-gpus 4,5,6,7`) to remove the limit.
+- **One shared GPU.** With stable and canary on the same GPU, stable's production load competes with the canary's measurement. On an RTX 4050, about 1 request per second of live traffic turned CUDA graphs' +21% into +2% (interval −16% to +21%). The `undisturbed` check refuses such results, so on a shared GPU, tests are only promotable while production is quiet. Give the canary its own GPUs (`--stable-gpus 0,1,2,3 --canary-gpus 4,5,6,7`) to remove the limit.
 - **Laptop CPUs throttle.** On the RTX 4050 laptop, a replay started straight after another ran 2× slower: the CPU reached 96°C and firmware held it near 450 MHz while the GPU clock never moved. Set `settle_s: 45` on a laptop; the unstable check catches what remains.
 - **Replays carry shape, not text.** Lengths, timing and prefix sharing are reproduced; content is not. Speculative decoding depends on content, so it can't be judged on a replay.
 - **Every structural change is a canary relaunch.** That's seconds on a small model and minutes on Kimi.

@@ -385,3 +385,67 @@ def test_cli_malformed_yaml_does_not_stop_the_batch(capsys, tmp_path):
 def test_registered_contracts_validate(path):
     c = load_contract(path)
     assert c.sha256()
+
+
+# --- latency targets, the worthwhile minimum, failed requests ------------------
+
+
+def test_a_latency_target_judges_against_what_users_need_not_the_baseline():
+    """+20% TTFT fails a 5% relative limit; at 960 ms it meets a 1 s target."""
+    gates = [{"metric": "ttft_ms_p95", "max_regression": 0.05, "target": 1000.0},
+             {"metric": "itl_ms_p95", "max_regression": 0.05}]
+    from gitm.experiment.contract import ExperimentContract
+
+    v, _ = _run(ExperimentContract(**_edit(latency_gates=gates)), effect=0.10, ttft_change=0.20)
+    assert v.state == "improved" and v.latency[0].status == "pass"
+    assert "meets the target" in v.latency[0].detail
+    tight = [{**gates[0], "target": 900.0}, gates[1]]
+    v, _ = _run(ExperimentContract(**_edit(latency_gates=tight)), effect=0.10, ttft_change=0.20)
+    assert v.state == "regressed" and "worse than the baseline" in v.latency[0].detail
+
+
+def test_a_change_need_not_fix_a_miss_it_did_not_cause():
+    from gitm.experiment.contract import ExperimentContract
+
+    gates = [{"metric": "ttft_ms_p95", "max_regression": 0.05, "target": 500.0}]
+    v, _ = _run(ExperimentContract(**_edit(latency_gates=gates)), effect=0.10, ttft_change=-0.05)
+    assert v.state == "improved" and "no worse" in v.latency[0].detail
+
+
+def test_a_real_effect_below_the_worthwhile_minimum_is_inconclusive():
+    from gitm.experiment.contract import ExperimentContract
+
+    v, _ = _run(ExperimentContract(**_edit(min_effect=0.03)), effect=0.01, noise=0.001)
+    assert v.state == "inconclusive" and v.interval[0] > 0
+    assert "not worth a change" in v.reason
+
+
+class FailingServer(FakeServer):
+    def __init__(self, config, *, failed=None, **kw):
+        super().__init__(config, **kw)
+        self.failed = failed or {}
+
+    def sample(self, arm, index):
+        s = super().sample(arm, index)
+        if arm in self.failed:
+            s.metrics["failed"] = self.failed[arm]
+        return s
+
+
+def _run_failing(**failed):
+    from gitm.experiment.contract import ExperimentContract
+
+    contract = ExperimentContract(**_edit(max_failed_requests=0))
+    config = dict(contract.baseline.engine_args)
+    return evaluate(contract, DictApplicator(config), FailingServer(config, failed=failed))
+
+
+def test_requests_the_candidate_fails_make_it_regressed():
+    assert _run_failing(baseline=0, candidate=0).state == "improved"
+    v = _run_failing(baseline=0, candidate=2)
+    assert v.state == "regressed" and "candidate samples" in v.reason
+
+
+def test_failures_on_the_baseline_or_no_count_mean_the_measurement_broke():
+    assert _run_failing(baseline=3, candidate=0).state == "invalid"
+    assert _run_failing().state == "invalid"          # nothing reported: not zero

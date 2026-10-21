@@ -164,9 +164,13 @@ function renderDetail(iv) {
     el("td", { class: "num" }, fmt.n(p.mean_tpot_ms, 2)), el("td", { class: "num" }, fmt.n(p.output_throughput)),
     el("td", { class: "num" }, fmt.n(p.p99_ttft_ms)), el("td", { class: "num" }, fmt.n(p.p99_itl_ms)),
     el("td", { class: "num" }, fmt.n(p.correctness, 3)), el("td", { class: "num" }, fmt.n(p.stable_rps, 2)))));
+  // One row per promotion question; its checks, failing ones first, as the evidence.
   fill($("drules"), (iv.rules || []).map((r) => el("tr", {},
     el("td", { class: "mono" }, r.name), el("td", {}, pillFor(r.passed ? "pass" : "fail")),
-    el("td", { class: "muted" }, r.detail))));
+    el("td", { class: "muted" }, ...((r.checks || []).length > 1
+      ? [...r.checks].sort((a, b) => a.passed - b.passed).map((c) => el("div", {},
+        el("span", { class: c.passed ? "" : "err" }, `${c.passed ? "✓" : "✗"} ${c.name}`), ` ${c.detail}`))
+      : [r.detail])))));
   $("dpromote").disabled = iv.status !== "awaiting_approval";
   $("ddecline").disabled = !["awaiting_approval", "approved"].includes(iv.status);
   $("dstop").disabled = !["queued", "running"].includes(iv.status);

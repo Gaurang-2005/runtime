@@ -11,6 +11,7 @@ from typing import Any
 
 from gitm.server.explore import EXPLORE_DEFAULTS
 from gitm.server.promotion import PROMOTION_DEFAULTS
+from gitm.tracer.vllm_stats import DEFAULT_TPOT_SLO_S, DEFAULT_TTFT_SLO_S
 
 DEFAULT_POLICY: dict[str, Any] = {
     # --- the test --------------------------------------------------------------
@@ -23,6 +24,16 @@ DEFAULT_POLICY: dict[str, Any] = {
         {"metric": "p99_ttft_ms", "max_regression": 0.10},
         {"metric": "p99_itl_ms", "max_regression": 0.10},
     ],
+    # What users must get, per latency gate, in the metric's unit. A gate with a
+    # target passes when the candidate meets it (or is no worse than now); its
+    # max_regression is only used for a gate without one. The defaults are
+    # gitm's serving SLOs (gitm.tracer.vllm_stats): 1 s to the first token, and
+    # 50 ms per output token taken as the p99 gap between tokens.
+    "latency_targets": {"p99_ttft_ms": DEFAULT_TTFT_SLO_S * 1000.0,
+                        "p99_itl_ms": DEFAULT_TPOT_SLO_S * 1000.0},
+    # The smallest gain worth changing production for: an improved verdict needs
+    # the effect's interval to lie at or above it.
+    "min_effect": 0.02,
     # Kept samples per arm, ABBA order, paired. 4, not 3: the first GPU run's
     # eager baseline wandered 6.9-9.2 ms/token across 3 samples, and a paired
     # t-interval on 3 pairs (t=4.3) could not separate a real +21% from that.
@@ -117,7 +128,11 @@ def merged(overrides: dict[str, Any] | None) -> dict[str, Any]:
 def warnings_for(policy: dict[str, Any]) -> list[str]:
     """Settings that are allowed but have a consequence worth saying out loud."""
     out = []
-    if policy["repetitions"] < policy["promote_min_rounds"]:
-        out.append(f"{policy['repetitions']} samples per arm can reject a change but never "
-                   f"promote one: promotion needs {policy['promote_min_rounds']}")
+    if policy["repetitions"] < 3:
+        out.append(f"{policy['repetitions']} samples per arm give a very wide interval: "
+                   "only a large change can be shown to help")
+    unknown = sorted(set(policy["latency_targets"]) - {g["metric"] for g in
+                                                       policy["latency_gates"]})
+    if unknown:
+        out.append(f"latency_targets for {unknown} have no latency gate, so nothing checks them")
     return out

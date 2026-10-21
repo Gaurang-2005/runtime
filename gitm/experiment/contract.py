@@ -107,8 +107,16 @@ class LatencyGate(_Model):
     metric: str
     direction: Direction = "lower_is_better"
     #: Largest tolerated worsening of this metric's mean, as a fraction of the
-    #: baseline mean (0.05 = up to 5% worse is acceptable).
+    #: baseline mean (0.05 = up to 5% worse is acceptable). Used when no
+    #: ``target`` is set.
     max_regression: float = Field(ge=0.0)
+    #: An absolute target for this metric (a latency objective, in the metric's
+    #: unit). When set it replaces ``max_regression``: the gate passes if the
+    #: candidate's mean meets the target, or is no worse than the baseline's (a
+    #: change must not deepen a miss, but need not fix one). A relative limit
+    #: alone refused CUDA graphs for taking p99 inter-token latency from 17 to
+    #: 23 ms, +35% yet far inside any objective, while it ran 18% faster.
+    target: float | None = Field(default=None, gt=0.0)
 
 
 class Protocol(_Model):
@@ -147,6 +155,14 @@ class ExperimentContract(_Model):
     correctness_gate: CorrectnessGate
     latency_gates: list[LatencyGate] = Field(default_factory=list)
     protocol: Protocol
+    #: The smallest effect worth acting on. ``improved`` needs the interval's low
+    #: end at or above it; a real effect below it is ``inconclusive``, with the
+    #: reason saying so. 0 keeps the plain "interval above 0" rule.
+    min_effect: float = Field(default=0.0, ge=0.0)
+    #: Requests a sample may fail, read from its ``failed`` metric. A candidate
+    #: sample over it is ``regressed``; a baseline sample over it makes the
+    #: measurement ``invalid``. ``None`` does not check.
+    max_failed_requests: int | None = Field(default=None, ge=0)
     #: The noise-floor entry this experiment's detectability is read from. With
     #: none, detectability is ``not_established``; no entry from another
     #: operating point may stand in.

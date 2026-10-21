@@ -87,13 +87,18 @@ class FakeCanary:
 class FakeSampler:
     """Candidate decodes 10% faster per token, latency unchanged, same answers."""
 
-    def __init__(self, canary, candidate_tpot=9.0, correct=1.0):
+    def __init__(self, canary, candidate_tpot=9.0, correct=1.0, candidate_itl=20.0,
+                 candidate_failed=0):
         self.canary, self.candidate_tpot, self.correct = canary, candidate_tpot, correct
+        self.candidate_itl, self.candidate_failed = candidate_itl, candidate_failed
 
     def sample(self, arm, index):
         cand = arm == "candidate"
         tpot = (self.candidate_tpot if cand else 10.0) + 0.01 * index
-        return Sample(metrics={"mean_tpot_ms": tpot, "p99_ttft_ms": 50.0, "p99_itl_ms": 20.0},
+        # vllm bench serve reports a failed-request count with every result.
+        return Sample(metrics={"mean_tpot_ms": tpot, "p99_ttft_ms": 50.0,
+                               "p99_itl_ms": self.candidate_itl if cand else 20.0,
+                               "failed": float(self.candidate_failed if cand else 0)},
                       wall_s=1.0, accelerator_s=1.0, correctness=self.correct if cand else 1.0)
 
 
@@ -102,6 +107,32 @@ def _contract(tmp_path, **policy):
     return build_contract(intervention_id="iv1", knobs={"max_num_batched_tokens": 16384},
                           stable_args=["--max-num-batched-tokens", "8192"], trace=trace,
                           regime=regime, policy=merged(policy), submitter="test")
+
+
+def test_a_faster_change_within_the_latency_targets_is_improved(tmp_path):
+    """Last night's CUDA graphs result: 18% faster, p99 ITL 17 -> 23 ms (+35%).
+    The old relative limit (10%) refused it; the 50 ms target takes it."""
+    canary = FakeCanary()
+    v = evaluate(_contract(tmp_path), canary, FakeSampler(canary, candidate_tpot=8.2,
+                                                          candidate_itl=27.0))
+    itl = next(g for g in v.latency if g.name == "p99_itl_ms")
+    assert v.state == "improved" and itl.status == "pass" and "meets the target" in itl.detail
+    canary = FakeCanary()
+    v = evaluate(_contract(tmp_path), canary, FakeSampler(canary, candidate_itl=60.0))
+    assert v.state == "regressed" and "p99_itl_ms" in v.reason
+
+
+def test_a_candidate_that_fails_requests_is_regressed(tmp_path):
+    canary = FakeCanary()
+    v = evaluate(_contract(tmp_path), canary, FakeSampler(canary, candidate_failed=1))
+    assert v.state == "regressed" and "failed" in v.reason
+    assert canary.args == ["--max-num-batched-tokens", "8192"]    # back on stable's flags
+
+
+def test_a_gain_below_the_worthwhile_minimum_is_not_improved(tmp_path):
+    canary = FakeCanary()
+    v = evaluate(_contract(tmp_path), canary, FakeSampler(canary, candidate_tpot=9.9))
+    assert v.state == "inconclusive" and "not worth a change" in v.reason
 
 
 def test_a_faster_candidate_is_improved_and_left_on_the_canary(tmp_path):

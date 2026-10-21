@@ -28,9 +28,14 @@ The terminal state is decided by fixed rules, applied in this order:
    same model, so its speed is not comparable. It may be a worse change or a
    broken engine (e.g. vLLM 0.29.0's fp8 prefill head drop at TP8), and the
    data cannot tell which; the effect and interval are still reported.
-6. any latency gate failed → ``regressed``
-7. the interval lies entirely above 0 → ``improved``; entirely below 0 → ``regressed``
-8. otherwise → ``inconclusive``
+6. with ``max_failed_requests`` set: a baseline sample failed more → ``invalid``
+   (the measurement is broken); a candidate sample did → ``regressed``
+7. any latency gate failed → ``regressed``. A gate with a ``target`` passes when
+   the candidate meets it or is no worse than the baseline; one without passes
+   within ``max_regression`` of the baseline
+8. the interval lies entirely below 0 → ``regressed``; its low end is at or above
+   ``min_effect`` (above 0 when that is 0) → ``improved``
+9. otherwise → ``inconclusive``, including a real effect smaller than ``min_effect``
 
 Wall clock and cost cover the whole run: sampler time plus the snapshot, apply
 and restore calls between arms, which on a served engine are model reloads.
@@ -319,11 +324,19 @@ def _decide(
             latency.append(GateResult(name=g.metric, status="not_run", detail="metric not reported"))
             continue
         mb, mc = sum(b) / len(b), sum(c) / len(c)  # type: ignore[arg-type]
-        worse = (mc / mb - 1.0) if g.direction == "lower_is_better" else (1.0 - mc / mb)
-        latency.append(GateResult(
-            name=g.metric, status="pass" if worse <= g.max_regression else "fail",
-            detail=f"worsened {worse:+.2%}, limit {g.max_regression:.2%}",
-        ))
+        lower = g.direction == "lower_is_better"
+        worse = (mc / mb - 1.0) if lower else (1.0 - mc / mb)
+        if g.target is not None:
+            meets = mc <= g.target if lower else mc >= g.target
+            ok = meets or worse <= 0.0
+            detail = (f"candidate {mc:.4g} vs target {g.target:g} (baseline {mb:.4g}, "
+                      f"{worse:+.2%}): " + ("meets the target" if meets else
+                                            "misses the target but is no worse" if ok else
+                                            "misses the target and is worse than the baseline"))
+        else:
+            ok = worse <= g.max_regression
+            detail = f"worsened {worse:+.2%}, limit {g.max_regression:.2%}"
+        latency.append(GateResult(name=g.metric, status="pass" if ok else "fail", detail=detail))
     extra["latency"] = latency
     if any(r.status == "not_run" for r in latency):
         return "invalid", "a latency gate's metric was not reported", extra
@@ -340,11 +353,29 @@ def _decide(
     if correctness.status == "fail":
         return ("invalid", f"correctness gate failed ({correctness.detail}); a candidate that "
                 "does not serve the same outputs has no comparable performance", extra)
+    if contract.max_failed_requests is not None:
+        cap = contract.max_failed_requests
+
+        def over(samples: list[RawSample]) -> list[int]:
+            return [s.order_index for s in samples
+                    if s.metrics.get("failed") is None or s.metrics["failed"] > cap]
+
+        if over(base):
+            return ("invalid", f"baseline samples {over(base)} failed more than {cap} request(s) "
+                    "or did not report failures: the measurement, not the candidate, broke",
+                    extra)
+        if over(cand):
+            return ("regressed", f"candidate samples {over(cand)} failed more than {cap} "
+                    "request(s) or did not report failures", extra)
     failed = [r.name for r in latency if r.status == "fail"]
     if failed:
         return "regressed", f"latency gate failed: {', '.join(failed)}", extra
-    if lo > 0:
-        return "improved", f"interval [{lo:+.4f}, {hi:+.4f}] lies above 0", extra
     if hi < 0:
         return "regressed", f"interval [{lo:+.4f}, {hi:+.4f}] lies below 0", extra
+    floor = contract.min_effect
+    if lo > 0 and lo >= floor:
+        return "improved", f"interval [{lo:+.4f}, {hi:+.4f}] lies above {floor:g}", extra
+    if lo > 0:
+        return ("inconclusive", f"interval [{lo:+.4f}, {hi:+.4f}] lies above 0 but its low end "
+                f"is below min_effect {floor:g}: real, but not worth a change", extra)
     return "inconclusive", f"interval [{lo:+.4f}, {hi:+.4f}] spans 0", extra
