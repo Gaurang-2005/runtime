@@ -577,7 +577,7 @@ def _config_engines(speed):
 
 
 def test_the_final_check_measures_the_end_against_the_start(monkeypatch):
-    from gitm.scheduler.loop import _final_check
+    from gitm.scheduler.loop import _final_check, _final_check_md
 
     monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(lambda e: None))
     def speed(kw):
@@ -590,15 +590,25 @@ def test_the_final_check_measures_the_end_against_the_start(monkeypatch):
     assert out["original_tps"] == pytest.approx(1000.0) and out["final_tps"] == pytest.approx(1050.0)
     assert out["delta"] == pytest.approx(0.05) and out["holds"]
     assert {"enforce_eager": True, "max_num_seqs": 64} in built     # the original was rebuilt
+    assert out["ends_on"] == "final" and app.engine.gitm_llm_kwargs["enforce_eager"] is False
+    md = _final_check_md(out)
+    assert "kept, together" in md and "ends on the combined configuration" in md
 
 
 def test_a_final_configuration_that_does_not_hold_up_says_so(monkeypatch):
-    from gitm.scheduler.loop import _final_check
+    from gitm.scheduler.loop import _final_check, _final_check_md
 
     monkeypatch.setattr(LiveEngineApplicator, "_shutdown", staticmethod(lambda e: None))
     make_app, _ = _config_engines(lambda kw: 1000.0)               # nothing changes speed
-    out = _final_check(make_app({"block_size": 32}), {"block_size": 16})
+    app = make_app({"block_size": 32})
+    out = _final_check(app, {"block_size": 16})
     assert out["delta"] == pytest.approx(0.0) and not out["holds"]
+    # The combination was rolled back: the run returns the original, and the
+    # report must not present the combination's speed as the final engine's.
+    assert out["ends_on"] == "original" and app.engine.gitm_llm_kwargs == {"block_size": 16}
+    md = _final_check_md(out)
+    assert "rolled back" in md and "ends on the configuration it started from" in md
+    assert "this run ends with" not in md
 
 
 def test_no_final_check_when_nothing_was_kept():

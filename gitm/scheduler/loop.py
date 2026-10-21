@@ -322,7 +322,38 @@ def _final_check(applicator: LiveEngineApplicator, original: dict[str, Any]) -> 
             original_tps=ab.baseline_tps, final_tps=ab.candidate_tps,
             delta=result.measured_delta + bar, threshold=bar, rounds=ab.rounds,
             holds=bool(result.kept))
+    # Which configuration the run is left on, read off the engine actually
+    # running rather than inferred from the verdict: a combination that does not
+    # hold up is rolled back, and the original is what the run returns.
+    running = dict(getattr(applicator.engine, "gitm_llm_kwargs", None) or {})
+    out["ends_on"] = ("final" if running == final else
+                      "original" if running == original else "unknown")
     return out
+
+
+def _final_check_md(final_check: dict[str, Any]) -> str:
+    """The report's final-check section, or ``""`` when nothing was measured.
+
+    The measured numbers are the kept changes *together* against the starting
+    configuration. When they do not hold up, the original configuration is
+    restored, and the section says so: printing the combination's speed as
+    "the configuration this run ends with" read as the speed of the engine the
+    run returned.
+    """
+    if not final_check or "delta" not in final_check:
+        return ""
+    ab = (f"{final_check['original_tps']:.1f} -> {final_check['final_tps']:.1f} tok/s, "
+          f"{final_check['delta']:+.1%} (threshold {final_check['threshold']:.1%})")
+    if final_check.get("holds"):
+        verdict = "holds, and the run ends on the combined configuration."
+    elif final_check.get("ends_on") == "original":
+        verdict = ("does not clear the noise, so the combined change was rolled back and "
+                   "the run ends on the configuration it started from.")
+    else:
+        verdict = ("does not clear the noise; which configuration the engine was left on "
+                   "could not be confirmed.")
+    return ("\n## Final check\n\nThe changes this run kept, together, against the "
+            f"configuration it started from, as one A/B: {ab}: {verdict}\n")
 
 
 _BUDGET_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])\s*$")
@@ -2569,13 +2600,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             else None
         ),
     )
-    if final_check and "delta" in final_check:
-        report_md += (
-            "\n## Final check\n\nThe configuration this run ends with, against the one it "
-            f"started from, as one A/B: {final_check['original_tps']:.1f} -> "
-            f"{final_check['final_tps']:.1f} tok/s, {final_check['delta']:+.1%} "
-            f"(threshold {final_check['threshold']:.1%}): "
-            f"{'holds' if final_check['holds'] else 'does not clear the noise'}.\n")
+    report_md += _final_check_md(final_check or {})
     _write_report(run_dir, report_md)
 
     if isinstance(applicator, LiveEngineApplicator):
