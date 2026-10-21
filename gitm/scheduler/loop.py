@@ -98,6 +98,7 @@ from gitm.optimizer.verification_export import (
 )
 from gitm.optimizer.vllm_knobs import (
     KNOB_PREREQUISITES,
+    current_knob_values,
     engine_kwargs,
     expand_relative_candidates,
     knob_kind,
@@ -1740,7 +1741,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions,
                                   ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
                                   fingerprint=qual.fingerprint, recoverable=_recoverable,
-                                  motivated=_motivated)
+                                  motivated=_motivated,
+                                  current_values=current_knob_values(
+                                      cfg.engine, {k for s in library for k in s.knob_values}))
+    baseline_noops = [c for c in ranked if c.baseline_noop is not None]
     (run_dir / "ranked_candidates.json").write_text(
         json.dumps(
             [
@@ -1920,6 +1924,34 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     def _has_structural_knob(spec: Any) -> bool:
         return any(knob_kind(k) == "structural" for k in spec.knob_values)
 
+    # Shared veto for library levers (Phase 4) and autoresearch candidates
+    # (Phase 4b): a candidate that can't be enacted on this engine is "not
+    # evaluable here", not a regression.
+    def _unenactable(spec: Any) -> str | None:
+        if (
+            cfg.engine is not None
+            and live_restart_fn is None
+            and _has_structural_knob(spec)
+        ):
+            return "structural knob: needs engine restart, no restart_fn"
+        values = spec.knob_values
+        # The engine running *now*: a Phase-4 restart that was kept has
+        # replaced cfg.engine, and a prerequisite it turned on (or off) is
+        # visible only on the engine the applicator holds.
+        engine_now = getattr(applicator, "engine", None) or cfg.engine
+        for k in values:
+            reason = unmet_prerequisite(engine_now, k)
+            if reason is None:
+                continue
+            prereq = next(
+                (p for needle, p in KNOB_PREREQUISITES if needle in k.lower()),
+                None,
+            )
+            if prereq in values:
+                continue
+            return reason
+        return None
+
     claims: list[Claim] = []
     rolled_back: list[str] = []
     rejected: list[str] = []
@@ -1986,7 +2018,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         # against. Cleared whichever applicator is left, not only a live one: a
         # predict-only queue would still re-trace, re-running the workload on
         # the engine that was just released.
-        n_untried = sum(1 for x in queue if x.rejected_reason is None)
+        n_untried = sum(1 for x in queue
+                        if x.rejected_reason is None and x.baseline_noop is None)
         rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
                         for x in queue if x.rejected_reason is not None)
         queue = []
@@ -2001,7 +2034,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         """
         rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
                         for x in queue if x.rejected_reason is not None)
-        left = sum(1 for x in queue if x.rejected_reason is None)
+        # A known baseline no-op was never going to run: not work the budget prevented.
+        left = sum(1 for x in queue if x.rejected_reason is None and x.baseline_noop is None)
         if left:
             degradations.record(
                 BUDGET_SPENT, used="a Phase 4 that stopped at the budget",
@@ -2026,15 +2060,20 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                                         else f"would be overrun ({overrun})")
             break
         c = queue.pop(0)
+        if c.baseline_noop is not None:
+            # Already in baseline_noops: recorded where it was found, by Phase 3
+            # or by the re-rank that caught it.
+            continue
         if c.rejected_reason is not None:
             rejected.append(f"{c.spec.name} ({c.rejected_reason})")
             continue
-        # Live + structural knob + no restart hook → it *cannot* be enacted on the
-        # running engine, so it's "not evaluable here", not a regression. Mark it
-        # rejected (honest) instead of attempting an apply that would roll back and
-        # read as "tried and lost" — and skip the wasted baseline benchmark.
-        if cfg.engine is not None and live_restart_fn is None and _has_structural_knob(c.spec):
-            rejected.append(f"{c.spec.name} (structural knob: needs engine restart, no restart_fn)")
+        # Live + structural knob + no restart hook, or an unmet prerequisite → it
+        # *cannot* be enacted on the running engine. Mark it rejected (honest)
+        # instead of attempting an apply that would roll back and read as "tried
+        # and lost" — and skip the wasted baseline benchmark.
+        unenactable = _unenactable(c.spec)
+        if unenactable is not None:
+            rejected.append(f"{c.spec.name} ({unenactable})")
             continue
         noop = (_already_set(getattr(applicator, "engine", None), c.spec)
                 or _not_for_this_model(c.spec, _has_linear_layers))
@@ -2111,7 +2150,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             )
         if result.restore_failed:
             engine_lost = result.error or f"restore failed after {c.spec.name}"
-            n_untried = sum(1 for x in queue if x.rejected_reason is None)
+            n_untried = sum(1 for x in queue
+                        if x.rejected_reason is None and x.baseline_noop is None)
             # What the gate rejected is a verdict that needed no engine, so it is
             # still recorded. Breaking here without it left those candidates in
             # neither the rejected list nor the untried count.
@@ -2181,7 +2221,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                         applicator.install(back)
                 if swap_err is not None:
                     engine_lost = f"could not swap engines for re-trace {step}: {swap_err}"
-                    n_untried = sum(1 for x in queue if x.rejected_reason is None)
+                    n_untried = sum(1 for x in queue
+                        if x.rejected_reason is None and x.baseline_noop is None)
                     rejected.extend(f"{x.spec.name} ({x.rejected_reason})"
                                     for x in queue if x.rejected_reason is not None)
                     degradations.record(
@@ -2218,11 +2259,28 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                     except Exception as exc:
                         not_targeted = f"residuals on the re-trace failed: {exc}"
                 _motivated = motivated_now
+                remaining = [x.spec for x in queue]
+                # Read from the engine running *now*: a kept intervention may have
+                # changed a value, and a kept restart replaces cfg.engine outright.
+                engine_now = getattr(applicator, "engine", None) or cfg.engine
                 queue = select_interventions(
-                    fresh, [x.spec for x in queue], policy, top_n=len(queue),
+                    fresh, remaining, policy, top_n=len(queue),
                     ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
                     fingerprint=qual.fingerprint, recoverable=fresh_recoverable,
-                    motivated=_motivated)
+                    motivated=_motivated,
+                    current_values=current_knob_values(
+                        engine_now, {k for s in remaining for k in s.knob_values}))
+                # Recorded now, not when the queue reaches them: the budget check
+                # below can end the run before that pop ever happens.
+                # And dropped when a kept intervention has since changed the knob
+                # back: a lever that is actionable again will run, so reporting it
+                # as skipped would disagree with what the run did.
+                now_noop = {x.spec.name: x for x in queue if x.baseline_noop is not None}
+                actionable = {x.spec.name for x in queue if x.baseline_noop is None}
+                baseline_noops[:] = [n for n in baseline_noops if n.spec.name not in actionable]
+                for name, x in now_noop.items():
+                    if all(n.spec.name != name for n in baseline_noops):
+                        baseline_noops.append(x)
             now = [x.spec.name for x in queue]
             reranks.append({
                 "after": c.spec.name,
@@ -2267,6 +2325,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
         (run_dir / "rerank.json").write_text(json.dumps({
             "mode": cfg.rerank, "steps": reranks,
         }, indent=2))
+    (run_dir / "baseline_noop.json").write_text(json.dumps(
+        [{"name": c.spec.name, "reason": c.baseline_noop} for c in baseline_noops], indent=2))
 
     # Phase 4b - agentic autoresearch through the catalog gate/rollback path.
     # The same rule as Phase 4: no pass, and no candidate within it, that the
@@ -2280,41 +2340,19 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     if engine_lost is None and ar_overrun is None:
         proposer = FallbackProposer(EngineArgsProposer(), TableProposer())
 
-        def _unenactable(spec: Any) -> str | None:
+        def _ar_reject(spec: Any) -> str | None:
             # The exclusion has to reach here too. Autoresearch proposes its own
             # candidates rather than drawing from the catalogue, so a knob the
             # operator excluded because it hangs the model would otherwise come
-            # straight back as a proposal.
+            # straight back as a proposal. Everything else is the Phase 4 veto.
             why = _record_skip(spec, "autoresearch")
             if why is not None:
                 return f"excluded by --skip-lever {why!r}"
-            if (
-                cfg.engine is not None
-                and live_restart_fn is None
-                and _has_structural_knob(spec)
-            ):
-                return "structural knob: needs engine restart, no restart_fn"
             noop = (_already_set(getattr(applicator, "engine", None), spec)
                     or _not_for_this_model(spec, _has_linear_layers))
             if noop is not None:
                 return noop
-            values = spec.knob_values
-            # The engine running *now*: a Phase-4 restart that was kept has
-            # replaced cfg.engine, and a prerequisite it turned on (or off) is
-            # visible only on the engine the applicator holds.
-            engine_now = getattr(applicator, "engine", None) or cfg.engine
-            for k in values:
-                reason = unmet_prerequisite(engine_now, k)
-                if reason is None:
-                    continue
-                prereq = next(
-                    (p for needle, p in KNOB_PREREQUISITES if needle in k.lower()),
-                    None,
-                )
-                if prereq in values:
-                    continue
-                return reason
-            return None
+            return _unenactable(spec)
 
         def _checkpoint_ar(r: Any) -> None:
             if r.ab_result is not None and r.apply_result is not None:
@@ -2338,7 +2376,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
             residuals=res,
             proposer=proposer,
             ctx=pctx.gate,
-            reject=_unenactable,
+            reject=_ar_reject,
             history=prior_runs,
             gpu_sku=pctx.sku,
             fingerprint=qual.fingerprint,
@@ -2586,6 +2624,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
                       and not c.rolled_back and not c.restore_failed),
         "n_rolled_back": len(rolled_back),
         "n_rejected": len(rejected),
+        "n_baseline_noop": len(baseline_noops),
         "bottleneck_class": ar_run.bottleneck_class,
         "n_autoresearch": len(ar_run.results),
         # In the summary, not only the run dir: a reader comparing two runs needs
