@@ -49,18 +49,21 @@ def scheduler_causes(
 
     causes: list[SchedulerCause] = []
 
-    # KV-bound: the cache filled while work waited and the sequence cap was not
-    # what stopped admission. A batch then is as big as the KV cache holds, so
-    # raising admission limits cannot fill it and only more cache room helps. An
-    # H200 at 512 Mooncake conversations ran at most 99 sequences against a cap
-    # of 1024, with 506 waiting and the cache at 100%, and the loop spent its
-    # whole budget on admission levers that measured within 0.4%.
+    # KV-bound: the cache was full in the same samples that had work waiting,
+    # and a known sequence cap was never reached. A batch then is as big as the
+    # KV cache holds, so raising admission limits cannot fill it and only more
+    # cache room helps. An H200 at 512 Mooncake conversations ran at most 99
+    # sequences against a cap of 1024, with requests waiting and the cache past
+    # 90% together in 3,800 of 5,161 samples, and the loop spent its budget on
+    # admission levers that measured within 0.4%. Separate peaks are not enough
+    # (a queue during prefill, a full cache after it drained), and an unread cap
+    # may be the one that bound, so either keeps the admission advice.
     kv_bound = (
-        summary.peak_gpu_cache_usage is not None
-        and summary.peak_gpu_cache_usage > cache_pressure
-        and bool(summary.peak_queue_depth)
+        summary.peak_cache_usage_while_waiting is not None
+        and summary.peak_cache_usage_while_waiting > cache_pressure
         and summary.peak_running is not None
-        and (summary.max_num_seqs is None or summary.peak_running < summary.max_num_seqs)
+        and summary.max_num_seqs is not None
+        and summary.peak_running < summary.max_num_seqs
     )
     kv_room = ["gpu_memory_utilization", "kv_cache_dtype"]
 
