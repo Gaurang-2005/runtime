@@ -49,6 +49,21 @@ def scheduler_causes(
 
     causes: list[SchedulerCause] = []
 
+    # KV-bound: the cache filled while work waited and the sequence cap was not
+    # what stopped admission. A batch then is as big as the KV cache holds, so
+    # raising admission limits cannot fill it and only more cache room helps. An
+    # H200 at 512 Mooncake conversations ran at most 99 sequences against a cap
+    # of 1024, with 506 waiting and the cache at 100%, and the loop spent its
+    # whole budget on admission levers that measured within 0.4%.
+    kv_bound = (
+        summary.peak_gpu_cache_usage is not None
+        and summary.peak_gpu_cache_usage > cache_pressure
+        and bool(summary.peak_queue_depth)
+        and summary.peak_running is not None
+        and (summary.max_num_seqs is None or summary.peak_running < summary.max_num_seqs)
+    )
+    kv_room = ["gpu_memory_utilization", "kv_cache_dtype"]
+
     # Preemptions force KV recompute — a direct, expensive decode tax.
     if summary.total_preemptions:
         causes.append(
@@ -90,12 +105,17 @@ def scheduler_causes(
                     "graphs (enforce_eager=false) to cut per-step launch overhead."
                     if demand_limited else
                     f"mean batch occupancy {summary.mean_batch_occupancy:.0%} < "
+                    f"{occupancy_floor:.0%} while requests waited and the KV cache was full: "
+                    "the batch is as big as the cache holds. Give the cache more room "
+                    "(gpu_memory_utilization, an fp8 KV cache)."
+                    if kv_bound else
+                    f"mean batch occupancy {summary.mean_batch_occupancy:.0%} < "
                     f"{occupancy_floor:.0%}: decode batches are under-filled. Raise "
                     "max_num_seqs / max_num_batched_tokens, or capture CUDA graphs "
                     "(enforce_eager=false) to cut per-step launch overhead."
                 ),
                 motivates_knobs=(
-                    ["enforce_eager"] if demand_limited else
+                    ["enforce_eager"] if demand_limited else kv_room if kv_bound else
                     ["max_num_seqs", "max_num_batched_tokens", "enforce_eager",
                      "enable_chunked_prefill"]),
             )
@@ -118,10 +138,16 @@ def scheduler_causes(
                 severity=min(1.0, ratio),
                 note=(
                     f"peak queue depth {summary.peak_queue_depth} exceeded peak running "
+                    f"{summary.peak_running}, below the cap of {summary.max_num_seqs}, with "
+                    "the KV cache full: the cache, not admission, is the bottleneck. Give "
+                    "it more room (gpu_memory_utilization, an fp8 KV cache)."
+                    if kv_bound else
+                    f"peak queue depth {summary.peak_queue_depth} exceeded peak running "
                     f"{summary.peak_running}: admission is the bottleneck. Raise max_num_seqs "
                     "/ max_num_batched_tokens to admit more concurrently."
                 ),
-                motivates_knobs=["max_num_seqs", "max_num_batched_tokens"],
+                motivates_knobs=(kv_room if kv_bound
+                                 else ["max_num_seqs", "max_num_batched_tokens"]),
             )
         )
 
