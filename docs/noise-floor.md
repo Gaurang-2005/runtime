@@ -26,7 +26,7 @@ Samples come from two places:
 - **Calibration**, before the first candidate: the running engine is measured, then N + 1 rebuilds. The first pair is a warm-up and is left out. On Kimi K2.5 the first engine after the opening capture decoded 25% slower than every later build.
 - **Every later fresh build of the same baseline**: after a rollback, or between rounds.
 
-A measurement that wasn't the first on its build is skipped (`skipped_not_fresh`). Repeated decodes on one engine (`--reps`) never count, because they miss the build-to-build part of the noise.
+A measurement that wasn't the first on its build is skipped (`skipped_not_fresh`). Repeated decodes on one engine (`GITM_AB_REPS`) never count, because they miss the build-to-build part of the noise.
 
 ## 2. The floor is the root mean square
 
@@ -46,13 +46,21 @@ A plain average would let positive and negative samples cancel and report almost
 
 A candidate gets up to N paired rounds. A round's ratio compares one candidate build with one baseline build, so a single round has the floor's spread: factor 1.
 
-Averaging helps less than $1/\sqrt{N}$ suggests, because neighbouring rounds share a build. Serial validation alternates and reuses the running engine: A₁ B₁, then B₁ A₂, then A₂ B₂, and so on. With two rounds the mean is
+Averaging helps less than $1/\sqrt{N}$ suggests, because neighbouring rounds share a build. Serial validation alternates and reuses the running engine: A₁ B₁, then B₁ A₂, then A₂ B₂, and so on. The measured gain is the mean of the rounds' ratios, minus 1. With two rounds:
 
 $$
-\bar r = B_1 - \tfrac{1}{2}A_1 - \tfrac{1}{2}A_2
+\bar r = \tfrac{1}{2}\left(\frac{B_1}{A_1} + \frac{B_1}{A_2}\right) - 1
 $$
 
-so build $B_1$ has weight 1 and each baseline build has weight ½. Each build carries noise of variance $\sigma_b^2$, and an A/A pair is two builds, so $\text{floor}^2 = 2\sigma_b^2$. The spread of the mean is then
+To see its noise, write each build's throughput as its true value times $(1 + \varepsilon)$, where $\varepsilon$ is that build's relative noise: $A_k = a(1+\varepsilon_{A_k})$ and $B_1 = b(1+\varepsilon_{B_1})$. Noise of a fraction of a percent makes products of $\varepsilon$ negligible, so to first order
+
+$$
+\frac{B_1}{A_k} \approx \frac{b}{a}\,\big(1 + \varepsilon_{B_1} - \varepsilon_{A_k}\big),
+\qquad
+\bar r \approx \Big(\frac{b}{a} - 1\Big) + \varepsilon_{B_1} - \tfrac{1}{2}\varepsilon_{A_1} - \tfrac{1}{2}\varepsilon_{A_2}
+$$
+
+(with $b/a$ close to 1, the true effect's factor on the noise terms is dropped too). So build $B_1$'s noise has weight 1 and each baseline build's has weight ½. If each build's relative noise has variance $\sigma_b^2$, an A/A sample is the difference of two builds, so $\text{floor}^2 = 2\sigma_b^2$. The spread of the mean is then
 
 $$
 \sigma_{\bar r} = \sqrt{\sum_j w_j^2\,\sigma_b^2} = \text{floor}\cdot\sqrt{\tfrac{1}{2}\sum_j w_j^2} = \text{floor}\cdot\sqrt{\tfrac{1}{2}\left(1 + \tfrac14 + \tfrac14\right)} = 0.866\cdot\text{floor}
@@ -76,7 +84,13 @@ $$
 \text{threshold} = \max\big(\,2 \times \text{floor} \times \text{factor},\ \ \text{min\_effect}\,\big)
 $$
 
-The candidate is kept when the mean of its rounds' B/A ratios, minus 1, exceeds the threshold. Until the first A/A sample exists, the threshold is $\max(2\%, \text{min\_effect})$.
+The candidate is kept when the mean of its rounds' B/A ratios, minus 1, is at least
+
+$$
+\max(\text{threshold},\ \text{noise\_band}), \qquad \text{noise\_band} = \frac{s_A + s_B}{T_A}
+$$
+
+where $s_A$ and $s_B$ are the standard deviations of the baseline's and the candidate's repeated decodes on one engine (`GITM_AB_REPS`) and $T_A$ is the baseline throughput. With the default `GITM_AB_REPS=1` there is one decode per engine, so the noise band is 0 and the threshold alone decides. A gain equal to the bar is kept. Until the first A/A sample exists, the threshold is $\max(2\%, \text{min\_effect})$.
 
 The 2× is two standard deviations of the measured mean. If the noise is roughly normal and the floor well estimated, a candidate with no real effect clears the noise term about 2.3% of the time (one-sided). The minimum effect is a separate, practical bar: a gain smaller than it isn't worth changing a deployment for, however clean the measurement.
 
