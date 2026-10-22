@@ -94,3 +94,38 @@ def test_the_loop_ranks_by_its_causes_and_records_which(tmp_path, monkeypatch):
     # Every motivated live lever sits ahead of every unmotivated one.
     flags = [r["motivated_by"] is not None for r in live]
     assert flags == sorted(flags, reverse=True)
+
+
+def test_gitm_top_n_sets_how_many_rows_the_run_ranks(tmp_path, monkeypatch):
+    """A value grid takes one row per step: at the default 5, H200 job 99's
+    max_num_batched_tokens x0.5/x2/x4 took three rows and pushed
+    gpu_memory_utilization, which its own causes argued for, off the list."""
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+    from .test_vllm_knobs_and_restart import _FullEngine
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100,
+                               end_ns=i * 100 + 80) for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    asked: list[int] = []
+    real = loop.select_interventions
+
+    def spy(*args, top_n=5, **kwargs):
+        asked.append(top_n)
+        return real(*args, top_n=top_n, **kwargs)
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "select_interventions", spy)
+    monkeypatch.setenv("GITM_TOP_N", "12")
+
+    engine = _FullEngine()
+    engine.gitm_throughput_fn = lambda e: float(e.scheduler_config.max_num_seqs)
+    run_loop(LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
+                        scratch=str(tmp_path)))
+    assert asked and asked[0] == 12

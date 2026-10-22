@@ -1568,7 +1568,10 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog) -> dict[str, Any]:
     _recoverable = recoverable_by_op(res) if _floors_priced_for_this_run else None
     # Knob -> the cause observed in this run that argues for it (S-3).
     _motivated = _motivation(sched_causes, coll_causes)
-    ranked = select_interventions(trace, library, policy, top_n=cfg.top_n_interventions,
+    # GITM_TOP_N: how many ranked rows the run may try. A lever with a value grid
+    # takes one row per step, so at the default 5 a single sweep can fill the list.
+    _top_n = int(os.environ.get("GITM_TOP_N", cfg.top_n_interventions))
+    ranked = select_interventions(trace, library, policy, top_n=_top_n,
                                   ctx=pctx.gate, history=prior_runs, gpu_sku=pctx.sku,
                                   fingerprint=qual.fingerprint, recoverable=_recoverable,
                                   motivated=_motivated,
