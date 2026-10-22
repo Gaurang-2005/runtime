@@ -11,6 +11,8 @@ import json
 from contextlib import contextmanager
 from pathlib import Path
 
+import pytest
+
 from gitm.agents.policy import Policy, select_interventions
 from gitm.optimizer.history import History
 
@@ -129,3 +131,22 @@ def test_gitm_top_n_sets_how_many_rows_the_run_ranks(tmp_path, monkeypatch):
     run_loop(LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
                         scratch=str(tmp_path)))
     assert asked and asked[0] == 12
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "five"])
+def test_gitm_top_n_below_one_stops_the_run_before_it_starts(tmp_path, monkeypatch, value):
+    """ranked[:-1] is every row but the last, so a negative count would try nearly
+    the whole catalogue. The run refuses before any capture."""
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .test_vllm_knobs_and_restart import _FullEngine
+
+    def no_capture(*a, **k):
+        raise AssertionError("captured before checking GITM_TOP_N")
+
+    monkeypatch.setattr(loop, "capture", no_capture)
+    monkeypatch.setenv("GITM_TOP_N", value)
+    with pytest.raises(ValueError, match="GITM_TOP_N"):
+        run_loop(LoopConfig(engine=_FullEngine(), workload="vllm-decode", budget="24h",
+                            scratch=str(tmp_path)))
