@@ -1666,6 +1666,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog,
     _min_effect = float(os.environ.get("GITM_MIN_EFFECT", "0.01"))
     noise_calibration: list[float] = []
     calibration_lost: str | None = None
+    _restart_record: dict[str, Any] | None = None
     if cfg.engine is not None:
         # Serial wherever a baseline rebuild is available, rather than parallel
         # by default. Parallel holds the baseline and the candidate at once, and
@@ -1784,6 +1785,21 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog,
     # folded into ``verification`` with the rest.
     ar_live: list[VerificationRecord] = []
 
+    def _write_restart_mode() -> None:
+        """Checkpoint ``restart_mode.json`` with the sleep_swap record so far:
+        each swap's sleep and wake-up seconds and any fallback, which a run
+        that is killed would otherwise lose with the rest of its end-of-run
+        writes. Nothing to add outside sleep_swap."""
+        swaps = getattr(applicator, "swap_log", None)
+        if _restart_record is None or not swaps:
+            return
+        _restart_record["swaps"] = swaps
+        try:
+            (run_dir / "restart_mode.json").write_text(json.dumps(_restart_record, indent=2))
+        except Exception as exc:  # noqa: BLE001 - a failed checkpoint must not end the run
+            warnings.warn(f"gitm: could not checkpoint restart_mode.json: {exc}",
+                          RuntimeWarning, stacklevel=2)
+
     def _flush_verification() -> None:
         """Write what has been measured so far (K-3).
 
@@ -1793,6 +1809,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog,
         final write at the end of the run replaces this one with the full set,
         so a run that finishes is unchanged.
         """
+        _write_restart_mode()
         records = verification + ar_live
         if not records:
             return
@@ -2241,8 +2258,7 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog,
         # Each swap's sleep and wake-up seconds, next to the mode that caused
         # them: none of it is inside a throughput measurement, so this is the
         # only place the cost (and the rebuilds saved) shows.
-        _restart_record["swaps"] = swap_log
-        (run_dir / "restart_mode.json").write_text(json.dumps(_restart_record, indent=2))
+        _write_restart_mode()
 
     ar_granger_evidence = granger_evidence(hypotheses)
     ar_residual = _ar_target_residual(ar_run, kt_residual)

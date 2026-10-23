@@ -892,7 +892,7 @@ class _SleepEngine(_FullEngine):
         self.gitm_baseline_restart_fn = self._rebuild_baseline
         self._free = free
         if free is not None:
-            self.gitm_free_gpu_fraction_fn = lambda e: e._free
+            self.gitm_free_gpu_fraction_fn = lambda e, values=None: e._free
 
     def _measure(self, e):
         assert not e.asleep and not e.shut_down, "measured an engine that is not live"
@@ -1175,3 +1175,119 @@ def test_sleep_swap_env_builds_every_engine_with_sleep_mode(tmp_path, monkeypatc
     monkeypatch.setenv("GITM_RESTART_MODE", "serial")
     plain = get_factory("vllm-decode")(LoopConfig(workload="vllm-decode")).engine
     assert "enable_sleep_mode" not in plain.kwargs
+
+
+def test_sleep_swap_keep_below_measures_own_bar_still_leaves_the_candidate_live():
+    # A +3% candidate against a 20% floor: round 1 is no clear loss, so round 2
+    # runs and ends on the baseline, and measure() does not judge it a keep.
+    # A caller's negative min_keep_delta keeps it anyway.
+    from gitm.optimizer.apply import NoiseFloor
+
+    base = _SleepEngine(64)
+    noise = NoiseFloor()
+    noise.samples.extend([0.2, -0.2, 0.2])
+    app = _sleep_app(base, validation=2, noise_gate=True, noise=noise)
+    res = apply_intervention(_spec("max_num_seqs", 66), app, min_keep_delta=-1.0)
+
+    assert res.applied and not res.rolled_back
+    assert len(app.last_result.rounds) == 2
+    assert app.engine is not base and not app.engine.shut_down and not app.engine.asleep
+    assert app.engine.scheduler_config.max_num_seqs == 66
+    assert base.shut_down and base.live() == [app.engine]
+
+
+def test_close_releases_the_running_engine_when_a_swap_stopped_halfway():
+    base = _SleepEngine(64)
+    app = _sleep_app(base)
+    app.snapshot()
+    app.apply(_spec("max_num_seqs", 128))
+    cand = app.engine
+    app._sleep(cand)                 # a swap interrupted after its sleep, before its wake
+    app.close()
+
+    assert base.live() == [] and app.engine is None
+    assert cand.shut_down and base.shut_down
+
+
+def test_sleep_swap_fit_check_is_asked_about_the_candidates_settings():
+    asked = []
+    base = _SleepEngine(64, free=0.95)
+    base.gitm_free_gpu_fraction_fn = lambda e, values=None: asked.append(values) or 0.95
+    app = _sleep_app(base)
+    apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+
+    assert asked == [{"max_num_seqs": 32}]
+
+
+def test_free_gpu_fraction_reads_only_the_gpus_the_candidate_would_use(monkeypatch):
+    import sys
+    import types
+
+    from gitm.scheduler.loop import LoopConfig
+    from gitm.workloads import get_factory
+
+    class _LLM:
+        def __init__(self, model, **kwargs):
+            self.kwargs = kwargs
+
+    vllm = types.ModuleType("vllm")
+    vllm.LLM, vllm.SamplingParams = _LLM, lambda **kw: types.SimpleNamespace(**kw)
+    # Eight GPUs; the last four are nearly full (someone else's job).
+    nvml = types.ModuleType("pynvml")
+    nvml.nvmlInit = nvml.nvmlShutdown = lambda: None
+    nvml.nvmlDeviceGetCount = lambda: 8
+    nvml.nvmlDeviceGetHandleByIndex = lambda i: i
+    nvml.nvmlDeviceGetMemoryInfo = lambda i: types.SimpleNamespace(
+        free=95 if i < 4 else 5, total=100)
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    monkeypatch.delenv("GITM_VLLM_SYNTHETIC", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("GITM_RESTART_MODE", "sleep_swap")
+    monkeypatch.setenv("GITM_VLLM_TP", "8")
+
+    engine = get_factory("vllm-decode")(LoopConfig(workload="vllm-decode")).engine
+    free = engine.gitm_free_gpu_fraction_fn
+    assert free(engine) == pytest.approx(0.05)
+    assert free(engine, {"tensor_parallel_size": 4}) == pytest.approx(0.95)
+
+
+def test_run_loop_checkpoints_swaps_before_the_run_ends(tmp_path, monkeypatch):
+    import json
+    from contextlib import contextmanager
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    calls = []
+    real_apply = loop.apply_intervention
+
+    def dies_on_second(spec, *a, **kw):
+        calls.append(spec.name)
+        if len(calls) == 2:
+            raise RuntimeError("node lost")
+        return real_apply(spec, *a, **kw)
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "apply_intervention", dies_on_second)
+    monkeypatch.setenv("GITM_RESTART_MODE", "sleep_swap")
+
+    engine = _SleepEngine()
+    with pytest.raises(RuntimeError, match="node lost"):
+        run_loop(LoopConfig(engine=engine, workload="vllm-decode", budget="24h",
+                            scratch=str(tmp_path), top_n_interventions=50))
+
+    (record_path,) = tmp_path.rglob("restart_mode.json")
+    swaps = json.loads(record_path.read_text())["swaps"]
+    assert [s["candidate"] for s in swaps] == calls[:1]
+    assert swaps[0]["sleep_s"] and swaps[0]["wake_s"]
+    assert not any(e.asleep and not e.shut_down for e in engine.log["engines"])

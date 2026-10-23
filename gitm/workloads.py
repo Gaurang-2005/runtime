@@ -1207,8 +1207,10 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         engine.gitm_llm_kwargs = kwargs
         return engine
 
-    def _free_gpu_fraction(engine: Any) -> float | None:
-        """The smallest free fraction of device memory across this engine's GPUs.
+    def _free_gpu_fraction(engine: Any,
+                           knob_values: dict[str, Any] | None = None) -> float | None:
+        """The smallest free fraction of device memory across the GPUs an engine
+        built from ``engine``'s kwargs with ``knob_values`` applied would use.
 
         Through NVML, which needs no CUDA context: the parent stays CUDA-free so
         vLLM can fork its workers. ``None`` where NVML is unavailable (ROCm, no
@@ -1219,7 +1221,12 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
             import pynvml
         except ImportError:
             return None
-        kwargs = getattr(engine, "gitm_llm_kwargs", None) or {}
+        kwargs = dict(getattr(engine, "gitm_llm_kwargs", None) or {})
+        if knob_values:
+            try:
+                kwargs.update(engine_kwargs(knob_values, kwargs))
+            except Exception:  # noqa: BLE001 - the build will report a bad value itself
+                return None
         n = (int(kwargs.get("tensor_parallel_size", 1))
              * int(kwargs.get("pipeline_parallel_size", 1)))
         try:

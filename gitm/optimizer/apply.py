@@ -1111,7 +1111,9 @@ class LiveEngineApplicator:
         if not callable(free_fn) or need is None:
             return None
         try:
-            free = free_fn(base)
+            # The candidate's own settings: a lever that changes
+            # tensor_parallel_size runs on a different set of GPUs.
+            free = free_fn(base, values)
         except Exception:
             return None
         if free is None or free >= need:
@@ -1150,15 +1152,20 @@ class LiveEngineApplicator:
         self._activate(target)
 
     def close(self) -> None:
-        """Shut down any engine still asleep that is not the running one.
+        """Shut down every engine still asleep.
 
         Every path through a sleep_swap candidate already leaves one engine; this
         is the backstop for one that was interrupted part-way (a restore that
-        began and did not finish). A no-op in every other mode.
+        began and did not finish, or a swap stopped between its sleep and its
+        wake-up, which leaves the running engine itself asleep). An engine
+        still asleep at this point is never going to be woken, so it is
+        released even when it is ``self.engine``, and the handle is dropped
+        rather than handed back as live. A no-op in every other mode.
         """
         for engine in list(self._sleeping.values()):
-            if engine is not self.engine:
-                self._release(engine)
+            if engine is self.engine:
+                self.engine = None
+            self._release(engine)
         self._sleeping.clear()
 
     def restore(self, snapshot: dict[str, Any]) -> None:
@@ -1265,9 +1272,16 @@ class LiveEngineApplicator:
         if self._prev is not None and self._prev[0] == "restart":
             self._shutdown(self._prev[1])
         elif self._prev is not None and self._prev[0] == "sleep_swap":
+            _, base, cand = self._prev
+            if self.engine is not cand:
+                # Kept although measure() did not judge it a keep (a caller's
+                # min_keep_delta below zero), so the last round left the
+                # baseline awake. Wake the candidate before releasing the
+                # baseline, or the engine left running would be shut down.
+                self._swap_live(cand)
             # The old baseline sleeps with its weights in CPU RAM; the kept
             # candidate is the baseline now, so nothing will wake it again.
-            self._release(self._prev[1])
+            self._release(base)
         self._prev = None
         # The candidate is the baseline now: a different configuration, so its
         # measurements are not A/A samples against the old one's.
