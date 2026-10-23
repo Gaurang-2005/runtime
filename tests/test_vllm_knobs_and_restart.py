@@ -1315,3 +1315,45 @@ def test_sleep_swap_candidate_that_will_not_wake_for_the_keep_is_rolled_back(mon
 
     assert res.rolled_back and not res.kept and "wake_up failed" in res.error
     assert app.engine is base and not base.asleep and base.live() == [base]
+
+
+def test_run_loop_writes_the_last_swap_on_the_way_out(tmp_path, monkeypatch):
+    # The second candidate's A/B completes, then the run dies before its
+    # verification record (and so its checkpoint) is written. Cleanup still
+    # writes its swap.
+    import json
+    from contextlib import contextmanager
+
+    import gitm.scheduler.loop as loop
+    from gitm.scheduler.loop import LoopConfig, run_loop
+
+    from .conftest import make_kernel, make_trace
+
+    @contextmanager
+    def fake_capture(out_path, *, workload_id="w", fingerprint="f", run_id=None):
+        kernels = [make_kernel(f"paged_attention_{i % 4}", start_ns=i * 100, end_ns=i * 100 + 80)
+                   for i in range(80)]
+        yield make_trace(events=kernels, vendor="nvidia", run_id=run_id or "r")
+
+    calls = []
+    real_apply = loop.apply_intervention
+
+    def dies_after_second(spec, *a, **kw):
+        calls.append(spec.name)
+        result = real_apply(spec, *a, **kw)
+        if len(calls) == 2:
+            raise RuntimeError("node lost")
+        return result
+
+    monkeypatch.setattr(loop, "capture", fake_capture)
+    monkeypatch.setattr(loop, "sync_device", lambda: None)
+    monkeypatch.setattr(loop, "apply_intervention", dies_after_second)
+    monkeypatch.setenv("GITM_RESTART_MODE", "sleep_swap")
+
+    with pytest.raises(RuntimeError, match="node lost"):
+        run_loop(LoopConfig(engine=_SleepEngine(), workload="vllm-decode", budget="24h",
+                            scratch=str(tmp_path), top_n_interventions=50))
+
+    (record_path,) = tmp_path.rglob("restart_mode.json")
+    swaps = json.loads(record_path.read_text())["swaps"]
+    assert [s["candidate"] for s in swaps] == calls
