@@ -1885,6 +1885,24 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog,
     noise_calibration: list[float] = []
     calibration_lost: str | None = None
     _restart_record: dict[str, Any] | None = None
+
+    def _write_restart_mode() -> None:
+        """Checkpoint ``restart_mode.json`` with the sleep_swap record so far:
+        each swap's sleep and wake-up seconds and any fallback, which a run
+        that is killed would otherwise lose with the rest of its end-of-run
+        writes. Also run on the way out by any path, after close(), so the
+        last candidate's record is kept even when no A/B record followed it.
+        Nothing to add outside sleep_swap."""
+        swaps = getattr(applicator, "swap_log", None)
+        if _restart_record is None or not swaps:
+            return
+        _restart_record["swaps"] = swaps
+        try:
+            (run_dir / "restart_mode.json").write_text(json.dumps(_restart_record, indent=2))
+        except Exception as exc:  # noqa: BLE001 - a failed checkpoint must not end the run
+            warnings.warn(f"gitm: could not checkpoint restart_mode.json: {exc}",
+                          RuntimeWarning, stacklevel=2)
+
     if cfg.engine is not None:
         # Serial wherever a baseline rebuild is available, rather than parallel
         # by default. Parallel holds the baseline and the candidate at once, and
@@ -1910,6 +1928,8 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog,
             min_effect=_min_effect,
             threshold_without_floor=_THRESHOLD_WITHOUT_FLOOR,
         )
+        # LIFO: close() releases what is still asleep, then the record is written.
+        cleanup.callback(_write_restart_mode)
         cleanup.callback(applicator.close)
         _restart_record = {
             "mode": _restart_mode,
@@ -2002,21 +2022,6 @@ def _run_loop(cfg: LoopConfig, degradations: DegradationLog,
     # Autoresearch's records as each lands, until the pass returns and they are
     # folded into ``verification`` with the rest.
     ar_live: list[VerificationRecord] = []
-
-    def _write_restart_mode() -> None:
-        """Checkpoint ``restart_mode.json`` with the sleep_swap record so far:
-        each swap's sleep and wake-up seconds and any fallback, which a run
-        that is killed would otherwise lose with the rest of its end-of-run
-        writes. Nothing to add outside sleep_swap."""
-        swaps = getattr(applicator, "swap_log", None)
-        if _restart_record is None or not swaps:
-            return
-        _restart_record["swaps"] = swaps
-        try:
-            (run_dir / "restart_mode.json").write_text(json.dumps(_restart_record, indent=2))
-        except Exception as exc:  # noqa: BLE001 - a failed checkpoint must not end the run
-            warnings.warn(f"gitm: could not checkpoint restart_mode.json: {exc}",
-                          RuntimeWarning, stacklevel=2)
 
     def _flush_verification() -> None:
         """Write what has been measured so far (K-3).
