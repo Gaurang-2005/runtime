@@ -1291,3 +1291,27 @@ def test_run_loop_checkpoints_swaps_before_the_run_ends(tmp_path, monkeypatch):
     assert [s["candidate"] for s in swaps] == calls[:1]
     assert swaps[0]["sleep_s"] and swaps[0]["wake_s"]
     assert not any(e.asleep and not e.shut_down for e in engine.log["engines"])
+
+
+def test_sleep_swap_candidate_that_will_not_wake_for_the_keep_is_rolled_back(monkeypatch):
+    # The keep-time wake-up of the candidate fails. It happens inside measure(),
+    # so the candidate is rolled back and the baseline woken, never a keep that
+    # hands back an engine still asleep.
+    from gitm.optimizer.apply import NoiseFloor
+
+    real_wake = _SleepEngine.wake_up
+
+    def wake(self):
+        if self.scheduler_config.max_num_seqs == 66:
+            raise RuntimeError("wake_up failed")
+        real_wake(self)
+
+    monkeypatch.setattr(_SleepEngine, "wake_up", wake)
+    base = _SleepEngine(64)
+    noise = NoiseFloor()
+    noise.samples.extend([0.2, -0.2, 0.2])
+    app = _sleep_app(base, validation=2, noise_gate=True, noise=noise)
+    res = apply_intervention(_spec("max_num_seqs", 66), app, min_keep_delta=-1.0)
+
+    assert res.rolled_back and not res.kept and "wake_up failed" in res.error
+    assert app.engine is base and not base.asleep and base.live() == [base]
