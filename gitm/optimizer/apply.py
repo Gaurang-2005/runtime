@@ -198,6 +198,12 @@ def apply_intervention(
         _audit(audit, "apply", spec, cause="applied live", knobs=_knob_values(spec))
 
         # Step 3: measure. A crash mid-measurement also rolls back.
+        # An applicator that leaves the engine it measured last (not
+        # necessarily the candidate) has to know the bar the keep below will
+        # use, so that putting the candidate back happens here, where a
+        # failure rolls back, and not after the keep has been decided.
+        if hasattr(applicator, "keep_at"):
+            applicator.keep_at = min_keep_delta
         try:
             delta = applicator.measure(spec)
         except RestoreFailed as exc:
@@ -846,6 +852,9 @@ class LiveEngineApplicator:
         # ("sleep_swap", baseline, candidate_or_None) | None.
         self._prev: tuple[Any, ...] | None = None
         self.last_result: EngineABResult | None = None
+        #: The ``min_keep_delta`` apply_intervention will keep at. Set by it
+        #: before each measure(), so the engine left live agrees with the keep.
+        self.keep_at = 0.0
         # sleep_swap: engines put to sleep and not yet woken or shut down, by id.
         # Each holds weights in CPU RAM and some device memory, so close()
         # releases whatever is left here.
@@ -1282,16 +1291,13 @@ class LiveEngineApplicator:
         if self._prev is not None and self._prev[0] == "restart":
             self._shutdown(self._prev[1])
         elif self._prev is not None and self._prev[0] == "sleep_swap":
-            _, base, cand = self._prev
-            if self.engine is not cand:
-                # Kept although measure() did not judge it a keep (a caller's
-                # min_keep_delta below zero), so the last round left the
-                # baseline awake. Wake the candidate before releasing the
-                # baseline, or the engine left running would be shut down.
-                self._swap_live(cand)
             # The old baseline sleeps with its weights in CPU RAM; the kept
             # candidate is the baseline now, so nothing will wake it again.
-            self._release(base)
+            # measure() left the candidate live for this keep; release
+            # whichever engine is not running regardless, so a keep that
+            # disagreed with it can never shut down the one engine left.
+            _, base, cand = self._prev
+            self._release(cand if self.engine is base else base)
         self._prev = None
         # The candidate is the baseline now: a different configuration, so its
         # measurements are not A/A samples against the old one's.
@@ -1391,9 +1397,10 @@ class LiveEngineApplicator:
             if self.noise_gate else 0.0)
         bar = max(threshold, noise_band)
         # One comparison decides everything: apply_intervention keeps at
-        # ``delta - bar >= 0``, and the candidate rebuild below must agree with it.
-        keep = delta - bar >= 0
-        significant = keep if self.noise_gate else delta > noise_band
+        # ``delta - bar >= keep_at``, and the candidate rebuild or wake-up below
+        # must agree with it. Significance stays measured against zero.
+        keep = delta - bar >= self.keep_at
+        significant = delta - bar >= 0 if self.noise_gate else delta > noise_band
         if tag == "hotswap" and keep and self._state_is_baseline:
             self._set_knobs(_knob_values(spec))
         if keep and self._prev and self._prev[0] == "baseline_running":
