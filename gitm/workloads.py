@@ -1104,6 +1104,12 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         # their workers share a name, so ownership is the only thing that keeps
         # a candidate's teardown from taking the baseline's workers with it.
         before = engine_worker_pids()
+        # A traced engine is never the one sleep_swap puts to sleep (the A/B runs
+        # on untraced builds), and sleep mode's allocator has not been run under
+        # the collector, so it is built without it. gitm_llm_kwargs keeps the
+        # flag, so an untraced rebuild from this engine still gets it.
+        build_kwargs = ({k: v for k, v in kwargs.items() if k != "enable_sleep_mode"}
+                        if traced else kwargs)
         # A traced engine also names the layer and op each kernel ran in. By
         # kernel name alone, cuBLAS/hipBLASLt GEMMs and MLA attention map to no
         # op: the first Kimi K2.5 run left 7.4M of 10.4M launches unmodelled and
@@ -1128,7 +1134,8 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         nvtx_default = "0" if injection.active_vendor() == "amd" else "1"
         nvtx = (traced and tracing
                 and os.environ.get("GITM_VLLM_NVTX", nvtx_default) != "0")
-        build_kwargs = {**kwargs, "enable_layerwise_nvtx_tracing": True} if nvtx else kwargs
+        if nvtx:
+            build_kwargs = {**build_kwargs, "enable_layerwise_nvtx_tracing": True}
         runner = ({"VLLM_USE_V2_MODEL_RUNNER": "0"}
                   if nvtx and "VLLM_USE_V2_MODEL_RUNNER" not in os.environ else {})
         with (injection.nvtx_env() if nvtx else contextlib.nullcontext() if traced

@@ -1073,6 +1073,8 @@ class LiveEngineApplicator:
         if not callable(getattr(base, "sleep", None)) or not callable(
                 getattr(base, "wake_up", None)):
             why = "the baseline engine has no sleep()/wake_up()"
+        elif getattr(base, "gitm_traced", False):
+            why = "the baseline is a traced engine, built without sleep mode"
         elif kwargs is not None and not kwargs.get("enable_sleep_mode"):
             why = "the baseline was not built with enable_sleep_mode=True"
         if why is None:
@@ -1490,6 +1492,12 @@ class LiveEngineApplicator:
             self._release(cand)
             raise
         self._note_baseline(a)      # not a fresh build, so never an A/A sample
+        # The same build measured before it slept: how far a woken baseline
+        # drifts from itself. A real offset here would bias every swapped round,
+        # so it is recorded per wake-up rather than assumed to be zero.
+        first = self._baseline_tps
+        if first:
+            self._swap_rec.setdefault("woken_vs_first", []).append(round(a / first - 1.0, 5))
         return a
 
     def _clear_loss(self, rounds: list[tuple[float, float]]) -> bool:

@@ -1021,6 +1021,27 @@ def test_sleep_swap_falls_back_when_the_baseline_was_built_without_sleep_mode():
     assert base.live() == [app.engine]
 
 
+def test_sleep_swap_falls_back_when_the_baseline_is_a_traced_engine():
+    """A traced engine is built without sleep mode, so it is never put to sleep."""
+    base = _SleepEngine(64)
+    base.gitm_traced = True
+    app = _sleep_app(base)
+    apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+
+    assert not any(ev == "sleep" for ev, _ in base.log["events"])
+    assert "traced" in app.swap_log[0]["fallback"]
+    assert base.live() == [app.engine]
+
+
+def test_sleep_swap_records_how_far_a_woken_baseline_drifts_from_itself():
+    base = _SleepEngine(64)
+    app = _sleep_app(base, validation=3)
+    apply_intervention(_spec("max_num_seqs", 128), app, min_keep_delta=0.0)
+
+    drift = app.swap_log[0]["woken_vs_first"]
+    assert drift and all(d == pytest.approx(0.0) for d in drift)
+
+
 def test_sleep_swap_rounds_swap_the_same_two_builds_and_use_factor_one():
     from gitm.optimizer.apply import NoiseFloor, mean_noise_factor
 
@@ -1182,7 +1203,10 @@ def test_sleep_swap_env_builds_every_engine_with_sleep_mode(tmp_path, monkeypatc
     monkeypatch.setenv("GITM_RESTART_MODE", "sleep_swap")
 
     engine = get_factory("vllm-decode")(LoopConfig(workload="vllm-decode")).engine
-    assert engine.kwargs["enable_sleep_mode"] is True
+    # The opening engine carries the collector, so it is built without sleep
+    # mode; its recorded configuration keeps the flag for the untraced rebuilds.
+    assert "enable_sleep_mode" not in engine.kwargs
+    assert engine.gitm_llm_kwargs["enable_sleep_mode"] is True
     cand = engine.gitm_restart_fn(engine, {"block_size": 32})
     assert cand.kwargs["enable_sleep_mode"] is True
     assert callable(engine.gitm_free_gpu_fraction_fn)
