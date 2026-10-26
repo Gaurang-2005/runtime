@@ -1077,6 +1077,13 @@ def test_host_headroom_is_the_tighter_of_the_cgroup_limit_and_the_nodes_memory(t
     # No cgroup limit set: the node's available memory is all there is.
     (cg / "job" / "memory.max").write_text("max\n")
     assert _host_headroom_bytes(str(proc), str(cg)) == 2800 * gib
+    # The limit on a parent (the job's cgroup above the step's) still counts, against
+    # the parent's own usage.
+    (cg / "job" / "step").mkdir()
+    (proc / "self" / "cgroup").write_text("0::/job/step\n")
+    (cg / "job" / "step" / "memory.max").write_text("max\n")
+    (cg / "job" / "memory.max").write_text(f"{1664 * gib}\n")
+    assert _host_headroom_bytes(str(proc), str(cg)) == 1584 * gib
     # Neither readable.
     assert _host_headroom_bytes(str(tmp_path / "nope"), str(tmp_path / "nope")) is None
 

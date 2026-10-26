@@ -848,8 +848,8 @@ def _nvml_memory_infos(kwargs: dict[str, Any]) -> list[Any]:
 
 
 def _host_headroom_bytes(proc: str = "/proc", cgroup: str = "/sys/fs/cgroup") -> int | None:
-    """Host memory this process can still take: the tighter of the node's
-    available memory and what is left under its cgroup limit.
+    """Host memory this process can still take: the tightest of the node's
+    available memory and what is left under each cgroup limit above it.
 
     The cgroup limit is the one that bites. Slurm gives a job
     ``DefMemPerCPU x cpus`` unless it asks otherwise, which is 1.6 TiB of a
@@ -870,18 +870,29 @@ def _host_headroom_bytes(proc: str = "/proc", cgroup: str = "/sys/fs/cgroup") ->
     try:
         with open(f"{proc}/self/cgroup") as f:
             rel = next(line.strip().split("::", 1)[1] for line in f if line.startswith("0::"))
-        d = Path(cgroup) / rel.lstrip("/")
-        limit = (d / "memory.max").read_text().strip()
-        if limit != "max":
-            used = int((d / "memory.current").read_text())
-            reclaimable = 0
-            for line in (d / "memory.stat").read_text().splitlines():
-                key, _, value = line.partition(" ")
-                if key == "inactive_file":
-                    reclaimable = int(value)
-            found.append(int(limit) - used + reclaimable)
-    except (OSError, ValueError, StopIteration):
-        pass
+    except (OSError, IndexError, StopIteration):
+        rel = None
+    if rel is not None:
+        # The limit may sit on a parent (a Slurm job's cgroup above the step's),
+        # so every level up to the root counts, each against its own usage.
+        root = Path(cgroup)
+        d = root / rel.lstrip("/")
+        while True:
+            try:
+                limit = (d / "memory.max").read_text().strip()
+                if limit != "max":
+                    used = int((d / "memory.current").read_text())
+                    reclaimable = 0
+                    for line in (d / "memory.stat").read_text().splitlines():
+                        key, _, value = line.partition(" ")
+                        if key == "inactive_file":
+                            reclaimable = int(value)
+                    found.append(int(limit) - used + reclaimable)
+            except (OSError, ValueError):
+                pass
+            if d == root or root not in d.parents:
+                break
+            d = d.parent
     return min(found) if found else None
 
 
