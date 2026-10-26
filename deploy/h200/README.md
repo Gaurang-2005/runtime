@@ -78,6 +78,40 @@ and run `gitm capture serve --out /out -- vllm serve $MODEL --tensor-parallel-si
 Results: `/var/lib/gitm/results/<jobid>/` (+ `<jobid>.log`) on the node that ran
 it. Raw `sbatch --exclusive --container-image=...` works too and shows on the page.
 
+## Run IDs and results layout
+
+Every run gets an ID minted by the submit script (not the Slurm job id):
+
+```
+<UTC>-<model-slug>-<node>-<rand4>
+example:  20261021T174233Z-kimi-k26-gm2-7f3a
+```
+
+UTC-first so runs sort chronologically; `model-slug` from the HF id lowercased
+(`moonshotai/Kimi-K2.6` → `kimi-k26`); `node` is `gm1`/`gm2`; `rand4` avoids
+same-second collisions. The full model id, HF revision, Slurm job id and
+submitter live in `inputs.json`, not in the name.
+
+Outputs are split by durability, keyed on the run id:
+
+```
+/mnt/gitm-runs/<run id>/          # durable: a plain folder over a central GCS bucket (gcsfuse)
+    record.json                   #   the run record the loop keys on (contents: ENG-72)
+    inputs.json                   #   exact inputs the script was called with
+    engine.log                    #   vLLM / SGLang server log
+    slurm.log                     #   the Slurm %j.log
+/mnt/disks/scratch/runs/<run id>/
+    trace/...                     # ephemeral: multi-GB CUPTI traces (scratch is wiped on VM stop/move)
+```
+
+`/mnt/gitm-runs` is a single config value (`RESULTS_ROOT`), so the bucket/mount
+can be repointed later without changing run ids or loop code. Run-id format and
+durable root were agreed in ENG-76 with Pamela and Sebastian; the `record.json`
+schema is ENG-72.
+
+> The gcsfuse mount is provisioned by a separate ops step (bucket + mount on
+> both nodes). Until then, runs land on the per-node `/var/lib/gitm/results`.
+
 ## Notes
 
 * The page's log tail is public. Common secret formats are redacted; don't
