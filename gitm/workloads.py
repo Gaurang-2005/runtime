@@ -814,6 +814,77 @@ def reap_engine_workers(pids: set[int] | None, timeout_s: float = 30.0) -> list[
     return forced
 
 
+def _nvml_memory_infos(kwargs: dict[str, Any]) -> list[Any]:
+    """NVML memory info for each GPU an engine built from ``kwargs`` would use.
+
+    Through NVML, which needs no CUDA context: the parent stays CUDA-free so
+    vLLM can fork its workers. Empty where NVML is unavailable (ROCm, no
+    driver) or the devices cannot be mapped, which leaves the decision to the
+    build itself.
+    """
+    try:
+        import pynvml
+    except ImportError:
+        return []
+    n = (int(kwargs.get("tensor_parallel_size", 1))
+         * int(kwargs.get("pipeline_parallel_size", 1)))
+    try:
+        pynvml.nvmlInit()
+    except Exception:
+        return []
+    try:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        devices = ([int(d) for d in visible.split(",") if d.strip()] if visible
+                   else list(range(pynvml.nvmlDeviceGetCount())))
+        return [pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(idx))
+                for idx in devices[:n]]
+    except Exception:  # noqa: BLE001 - a UUID in CUDA_VISIBLE_DEVICES, a driver error
+        return []
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+def _host_headroom_bytes(proc: str = "/proc", cgroup: str = "/sys/fs/cgroup") -> int | None:
+    """Host memory this process can still take: the tighter of the node's
+    available memory and what is left under its cgroup limit.
+
+    The cgroup limit is the one that bites. Slurm gives a job
+    ``DefMemPerCPU x cpus`` unless it asks otherwise, which is 1.6 TiB of a
+    2.8 TiB node here, and the OOM killer enforces it. Memory held as shared
+    memory (what a sleeping engine's weights become) counts against it and is
+    not reclaimable; page cache is, so it is added back. ``None`` where neither
+    can be read.
+    """
+    found: list[int] = []
+    try:
+        with open(f"{proc}/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    found.append(int(line.split()[1]) * 1024)
+                    break
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(f"{proc}/self/cgroup") as f:
+            rel = next(line.strip().split("::", 1)[1] for line in f if line.startswith("0::"))
+        d = Path(cgroup) / rel.lstrip("/")
+        limit = (d / "memory.max").read_text().strip()
+        if limit != "max":
+            used = int((d / "memory.current").read_text())
+            reclaimable = 0
+            for line in (d / "memory.stat").read_text().splitlines():
+                key, _, value = line.partition(" ")
+                if key == "inactive_file":
+                    reclaimable = int(value)
+            found.append(int(limit) - used + reclaimable)
+    except (OSError, ValueError, StopIteration):
+        pass
+    return min(found) if found else None
+
+
 @register("vllm-decode")
 def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     """Launch a vLLM decode job inside the tracer capture window.
@@ -1311,38 +1382,32 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
         driver) or the devices cannot be mapped, which leaves the decision to
         the build itself.
         """
-        try:
-            import pynvml
-        except ImportError:
-            return None
         kwargs = dict(getattr(engine, "gitm_llm_kwargs", None) or {})
         if knob_values:
             try:
                 kwargs.update(engine_kwargs(knob_values, kwargs))
             except Exception:  # noqa: BLE001 - the build will report a bad value itself
                 return None
-        n = (int(kwargs.get("tensor_parallel_size", 1))
-             * int(kwargs.get("pipeline_parallel_size", 1)))
-        try:
-            pynvml.nvmlInit()
-        except Exception:
+        infos = _nvml_memory_infos(kwargs)
+        if not infos:
             return None
-        try:
-            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-            devices = ([int(d) for d in visible.split(",") if d.strip()] if visible
-                       else list(range(pynvml.nvmlDeviceGetCount())))
-            fractions = []
-            for idx in devices[:n]:
-                info = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(idx))
-                fractions.append(info.free / info.total)
-            return min(fractions) if fractions else None
-        except Exception:  # noqa: BLE001 - a UUID in CUDA_VISIBLE_DEVICES, a driver error
+        return min(i.free / i.total for i in infos)
+
+    def _sleep_host_room(engine: Any) -> tuple[int, int] | None:
+        """``(headroom, bytes_per_engine)`` for keeping engines asleep, or ``None``.
+
+        ``headroom`` is the host memory this job can still use (see
+        :func:`_host_headroom_bytes`). ``bytes_per_engine`` is what an engine
+        like this one would put in host memory when it sleeps: the device
+        memory in use on its GPUs now, an upper bound, since the KV cache is
+        dropped rather than copied (about 20% over on Kimi K2.6, measured).
+        ``None`` where either cannot be read.
+        """
+        headroom = _host_headroom_bytes()
+        infos = _nvml_memory_infos(dict(getattr(engine, "gitm_llm_kwargs", None) or {}))
+        if headroom is None or not infos:
             return None
-        finally:
-            try:
-                pynvml.nvmlShutdown()
-            except Exception:
-                pass
+        return headroom, sum(i.used for i in infos)
 
     # Expose the live engine + its A/B hooks so the loop can (a) sample scheduler
     # stats and (b) run the Phase-4 decode-throughput A/B on it. ``run.engine`` is
@@ -1356,6 +1421,7 @@ def _vllm_decode_factory(cfg: LoopConfig) -> WorkloadRunner:
     run.workload_id = "vllm-decode"
     hooks.update(
         gitm_free_gpu_fraction_fn=_free_gpu_fraction,
+        gitm_sleep_host_room_fn=_sleep_host_room,
         gitm_throughput_fn=_throughput,
         gitm_restart_fn=_restart,
         gitm_baseline_restart_fn=_baseline_restart,

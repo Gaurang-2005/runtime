@@ -1078,6 +1078,8 @@ class LiveEngineApplicator:
         elif kwargs is not None and not kwargs.get("enable_sleep_mode"):
             why = "the baseline was not built with enable_sleep_mode=True"
         if why is None:
+            why = self._host_cannot_hold(base)
+        if why is None:
             # Recorded before the build, so a Ctrl-C during it still leaves
             # restore() able to wake the baseline.
             self._prev = ("sleep_swap", base, None)
@@ -1102,6 +1104,37 @@ class LiveEngineApplicator:
         self._prev = None
         self._release(base)
         return None
+
+    def _host_cannot_hold(self, base: Any) -> str | None:
+        """Why the host cannot keep two sleeping engines, or None.
+
+        Sleep level 1 moves an engine's weights into host memory, and the
+        validation rounds sleep the candidate as well while the baseline still
+        sleeps, so two engines' worth must fit under the job's memory limit. On
+        Kimi K2.6 that is about 1.8 TiB against a default Slurm limit of 1.6
+        TiB: the second sleep was killed by the OOM killer mid-copy, and the
+        baseline could not be woken. Asked of the engine's own
+        ``gitm_sleep_host_room_fn`` -> ``(headroom, bytes_per_engine)``; an
+        engine without one, or a reading that is unavailable, is left to the
+        sleep itself to decide.
+        """
+        room_fn = getattr(base, "gitm_sleep_host_room_fn", None)
+        if not callable(room_fn):
+            return None
+        try:
+            room = room_fn(base)
+        except Exception:
+            return None
+        if room is None:
+            return None
+        headroom, each = room
+        need = 2 * each
+        if headroom >= need:
+            return None
+        gib = 2**30
+        return (f"{headroom / gib:.0f} GiB of host memory is free under the job's limit "
+                f"and two sleeping engines need about {need / gib:.0f} GiB "
+                f"({each / gib:.0f} GiB each)")
 
     def _candidate_cannot_fit(self, base: Any, values: dict[str, Any]) -> str | None:
         """Why vLLM would refuse the candidate with the baseline asleep, or None.

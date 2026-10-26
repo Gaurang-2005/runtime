@@ -896,7 +896,8 @@ class _SleepEngine(_FullEngine):
     """
 
     def __init__(self, max_num_seqs: int = 64, *, log: dict | None = None,
-                 free: float | None = None, fail_builds: int = 0):
+                 free: float | None = None, fail_builds: int = 0,
+                 host: tuple[int, int] | None = None):
         super().__init__(max_num_seqs)
         self.log = log if log is not None else {"builds": 0, "fail_builds": fail_builds,
                                                 "events": [], "engines": []}
@@ -908,6 +909,9 @@ class _SleepEngine(_FullEngine):
         self._free = free
         if free is not None:
             self.gitm_free_gpu_fraction_fn = lambda e, values=None: e._free
+        self._host = host
+        if host is not None:
+            self.gitm_sleep_host_room_fn = lambda e: e._host
 
     def _measure(self, e):
         assert not e.asleep and not e.shut_down, "measured an engine that is not live"
@@ -1008,6 +1012,73 @@ def test_sleep_swap_falls_back_to_serial_when_the_build_fails_beside_the_sleeper
     assert app.engine.scheduler_config.max_num_seqs == 128
     assert base.live() == [app.engine]
     assert "failed to build beside the sleeping baseline" in app.swap_log[0]["fallback"]
+
+
+def test_sleep_swap_falls_back_when_two_sleeping_engines_would_not_fit_in_host_memory():
+    # Job 111: each sleeping Kimi engine held ~0.9 TiB, the job's limit was 1.6.
+    gib = 2**30
+    base = _SleepEngine(64, host=(1664 * gib, 1033 * gib))
+    app = _sleep_app(base)
+    res = apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+
+    assert res.applied and res.rolled_back
+    assert ("sleep", 64) not in base.log["events"]      # never put to sleep
+    assert base.shut_down
+    assert base.log["builds"] == 2                      # candidate + serial rebuild
+    (swap,) = app.swap_log
+    assert swap["via"] == "serial" and not swap["sleep_s"]
+    assert "1664 GiB of host memory is free" in swap["fallback"]
+    assert "need about 2066 GiB" in swap["fallback"]
+    assert app.last_result.via == "restart"
+
+
+def test_sleep_swap_proceeds_when_two_sleeping_engines_fit_in_host_memory():
+    gib = 2**30
+    base = _SleepEngine(64, host=(2816 * gib, 1033 * gib))
+    app = _sleep_app(base)
+    apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+
+    (swap,) = app.swap_log
+    assert swap["via"] == "sleep_swap" and swap["fallback"] is None
+
+
+def test_sleep_swap_host_check_unreadable_leaves_it_to_the_sleep():
+    base = _SleepEngine(64, host=None)
+    base.gitm_sleep_host_room_fn = lambda e: None
+    app = _sleep_app(base)
+    apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+    assert app.swap_log[0]["via"] == "sleep_swap"
+
+    broken = _SleepEngine(64)
+
+    def _boom(e):
+        raise OSError("no cgroup")
+    broken.gitm_sleep_host_room_fn = _boom
+    app = _sleep_app(broken)
+    apply_intervention(_spec("max_num_seqs", 32), app, min_keep_delta=0.0)
+    assert app.swap_log[0]["via"] == "sleep_swap"
+
+
+def test_host_headroom_is_the_tighter_of_the_cgroup_limit_and_the_nodes_memory(tmp_path):
+    from gitm.workloads import _host_headroom_bytes
+
+    gib = 2**30
+    proc, cg = tmp_path / "proc", tmp_path / "cg"
+    (proc / "self").mkdir(parents=True)
+    (cg / "job").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text("0::/job\n")
+    (proc / "meminfo").write_text(f"MemTotal: 1\nMemAvailable: {2800 * gib // 1024} kB\n")
+    (cg / "job" / "memory.max").write_text(f"{1664 * gib}\n")
+    (cg / "job" / "memory.current").write_text(f"{100 * gib}\n")
+    (cg / "job" / "memory.stat").write_text(f"anon 1\ninactive_file {20 * gib}\nshmem 2\n")
+
+    # 1664 - 100 + 20 reclaimable page cache, under the node's 2800.
+    assert _host_headroom_bytes(str(proc), str(cg)) == 1584 * gib
+    # No cgroup limit set: the node's available memory is all there is.
+    (cg / "job" / "memory.max").write_text("max\n")
+    assert _host_headroom_bytes(str(proc), str(cg)) == 2800 * gib
+    # Neither readable.
+    assert _host_headroom_bytes(str(tmp_path / "nope"), str(tmp_path / "nope")) is None
 
 
 def test_sleep_swap_falls_back_when_the_baseline_was_built_without_sleep_mode():
