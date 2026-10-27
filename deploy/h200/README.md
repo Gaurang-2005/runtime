@@ -16,9 +16,13 @@ one queue. Live status: <https://gitm-labs.github.io/gpu-status/>.
 |---|---|---|
 | `setup-controller.sh` | gitmachine-2 | Adds node 2 to `slurm.conf`, makes the `gpu` partition whole-node (`OverSubscribe=EXCLUSIVE`), turns on job history, installs containers here, makes the join bundle, starts the status pusher |
 | `setup-join.sh` | node 2 | Installs matching Slurm + munge, copies accounts with the same UIDs, joins the cluster, installs containers |
-| `setup-node.sh` | (called by both) | nvidia-container hook, Enroot 4.2.1, Pyxis v0.24.0, pre-imported vLLM image, reporter |
+| `setup-node.sh` | (called by both) | nvidia-container hook, Enroot 4.2.1, Pyxis v0.24.0, pre-imported vLLM image, reporter, node-health checker |
 | `gitm-job` | everywhere | Team CLI; also the status pusher |
 | `gitm-node-report` | every node | GPU readings + job log tails for the page |
+| `gitm-node-health` | every node (job prolog/epilog) | Pre/post thermal, clocks, power cap, XID, vLLM, `/dev/shm`, NVLink; one window row per job; discard + requeue on fail |
+| `signal_contract.json` | laptop / qualify_run | H200 contract requiring `node_health` + `merged_trace` (`expected_sample_period_ns` = 1 s, `max_clock_skew_ns` = 5 s) |
+
+Node-health signals and thresholds: [`docs/h200_node_health.md`](../../docs/h200_node_health.md).
 
 ## Setup
 
@@ -26,7 +30,9 @@ On node 2, note its name and internal IP: `hostname -s; hostname -I`.
 
 ```bash
 # 1. gitmachine-2
-sudo ./setup-controller.sh --add-node NODE2NAME=NODE2_IP --status-repo GitM-Labs/gpu-status
+sudo ./setup-controller.sh --health-user JOB_USER_1 --health-user JOB_USER_2 \
+  --add-node NODE2NAME=NODE2_IP \
+  --status-repo GitM-Labs/gpu-status
 
 # 2. node 2 (copy this folder + the bundle it printed)
 sudo ./setup-join.sh --bundle ~/gitm-join.tgz && rm ~/gitm-join.tgz
@@ -77,6 +83,40 @@ and run `gitm capture serve --out /out -- vllm serve $MODEL --tensor-parallel-si
 `--node`, or a custom command after `--`. `--dry-run` prints the batch script.
 Results: `/var/lib/gitm/results/<jobid>/` (+ `<jobid>.log`) on the node that ran
 it. Raw `sbatch --exclusive --container-image=...` works too and shows on the page.
+
+## Run IDs and results layout
+
+Every run gets an ID minted by the submit script (not the Slurm job id):
+
+```
+<UTC>-<model-slug>-<node>-<rand4>
+example:  20261021T174233Z-kimi-k26-gm2-7f3a
+```
+
+UTC-first so runs sort chronologically; `model-slug` from the HF id lowercased
+(`moonshotai/Kimi-K2.6` → `kimi-k26`); `node` is `gm1`/`gm2`; `rand4` avoids
+same-second collisions. The full model id, HF revision, Slurm job id and
+submitter live in `inputs.json`, not in the name.
+
+Outputs are split by durability, keyed on the run id:
+
+```
+/mnt/gitm-runs/<run id>/          # durable: a plain folder over a central GCS bucket (gcsfuse)
+    record.json                   #   the run record the loop keys on (contents: ENG-72)
+    inputs.json                   #   exact inputs the script was called with
+    engine.log                    #   vLLM / SGLang server log
+    slurm.log                     #   the Slurm %j.log
+/mnt/disks/scratch/runs/<run id>/
+    trace/...                     # ephemeral: multi-GB CUPTI traces (scratch is wiped on VM stop/move)
+```
+
+`/mnt/gitm-runs` is a single config value (`RESULTS_ROOT`), so the bucket/mount
+can be repointed later without changing run ids or loop code. Run-id format and
+durable root were agreed in ENG-76 with Pamela and Sebastian; the `record.json`
+schema is ENG-72.
+
+> The gcsfuse mount is provisioned by a separate ops step (bucket + mount on
+> both nodes). Until then, runs land on the per-node `/var/lib/gitm/results`.
 
 ## Notes
 
