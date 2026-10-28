@@ -48,6 +48,7 @@ gitm-node-health summarize --job "$SLURM_JOB_ID" --out "$OUT_HOST/node_health.js
 | `healthy` | `true` only if every signal stayed healthy for the whole window |
 | `failed_signals` | names from the table above that flipped |
 | `job_id` / `node` | Slurm job id and hostname |
+| `stack_versions` | host driver + CUDA banner at pre (`source: host_nvidia_smi`); `torch_cuda_version` / `nccl_version` stay null until sampled from the server env |
 
 `qualify_run` with the H200 signal contract requires source `node_health`
 (`node_health_window.json`). `healthy: false` → check fail → verdict

@@ -109,6 +109,38 @@ def test_print_thresholds_matches_doc_keys():
     assert health.THRESHOLDS["shm_min_size_g"] == 16
 
 
+def test_pre_writes_stack_versions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        health,
+        "_stack_versions",
+        lambda: {
+            "driver_version": "570.86.15",
+            "cuda_version": "12.8",
+            "torch_cuda_version": None,
+            "nccl_version": None,
+            "source": "host_nvidia_smi",
+        },
+
+    )
+    monkeypatch.setattr(
+        health,
+        "snapshot",
+        lambda phase: _healthy_snap(phase=phase, vllm_alive=False),
+    )
+    monkeypatch.setattr(
+        health.subprocess,
+        "Popen",
+        lambda *a, **k: type("P", (), {"pid": 1})(),
+    )
+    out = tmp_path / "node_health.jsonl"
+    rc = health.pre(Namespace(job="7", out=str(out), require_vllm=False))
+    assert rc == 0
+    versions = json.loads((tmp_path / "stack_versions.json").read_text())
+    assert versions["driver_version"] == "570.86.15"
+    row = json.loads(out.read_text().splitlines()[0])
+    assert row["stack_versions"] == versions
+
+
 def test_dmesg_helper_filters_before_returning_and_is_explicitly_scoped():
     setup = (ROOT / "deploy" / "h200" / "setup-node.sh").read_text()
     helper = setup.split(

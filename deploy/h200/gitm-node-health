@@ -108,6 +108,27 @@ def _nvlink_ok(status: dict[str, Any]) -> bool:
     )
 
 
+def _stack_versions() -> dict[str, Any]:
+    """Host driver/CUDA banner for the run record (torch/NCCL left unknown)."""
+    versions: dict[str, Any] = {
+        "driver_version": None,
+        "cuda_version": None,
+        "torch_cuda_version": None,
+        "nccl_version": None,
+        "source": "host_nvidia_smi",
+    }
+    rows = _csv("driver_version")
+    if rows and rows[0]:
+        versions["driver_version"] = rows[0][0] or None
+    rc, smi = _command(["nvidia-smi"])
+    if rc == 0:
+        m = re.search(r"CUDA Version:\s*([\d.]+)", smi)
+        if m:
+            versions["cuda_version"] = m.group(1)
+    return versions
+
+
+
 def snapshot(phase: str) -> dict[str, Any]:
     temps = _csv("temperature.gpu", nounits=True)
     clocks = _csv(",".join(THRESHOLDS["clocks_bad_fields"]))
@@ -240,7 +261,11 @@ def pre(args: argparse.Namespace) -> int:
     row = snapshot("pre")
     row["job_id"] = args.job
     row["require_vllm"] = args.require_vllm
-    _append(Path(args.out), row)
+    versions = _stack_versions()
+    row["stack_versions"] = versions
+    out = Path(args.out)
+    _append(out, row)
+    (out.parent / "stack_versions.json").write_text(json.dumps(versions, indent=2) + "\n")
     failed = eval_snapshot(row)
     if failed:
         print("unhealthy: " + ",".join(failed), file=sys.stderr)
@@ -284,6 +309,9 @@ def summarize(args: argparse.Namespace) -> int:
         rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
         result = eval_window(rows)
         result["job_id"] = args.job
+        pre = next((r for r in rows if r.get("phase") == "pre"), None)
+        if pre and isinstance(pre.get("stack_versions"), dict):
+            result["stack_versions"] = pre["stack_versions"]
     except (OSError, json.JSONDecodeError) as exc:
         result = {
             "job_id": args.job,

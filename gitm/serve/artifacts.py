@@ -10,6 +10,7 @@ the whole point of having both paths is lost. So the writing lives here, once:
     run_manifest.json      how the trace was obtained, in enough detail to redo it
     serving_summary.json   what the server was doing during the window
     preflight.json         what was checked before anything was touched
+    stack_versions.json    host driver / CUDA versions (re-baseline visibility)
 
 ``kernel_breakdown`` is written on every run, not only on the empty-trace path: a
 trace with plenty of kernels in it can still be unusable — CUDA-graph replay loses
@@ -52,11 +53,31 @@ class CaptureResult:
         }
 
 
-def write_preflight(out_dir: Path, checks: list) -> None:
+def write_preflight(out_dir: Path, checks: list) -> dict[str, Any]:
+    """Write preflight checks + stack versions; return the version snapshot."""
+    from gitm.serve.stack_versions import collect_stack_versions
+
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "preflight.json").write_text(
         json.dumps([asdict(c) for c in checks], indent=2)
     )
+    versions = collect_stack_versions()
+    (out_dir / "stack_versions.json").write_text(json.dumps(versions, indent=2) + "\n")
+    return versions
+
+
+def _with_stack_versions(out_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    path = out_dir / "stack_versions.json"
+    if path.is_file():
+        try:
+            return {**manifest, "stack_versions": json.loads(path.read_text())}
+        except (OSError, json.JSONDecodeError):
+            pass
+    from gitm.serve.stack_versions import collect_stack_versions
+
+    versions = collect_stack_versions()
+    path.write_text(json.dumps(versions, indent=2) + "\n")
+    return {**manifest, "stack_versions": versions}
 
 
 def write_capture_artifacts(
@@ -94,9 +115,8 @@ def write_capture_artifacts(
             )
         if checks is not None:
             manifest = {**manifest, "preflight": [asdict(c) for c in checks]}
-        (out_dir / "run_manifest.json").write_text(
-            json.dumps({**manifest, "trace": None}, indent=2)
-        )
+        manifest = _with_stack_versions(out_dir, {**manifest, "trace": None})
+        (out_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2))
         return CaptureResult(
             out_dir=out_dir,
             trace_path=trace_path,
@@ -119,18 +139,21 @@ def write_capture_artifacts(
 
     if checks is not None:
         manifest = {**manifest, "preflight": [asdict(c) for c in checks]}
-    manifest = {
-        **manifest,
-        "trace": {
-            "path": str(trace_path),
-            "run_id": trace.run_id,
-            "source": trace.source,
-            "device_count": trace.device_count,
-            "events": len(trace.events),
-            "kernels": len(kernels),
-            "duration_ns": trace.duration_ns,
+    manifest = _with_stack_versions(
+        out_dir,
+        {
+            **manifest,
+            "trace": {
+                "path": str(trace_path),
+                "run_id": trace.run_id,
+                "source": trace.source,
+                "device_count": trace.device_count,
+                "events": len(trace.events),
+                "kernels": len(kernels),
+                "duration_ns": trace.duration_ns,
+            },
         },
-    }
+    )
     (out_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2))
 
     if not kernels:
