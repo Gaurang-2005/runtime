@@ -208,6 +208,45 @@ def test_clocks_bad_decodes_hex_and_active():
     assert health._clocks_bad("0x0000000000000000") is False
 
 
+def test_sample_sw_power_cap_active_is_healthy():
+    # Hitting TDP mid-job is normal; limit still at max → not a node fault.
+    pre = _healthy_snap(phase="pre")
+    mid = _healthy_snap(
+        phase="sample",
+        ts=1.5,
+        power=[["700", "700", "Active"] for _ in range(8)],
+    )
+    post = _healthy_snap(phase="post", ts=2.0)
+    window = health.eval_window([pre, mid, post])
+    assert window["healthy"] is True
+    assert "power_cap" not in window["failed_signals"]
+
+
+def test_idle_sw_power_cap_active_is_unhealthy():
+    pre = _healthy_snap(
+        phase="pre",
+        power=[["700", "700", "Active"] for _ in range(8)],
+    )
+    mid = _healthy_snap(phase="sample", ts=1.5)
+    post = _healthy_snap(phase="post", ts=2.0)
+    window = health.eval_window([pre, mid, post])
+    assert window["healthy"] is False
+    assert "power_cap" in window["failed_signals"]
+
+
+def test_sample_power_limit_below_max_is_unhealthy():
+    pre = _healthy_snap(phase="pre")
+    mid = _healthy_snap(
+        phase="sample",
+        ts=1.5,
+        power=[["500", "700", "Not Active"] for _ in range(8)],
+    )
+    post = _healthy_snap(phase="post", ts=2.0)
+    window = health.eval_window([pre, mid, post])
+    assert window["healthy"] is False
+    assert "power_cap" in window["failed_signals"]
+
+
 def test_xid_mid_run_caught(tmp_path: Path):
     pre = _healthy_snap(phase="pre", xid_lines=[])
     # XID only in a mid-window sample (rolled out of dmesg before post).

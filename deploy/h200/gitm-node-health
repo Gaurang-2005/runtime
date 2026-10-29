@@ -164,8 +164,12 @@ def eval_snapshot(snap: dict[str, Any]) -> list[str]:
     if not snap["throttle_reasons"] or any(map(_clocks_bad, snap["throttle_reasons"])):
         failed.append("clocks")
     try:
+        # limit≈max is a config check (all phases). sw_power_cap Active under
+        # load is normal TDP bounding — only treat as a fault at idle pre/post.
+        check_throttle = snap.get("phase") != "sample"
         if not snap["power"] or any(
-            abs(float(limit) - float(maximum)) > 0.5 or "not active" not in cap.lower()
+            abs(float(limit) - float(maximum)) > 0.5
+            or (check_throttle and "not active" not in cap.lower())
             for limit, maximum, cap in snap["power"]
         ):
             failed.append("power_cap")
